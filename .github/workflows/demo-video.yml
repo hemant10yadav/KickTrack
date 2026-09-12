@@ -17,6 +17,9 @@ concurrency:
   group: demo-video-${{ github.workflow }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   render:
     runs-on: macos-14
@@ -28,6 +31,9 @@ jobs:
         with:
           python-version: "3.13"
           enable-cache: true
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
 
       - name: Install dependencies
         run: uv sync
