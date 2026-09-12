@@ -127,9 +127,15 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   3.13, where a prebuilt wheel exists and everything works.
 
 ## File layout
-- `scripts/track_players.py` — the tracking tool (see module for class breakdown:
-  `PlayerTracker`, `InferenceWorker`, `MarkerRenderer`, `FramePacer`,
-  `MotionExtrapolator`, `TeamClassifier`, `StalenessTracker`/`WorkerStats`/`DisplayStats`)
+- `scripts/track_players.py` — thin CLI entrypoint (`parse_args`, `main`)
+- `scripts/pipeline.py` — video source resolution, raw YOLO/BoT-SORT detection,
+  the background `InferenceWorker`, and the top-level `PlayerTracker` orchestrator
+- `scripts/player.py` — everything "what is a player": `TeamClassifier` (jersey
+  color → team), `StateManager` (confirm/grace visibility), `PlayerIdentityManager`
+  (persistent `player_id` across BoT-SORT `track_id` churn)
+- `scripts/display.py` — everything "what gets shown on screen": `MarkerRenderer`,
+  `MotionExtrapolator`, `DisplaySmoother`, `FadeController`, `FramePacer`,
+  `StalenessTracker`/`WorkerStats`/`DisplayStats`
 - `scripts/botsort_custom.yaml` — tracker tuning
 - `yolov8m.mlpackage` — the CoreML-exported model actually used at runtime (gitignored,
   like other `.pt`/model weight files — regenerate with the export command above)
@@ -144,3 +150,11 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   installs themselves.
 - Verify performance/quality claims empirically (benchmark timings, visually inspect
   sample frames) rather than assuming a change helped.
+- **Group files by domain/concept, not one class per file.** When splitting up code,
+  ask "what is this about" (player state/identity? team color? what's drawn on
+  screen? the detection/tracking pipeline?) rather than pulling every class into
+  its own file — a pile of one-class files is just as hard to navigate as one giant
+  file, in the other direction. `scripts/player.py` and `scripts/display.py` are the
+  reference examples: each holds several classes that all answer the same "what is
+  this about" question, so a contributor can find where something lives by domain
+  instead of memorizing a class-to-file map.
