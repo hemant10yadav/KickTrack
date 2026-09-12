@@ -11,14 +11,17 @@ from ultralytics import YOLO
 
 from scripts.track_players import MODEL_NAME, InferenceWorker, PlayerTracker
 
-# match_5.mp4 (50fps) is the demanding case: inference (~29ms) is still slower than
-# its 20ms native frame budget, so some drops are structurally expected -- this
-# floor catches a regression (e.g. a slower model/imgsz change) without demanding
-# the impossible (zero drops on a source faster than the hardware can process).
+# match_5.mp4 (50fps) is the demanding case: inference (~25ms, after removing a
+# stray device="mps" that was forcing a pointless CPU->MPS->CPU round trip on every
+# frame for a CoreML model -- see track()) is still slower than its 20ms native
+# frame budget, so some drops are structurally expected -- this floor catches a
+# regression (e.g. a slower model/imgsz change, or that device kwarg coming back)
+# without demanding the impossible (zero drops on a source faster than the
+# hardware can process).
 MAX_DROP_RATIO = {
     "match_3": 0.05,
     "match_4": 0.05,
-    "match_5": 0.45,
+    "match_5": 0.30,
 }
 
 # Loose ceiling on persistent player_ids for a ~10-20s clip with ~22-28 real people
