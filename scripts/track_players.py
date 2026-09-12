@@ -796,7 +796,7 @@ class FramePacer:
         self.frame_interval = 1 / fps
         self.next_deadline = None
 
-    def wait(self, _iteration_start: float) -> int:
+    def wait(self, _iteration_start: float, use_gui: bool = True) -> int:
         now = time.perf_counter()
         if self.next_deadline is None:
             self.next_deadline = now + self.frame_interval
@@ -807,7 +807,10 @@ class FramePacer:
         self.next_deadline += self.frame_interval
 
         wait_ms = max(1, int(remaining_ms - self.WAITKEY_OVERSHOOT_MS))
-        return cv2.waitKey(wait_ms) & 0xFF
+        if use_gui:
+            return cv2.waitKey(wait_ms) & 0xFF
+        time.sleep(wait_ms / 1000)
+        return -1
 
 
 class PlayerTracker:
@@ -821,9 +824,10 @@ class PlayerTracker:
     WINDOW_NAME = "Football Tracker"
     QUIT_KEY = ord("q")
 
-    def __init__(self, video_path: Path, model: YOLO):
+    def __init__(self, video_path: Path, model: YOLO, show_window: bool = True):
         self.video_path = video_path
         self.model = model
+        self.show_window = show_window
         self.classifier = TeamClassifier()
         self.renderer = MarkerRenderer(self.classifier)
         self.extrapolator = MotionExtrapolator()
@@ -833,6 +837,7 @@ class PlayerTracker:
         self.display_stats = DisplayStats()
         self.frame_count = 0
         self.play_start = None
+        self.achieved_fps = None
 
     def run(self):
         cap = self._open_capture()
@@ -846,10 +851,12 @@ class PlayerTracker:
         finally:
             worker.stop()
             cap.release()
-            cv2.destroyAllWindows()
+            if self.show_window:
+                cv2.destroyAllWindows()
             elapsed = time.perf_counter() - self.play_start
+            self.achieved_fps = self.frame_count / elapsed
             print(f"Read {self.frame_count} frames from {self.video_path}")
-            print(f"Display FPS: {self.frame_count / elapsed:.1f}")
+            print(f"Display FPS: {self.achieved_fps:.1f}")
             print()
             print(worker.stats.summary())
             print()
@@ -891,10 +898,11 @@ class PlayerTracker:
             alphas = self.fader.update(boxes, result.coasting_progress)
             self.renderer.draw(frame, boxes, alphas)
             t3 = time.perf_counter()
-            cv2.imshow(self.WINDOW_NAME, frame)
+            if self.show_window:
+                cv2.imshow(self.WINDOW_NAME, frame)
             t4 = time.perf_counter()
 
-            key = pacer.wait(iteration_start)
+            key = pacer.wait(iteration_start, use_gui=self.show_window)
             t5 = time.perf_counter()
 
             self.display_stats.record(
@@ -906,7 +914,7 @@ class PlayerTracker:
                 frame_budget_ms=pacer.frame_budget_ms,
             )
 
-            if key == self.QUIT_KEY:
+            if self.show_window and key == self.QUIT_KEY:
                 break
 
 
