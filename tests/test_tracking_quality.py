@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from ultralytics import YOLO
 
-from scripts.track_players import MODEL_NAME, InferenceWorker, PlayerTracker
+from scripts.pipeline import MODEL_NAME, InferenceWorker, PlayerTracker
 
 # match_5.mp4 (50fps) is the demanding case: inference (~25ms, after removing a
 # stray device="mps" that was forcing a pointless CPU->MPS->CPU round trip on every

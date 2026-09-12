@@ -12,7 +12,7 @@ import cv2
 import pytest
 from ultralytics import YOLO
 
-from scripts.track_players import MODEL_NAME, PlayerTracker
+from scripts.pipeline import MODEL_NAME, PlayerTracker
 
 # FramePacer paces playback at the input video's own native fps, so achieved FPS
 # can never exceed it — the right regression floor is a fraction of *that video's*

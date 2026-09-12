@@ -7,7 +7,7 @@ box loses its BoT-SORT track for a single frame and reappears under a brand-new
 track_id a few pixels away (track 95 -> 159, see docs/PLAN.md Plan 3.5).
 """
 
-from scripts.track_players import PlayerIdentityManager
+from scripts.player import PlayerIdentityManager
 
 
 def _box(x1, y1, x2, y2, track_id):
