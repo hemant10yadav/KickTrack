@@ -335,10 +335,20 @@ class PlayerTracker:
     WINDOW_NAME = "Football Tracker"
     QUIT_KEY = ord("q")
 
-    def __init__(self, video_source: str | int, model: YOLO, show_window: bool = True):
+    def __init__(
+        self,
+        video_source: str | int,
+        model: YOLO,
+        show_window: bool = True,
+        output_path: str | None = None,
+        realtime: bool = True,
+    ):
         self.video_source = video_source
         self.model = model
         self.show_window = show_window
+        self.output_path = output_path
+        self.realtime = realtime
+        self.writer = None
         self.classifier = TeamClassifier()
         self.renderer = MarkerRenderer(self.classifier)
         self.extrapolator = MotionExtrapolator()
@@ -354,6 +364,8 @@ class PlayerTracker:
     def run(self):
         cap = self._open_capture()
         pacer = FramePacer(fps=cap.get(cv2.CAP_PROP_FPS) or 25)
+        if self.output_path:
+            self.writer = self._open_writer(cap, pacer.frame_budget_ms)
         self._warmup()
 
         worker = InferenceWorker(self.model, self.classifier).start()
@@ -363,6 +375,8 @@ class PlayerTracker:
         finally:
             worker.stop()
             cap.release()
+            if self.writer is not None:
+                self.writer.release()
             if self.show_window:
                 cv2.destroyAllWindows()
             elapsed = time.perf_counter() - self.play_start
@@ -390,6 +404,12 @@ class PlayerTracker:
         blank_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         track(self.model, blank_frame)
 
+    def _open_writer(self, cap: cv2.VideoCapture, frame_budget_ms: float) -> cv2.VideoWriter:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        return cv2.VideoWriter(self.output_path, fourcc, 1000 / frame_budget_ms, (width, height))
+
     def _play(self, cap: cv2.VideoCapture, worker: InferenceWorker, pacer: FramePacer):
         while True:
             iteration_start = time.perf_counter()
@@ -416,9 +436,14 @@ class PlayerTracker:
             if self.show_window:
                 self.fps_overlay.draw(frame, native_fps=1000 / pacer.frame_budget_ms)
                 cv2.imshow(self.WINDOW_NAME, frame)
+            if self.writer is not None:
+                self.writer.write(frame)
             t4 = time.perf_counter()
 
-            key = pacer.wait(iteration_start, use_gui=self.show_window)
+            if self.realtime:
+                key = pacer.wait(iteration_start, use_gui=self.show_window)
+            else:
+                key = -1
             t5 = time.perf_counter()
 
             self.display_stats.record(
