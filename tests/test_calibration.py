@@ -8,6 +8,7 @@ calibrates reliably -- see docs/PITCH_CALIBRATION_SPEC.md). Slow (loads a
 from pathlib import Path
 
 import cv2
+import numpy as np
 import pytest
 
 from scripts.calibration import CalibrationResult, PitchCalibrator
@@ -119,3 +120,79 @@ def test_calibration_worker_respects_keyframe_interval():
         assert fake.calls <= 1
     finally:
         worker.stop()
+
+
+def test_calibration_worker_get_keyframe_returns_matching_frame():
+    """Phase 2's HomographyPropagator needs the exact frame a calibration
+    came from (to seed optical flow tracking against it), not just the
+    result -- get_keyframe() must return both together, atomically."""
+    import time
+
+    from scripts.calibration import CalibrationWorker
+
+    fake = _FakeCalibrator()
+    worker = CalibrationWorker(fake, keyframe_interval=1).start()
+    try:
+        submitted_frame = np.zeros((4, 4, 3), dtype="uint8")
+        submitted_frame[:] = 7
+        worker.submit(frame=submitted_frame, frame_id=1)
+        for _ in range(50):
+            if worker.get_keyframe() is not None:
+                break
+            time.sleep(0.01)
+        keyframe = worker.get_keyframe()
+        assert keyframe is not None
+        result, frame = keyframe
+        assert result.frame_id == 1
+        assert np.array_equal(frame, submitted_frame)
+    finally:
+        worker.stop()
+
+
+def _make_textured_frame(size=300):
+    """A synthetic checkerboard has strong, well-distributed corners for
+    cv2.goodFeaturesToTrack/optical flow -- unlike a blank frame."""
+    import numpy as np
+
+    square = 20
+    rows, cols = np.indices((size, size))
+    grid = ((rows // square) + (cols // square)) % 2
+    gray = (grid * 255).astype("uint8")
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def test_homography_propagator_recovers_known_translation():
+    """Warp a textured frame by a known pixel translation, seed the
+    propagator at identity homography, and check it recovers that exact
+    translation as the new homography -- proves the optical-flow-tracking
+    + composition math is correct before trusting it on real footage."""
+    from scripts.calibration import HomographyPropagator
+
+    frame0 = _make_textured_frame()
+    dx, dy = 8.0, -5.0
+    translation = np.array([[1, 0, dx], [0, 1, dy]], dtype="float32")
+    frame1 = cv2.warpAffine(frame0, translation, (frame0.shape[1], frame0.shape[0]))
+
+    propagator = HomographyPropagator()
+    propagator.reset(frame0, homography=np.eye(3))
+    result = propagator.propagate(frame1)
+
+    assert result is not None
+    result = result / result[2, 2]
+    expected = np.array([[1, 0, dx], [0, 1, dy], [0, 0, 1]])
+    assert np.allclose(result, expected, atol=1.0)
+
+
+def test_homography_propagator_fails_gracefully_on_blank_frame():
+    """A blank frame has no trackable features at all -- must return None,
+    not raise or silently produce a garbage homography."""
+    from scripts.calibration import HomographyPropagator
+
+    frame0 = _make_textured_frame()
+    blank = np.zeros_like(frame0)
+
+    propagator = HomographyPropagator()
+    propagator.reset(frame0, homography=np.eye(3))
+    result = propagator.propagate(blank)
+
+    assert result is None

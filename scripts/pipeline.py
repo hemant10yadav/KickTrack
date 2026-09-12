@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from scripts.calibration import CalibrationWorker, PitchCalibrator
+from scripts.calibration import CalibrationWorker, HomographyPropagator, PitchCalibrator
 from scripts.display import (
     DisplaySmoother,
     DisplayStats,
@@ -352,6 +352,9 @@ class PlayerTracker:
         self.play_start = None
         self.achieved_fps = None
         self.latest_calibration = None
+        self.current_homography = None
+        self.homography_propagator = HomographyPropagator()
+        self._last_keyframe_id = None
 
     def run(self):
         cap = self._open_capture()
@@ -383,11 +386,12 @@ class PlayerTracker:
             print(self.display_stats.summary())
             print()
             if self.latest_calibration is not None:
-                homography_found = self.latest_calibration.homography is not None
                 print(
-                    f"Calibration: homography_found={homography_found} "
+                    f"Calibration: keyframe_homography_found="
+                    f"{self.latest_calibration.homography is not None} "
                     f"keypoints={self.latest_calibration.num_keypoints} "
-                    f"lines={self.latest_calibration.num_lines}"
+                    f"lines={self.latest_calibration.num_lines} "
+                    f"propagation_active={self.current_homography is not None}"
                 )
             else:
                 print("Calibration: no result yet")
@@ -403,6 +407,23 @@ class PlayerTracker:
         """Pay the one-time GPU kernel compilation cost (MPS) before playback starts."""
         blank_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         track(self.model, blank_frame)
+
+    def _update_calibration(self, calibration_worker: CalibrationWorker, frame: np.ndarray):
+        """Resets HomographyPropagator against each new full recalibration
+        from CalibrationWorker (keyframe rate), then propagates forward to
+        this exact frame every call (every displayed frame) -- see
+        docs/PITCH_CALIBRATION_SPEC.md Phase 2 for why holding a keyframe's
+        homography stale in between isn't accurate enough on its own.
+        """
+        keyframe = calibration_worker.get_keyframe()
+        if keyframe is not None:
+            self.latest_calibration, keyframe_frame = keyframe
+            is_new_keyframe = self.latest_calibration.frame_id != self._last_keyframe_id
+            if is_new_keyframe and self.latest_calibration.homography is not None:
+                self.homography_propagator.reset(keyframe_frame, self.latest_calibration.homography)
+                self._last_keyframe_id = self.latest_calibration.frame_id
+
+        self.current_homography = self.homography_propagator.propagate(frame)
 
     def _play(
         self,
@@ -425,7 +446,7 @@ class PlayerTracker:
             worker.submit(frame.copy(), self.frame_count)
             calibration_worker.submit(frame.copy(), self.frame_count)
             result = worker.get_result()
-            self.latest_calibration = calibration_worker.get_result()
+            self._update_calibration(calibration_worker, frame)
             t2 = time.perf_counter()
             now = time.perf_counter()
             self.staleness.record(self.frame_count, result.frame_id, result.captured_at)

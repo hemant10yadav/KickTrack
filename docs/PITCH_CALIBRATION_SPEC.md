@@ -180,8 +180,55 @@ Implementation plan: `docs/superpowers/plans/2026-09-12-pitch-calibration-phase1
 
 ### Phase 2 — Frame-to-frame propagation
 
-Add cheap inter-keyframe homography tracking, with confidence-based
-re-trigger of Phase 1 keyframe detection.
+**Drift measurement (2026-09-13)**, before building anything: ran
+`PitchCalibrator` on every frame of a 90-frame window (no propagation,
+no holding stale) on `data/videos/match_4.mp4` and `match_5.mp4`, and
+measured how far a fixed on-screen world point (pitch center) projects
+frame-to-frame — i.e. how wrong a stale homography held for K frames
+would be.
+
+First attempt measured all 4 pitch corners too and got misleadingly huge
+numbers (mean 196px, max 1130px at K=30) — traced to a measurement bug,
+not a real problem: pitch corners are usually off-screen in these
+zoomed/half-pitch shots, and homography extrapolation to points far
+outside the observed keypoint region is numerically unstable even when
+the on-screen calibration is fine (confirmed visually: frames 1565/1566
+of match_4, the worst "corner" outlier pair, calibrate near-identically
+on screen). Corrected to on-screen center point only:
+
+| K (frames) | match_4 mean/median/max (px) | match_5 mean/median/max (px) |
+|---|---|---|
+| 1  | 9.5 / 6.4 / 57.6    | 5.8 / 1.3 / 42.5  |
+| 5  | 21.8 / 18.6 / 60.7  | 9.2 / 5.8 / 43.0  |
+| 10 | 40.0 / 34.2 / 87.9  | 13.0 / 9.2 / 45.1 |
+| 15 | 59.9 / 52.3 / 121.6 | 14.9 / 12.2 / 47.2|
+| 30 (current keyframe_interval) | 124.8 / 124.5 / 186.5 | 18.9 / 15.1 / 59.2 |
+
+Mean and median are close together at every K (no heavy-tailed
+instability) and drift grows roughly linearly with K — consistent with
+real, gradual camera pan, not per-frame calibration noise.
+**Conclusion:** `match_4`-style footage (more camera movement) drifts a
+real, meaningful amount (~125px mean, ~6-10% of frame width) by the
+current 30-frame keyframe interval — worth fixing. `match_5` drifts much
+less in this window. Decision: build full propagation (not just shrink
+`keyframe_interval`) per user direction — the throughput ceiling on
+`keyframe_interval` (calibration takes ~0.35s/frame on MPS, so an
+interval much below ~10 frames risks the worker falling behind its own
+cadence at 25fps) means propagation is the right long-term fix, not a
+workaround.
+
+**Design:** `HomographyPropagator` (new class in `scripts/calibration.py`)
+runs in `PlayerTracker`'s main thread (not the background worker) —
+every displayed frame, not just at keyframe rate, mirroring how
+`MotionExtrapolator` already runs per-frame in the main thread on top of
+`InferenceWorker`'s keyframe-rate boxes (`scripts/display.py`). It tracks
+sparse features (`cv2.goodFeaturesToTrack` + `cv2.calcOpticalFlowPyrLK`)
+from the last full calibration's frame forward, composes the incremental
+image-to-image transform with that keyframe's homography, and reports
+propagation failure (too few tracked inliers) so the caller can fall back
+to holding the last good homography rather than trusting a bad estimate —
+the hold-on-failure behavior Phase 3 was going to add anyway, pulled
+forward since propagation needs it too.
 
 ### Phase 3 — Low-confidence fallback + `PlayerState` integration
 

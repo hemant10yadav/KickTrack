@@ -55,6 +55,7 @@ class CalibrationResult:
     num_lines: int
     top_kp_score: float
     top_line_score: float
+    frame_id: int | None = None
 
 
 def _homography_from_cam_params(final_params_dict: dict) -> np.ndarray:
@@ -153,6 +154,7 @@ class CalibrationWorker:
         self.lock = threading.Lock()
         self.pending = None  # (frame, frame_id)
         self.latest: CalibrationResult | None = None
+        self.latest_frame: np.ndarray | None = None
         self.last_calibrated_frame_id = None
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -175,6 +177,16 @@ class CalibrationWorker:
         with self.lock:
             return self.latest
 
+    def get_keyframe(self) -> tuple[CalibrationResult, np.ndarray] | None:
+        """Returns the latest calibration result together with the exact
+        frame it was computed from, atomically -- so a caller can tell
+        whether this is a *new* keyframe (compare `.frame_id`) and, if so,
+        reset a HomographyPropagator against the matching frame."""
+        with self.lock:
+            if self.latest is None:
+                return None
+            return self.latest, self.latest_frame
+
     def _is_keyframe(self, frame_id: int) -> bool:
         if self.last_calibrated_frame_id is None:
             return True
@@ -188,11 +200,89 @@ class CalibrationWorker:
                 continue
             frame, frame_id = pending
             result = self.calibrator.calibrate(frame)
+            result.frame_id = frame_id
             with self.lock:
                 self.latest = result
+                self.latest_frame = frame
                 self.last_calibrated_frame_id = frame_id
 
     def _take_pending(self):
         with self.lock:
             pending, self.pending = self.pending, None
             return pending
+
+
+MIN_TRACKED_POINTS = (
+    15  # below this, propagation is unreliable -- caller should hold last homography
+)
+MAX_TRACK_ERROR = (
+    10.0  # cv2 LK tracking error above this means "not really tracked" (see propagate())
+)
+
+
+class HomographyPropagator:
+    """Tracks the pitch homography frame-to-frame between full
+    CalibrationWorker recalibrations, using sparse optical flow. Mirrors
+    MotionExtrapolator's role (scripts/display.py) of running every frame in
+    the main thread on top of a background worker's keyframe-rate results.
+
+    See docs/PITCH_CALIBRATION_SPEC.md Phase 2 for the drift measurement
+    that motivated this: match_4-style footage (more camera movement)
+    drifts ~125px on average by the time the current 30-frame keyframe
+    interval elapses if the homography is just held stale.
+
+    If tracking ever fails (too few inlier points -- fast pan, occlusion,
+    a bad frame), propagate() returns None and keeps failing on the *same*
+    stale reference until the next full keyframe recalibration resets it,
+    rather than guessing from a potentially-bad current frame. Callers
+    should treat a None as "hold the last known-good homography, mark this
+    frame low-confidence."
+    """
+
+    def __init__(self, max_corners: int = 200, min_tracked_points: int = MIN_TRACKED_POINTS):
+        self.max_corners = max_corners
+        self.min_tracked_points = min_tracked_points
+        self.reference_gray: np.ndarray | None = None
+        self.reference_points: np.ndarray | None = None
+        self.homography: np.ndarray | None = None
+
+    def reset(self, frame: np.ndarray, homography: np.ndarray):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self.reference_gray = gray
+        self.reference_points = cv2.goodFeaturesToTrack(
+            gray, maxCorners=self.max_corners, qualityLevel=0.01, minDistance=10
+        )
+        self.homography = homography
+
+    def propagate(self, frame: np.ndarray) -> np.ndarray | None:
+        if self.homography is None or self.reference_points is None:
+            return None
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        tracked_points, status, err = cv2.calcOpticalFlowPyrLK(
+            self.reference_gray, gray, self.reference_points, None
+        )
+        # cv2 can report status=1 ("tracked") even when the target region has
+        # no real content to track against (e.g. a blank/black frame) -- its
+        # own per-point tracking error is what actually distinguishes that
+        # case (measured ~127 on a blank frame vs ~0.0003 on real motion).
+        status_mask = status.reshape(-1).astype(bool) & (err.reshape(-1) < MAX_TRACK_ERROR)
+        if status_mask.sum() < self.min_tracked_points:
+            return None
+
+        src = self.reference_points[status_mask]
+        dst = tracked_points[status_mask]
+        transform, inliers = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
+        if transform is None or int(inliers.sum()) < self.min_tracked_points:
+            return None
+
+        new_homography = transform @ self.homography
+
+        # Roll the reference forward to the current frame so optical flow
+        # always tracks a short hop from the previous frame, not an
+        # ever-growing distance from the original keyframe.
+        inlier_mask = inliers.reshape(-1).astype(bool)
+        self.reference_gray = gray
+        self.reference_points = dst[inlier_mask]
+        self.homography = new_homography
+        return new_homography
