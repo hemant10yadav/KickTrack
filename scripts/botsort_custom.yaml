@@ -1,9 +1,21 @@
 tracker_type: botsort
 track_high_thresh: 0.25
 track_low_thresh: 0.1
-new_track_thresh: 0.25
+# Debugged (docs/PLAN.md Plan 3.5): small/distant, borderline-confidence boxes were
+# frequently spawning a brand-new track_id for a player BoT-SORT already had an
+# active/lost track for, one frame after the old one (e.g. track 95 -> 159, ~9px
+# apart, 1-frame gap) -- median first-appearance box was only ~717px^2 on 3840x2160
+# footage. Raising new_track_thresh makes a fresh (as opposed to re-matched) track
+# require real confidence before it's allowed to exist at all; raising match_thresh
+# (more permissive: 1-match_thresh is the max allowed cost) gives marginal-confidence
+# re-detections more room to still match their old/lost track via fuse_score's
+# iou*conf combination. Measured on match_4.mp4 first 300 frames: unique tracker IDs
+# dropped 52 -> 29 for a scene with ~22-28 real people in frame. See also
+# PlayerIdentityManager in track_players.py, an app-level safety net for whatever
+# churn these thresholds don't catch.
+new_track_thresh: 0.5
 track_buffer: 90
-match_thresh: 0.8
+match_thresh: 0.9
 fuse_score: True
 
 # BoT-SORT specific: camera motion compensation
