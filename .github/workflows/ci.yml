@@ -5,7 +5,14 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # TODO: move to ubuntu-latest once the CoreML-only dependency (coremltools,
+  # pinned via tool.uv.environments = ["sys_platform == 'darwin'"] in
+  # pyproject.toml) is no longer a hard requirement for import/test collection.
   lint:
     runs-on: macos-latest
     steps:
@@ -15,12 +22,33 @@ jobs:
         uses: astral-sh/setup-uv@v10.1.0
         with:
           python-version: "3.13"
+          enable-cache: true
+
+      - name: Check uv.lock is up to date
+        run: uv lock --check
 
       - name: Install dependencies
         run: uv sync --group dev
 
-      - name: Ruff lint
-        run: uv run ruff check .
+      - name: Run pre-commit hooks
+        run: uv run prek run --all-files
 
-      - name: Ruff format check
-        run: uv run ruff format --check .
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run tests
+        # Exit code 5 = "no tests collected", which is expected for now since the
+        # only test file is entirely `slow`-marked (real CoreML pipeline against
+        # fixture footage). Treat it as a pass; still fail on real test failures.
+        run: uv run pytest -m "not slow" || [ "$?" = 5 ]
