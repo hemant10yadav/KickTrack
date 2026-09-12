@@ -31,7 +31,15 @@ STREAM_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")  # e.g. rtmp://, 
 
 PERSON_CLASS_ID = 0  # COCO class id for "person"
 TRACKER_CONFIG = str(Path(__file__).parent / "botsort_custom.yaml")
-MODEL_NAME = "yolov8m.mlpackage"
+MODEL_NAME = "yolov8s.mlpackage"
+# Switched from yolov8m: at the same 640x1152 rect imgsz, v8s cuts inference from
+# ~24ms to ~18ms avg on match_5.mp4 (50fps, 20ms budget) -- enough to clear the
+# budget outright instead of just narrowing the shortfall, eliminating match_5's
+# frame drops entirely (was 33% before the device="mps" fix, ~19-27% after it,
+# 0% with v8s). Verified visually (not just box-count) across match_4/match_5 spot
+# frames: every on-pitch player caught by v8m was also caught by v8s; box-count
+# differences were sideline/crowd false positives, same pattern already seen with
+# the rect-imgsz change above -- never a missed player.
 # (height, width): matches the 16:9 aspect ratio of the actual footage instead of
 # padding to a square, and is smaller than the original 1280 square export.
 # Verified visually (not just by box-count) on both a 1080p 50fps clip
