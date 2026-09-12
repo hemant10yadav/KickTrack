@@ -775,6 +775,74 @@ class DisplayStats:
         return "\n".join(lines)
 
 
+class FpsOverlay:
+    """Tracks a smoothed live display FPS and draws it on the frame (top-left)
+    against the video's own native FPS, so playback speed is visible during
+    playback rather than only printed to the terminal after the run ends.
+
+    Colored green while live FPS tracks native FPS, and red once it falls below
+    DROP_RATIO of native — the same threshold the pytest FPS regression test
+    uses — so a real slowdown is visually obvious rather than requiring the
+    viewer to compare two numbers themselves.
+
+    The underlying value is smoothed and updated every frame for accuracy, but
+    the *displayed* text only refreshes every REFRESH_INTERVAL_S — redrawing a
+    changed digit every single frame (~24-60x/sec) reads as flicker even when
+    the smoothed value itself is barely moving.
+    """
+
+    SMOOTHING = 0.9  # closer to 1 = smoother/slower-reacting, less noisy readout
+    REFRESH_INTERVAL_S = 0.5  # how often the on-screen text is allowed to change
+    DROP_RATIO = 0.8
+    POSITION = (10, 30)
+    FONT = cv2.FONT_HERSHEY_SIMPLEX
+    FONT_SCALE = 0.8
+    COLOR_OK = (0, 255, 0)
+    COLOR_DROPPED = (0, 0, 255)
+    THICKNESS = 2
+
+    def __init__(self):
+        self.smoothed_fps = None
+        self.displayed_fps = None
+        self.last_tick_at = None
+        self.last_refresh_at = None
+
+    def tick(self, now: float | None = None) -> float | None:
+        now = time.perf_counter() if now is None else now
+        if self.last_tick_at is not None:
+            dt = now - self.last_tick_at
+            if dt > 0:
+                instant_fps = 1.0 / dt
+                self.smoothed_fps = (
+                    instant_fps
+                    if self.smoothed_fps is None
+                    else self.SMOOTHING * self.smoothed_fps + (1 - self.SMOOTHING) * instant_fps
+                )
+        self.last_tick_at = now
+
+        if self.displayed_fps is None or now - self.last_refresh_at >= self.REFRESH_INTERVAL_S:
+            self.displayed_fps = self.smoothed_fps
+            self.last_refresh_at = now
+        return self.smoothed_fps
+
+    def draw(self, frame, native_fps: float):
+        if self.displayed_fps is None:
+            return
+        dropped = self.displayed_fps < self.DROP_RATIO * native_fps
+        color = self.COLOR_DROPPED if dropped else self.COLOR_OK
+        text = f"Live FPS: {self.displayed_fps:.1f}  |  Video FPS: {native_fps:.1f}"
+        cv2.putText(
+            frame,
+            text,
+            self.POSITION,
+            self.FONT,
+            self.FONT_SCALE,
+            color,
+            self.THICKNESS,
+            lineType=cv2.LINE_AA,
+        )
+
+
 class FramePacer:
     """Paces against an absolute frame schedule (not a per-iteration budget), so
     a single frame's timing error self-corrects on the next frame instead of
@@ -835,6 +903,7 @@ class PlayerTracker:
         self.fader = FadeController()
         self.staleness = StalenessTracker()
         self.display_stats = DisplayStats()
+        self.fps_overlay = FpsOverlay()
         self.frame_count = 0
         self.play_start = None
         self.achieved_fps = None
@@ -879,6 +948,7 @@ class PlayerTracker:
     def _play(self, cap: cv2.VideoCapture, worker: InferenceWorker, pacer: FramePacer):
         while True:
             iteration_start = time.perf_counter()
+            self.fps_overlay.tick(iteration_start)
 
             t0 = time.perf_counter()
             ret, frame = cap.read()
@@ -899,6 +969,7 @@ class PlayerTracker:
             self.renderer.draw(frame, boxes, alphas)
             t3 = time.perf_counter()
             if self.show_window:
+                self.fps_overlay.draw(frame, native_fps=1000 / pacer.frame_budget_ms)
                 cv2.imshow(self.WINDOW_NAME, frame)
             t4 = time.perf_counter()
 
