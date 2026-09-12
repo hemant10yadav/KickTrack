@@ -43,6 +43,18 @@ def parse_args():
         f"(default: {pipeline.INFERENCE_IMGSZ[0]},{pipeline.INFERENCE_IMGSZ[1]}) — "
         f"must match the shape the .mlpackage was exported with",
     )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Write annotated frames to this video file instead of (or alongside) "
+        "displaying them. Runs headless (no window, no real-time pacing) unless "
+        "--show is also passed.",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Display a live window. Implied when --output is not given.",
+    )
     return parser.parse_args()
 
 
@@ -58,7 +70,14 @@ def main():
         sys.exit(1)
 
     model = YOLO(pipeline.MODEL_NAME)
-    PlayerTracker(video_source, model).run()
+    show_window = args.show or args.output is None
+    PlayerTracker(
+        video_source,
+        model,
+        show_window=show_window,
+        output_path=args.output,
+        realtime=show_window,
+    ).run()
 
 
 if __name__ == "__main__":
