@@ -58,13 +58,21 @@ def is_stream_source(source: str | int) -> bool:
 
 
 def track(model: YOLO, frame):
-    """Run detection + tracking on a single frame and return raw Ultralytics results."""
+    """Run detection + tracking on a single frame and return raw Ultralytics results.
+
+    No `device` kwarg: the CoreML backend always runs on the Neural Engine
+    (ComputeUnit.CPU_AND_NE, set in its own load_model) regardless of what's passed
+    here -- a leftover `device="mps"` from before the CoreML migration was still
+    read by the predictor, which moved the input tensor onto the MPS GPU and back
+    to CPU every frame before the real CoreML call, for no benefit. Measured cost of
+    that round trip: ~4.6ms/frame on match_5.mp4 (29.2ms -> 24.6ms avg inference),
+    dropping its frame-drop rate from 33% to 19.5%.
+    """
     return model.track(
         frame,
         classes=[PERSON_CLASS_ID],
         persist=True,
         tracker=TRACKER_CONFIG,
-        device="mps",
         conf=0.15,
         imgsz=INFERENCE_IMGSZ,
         verbose=False,
