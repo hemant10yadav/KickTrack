@@ -59,6 +59,48 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   `model.export(format="coreml", imgsz=1280, half=True)` (must be run from a Python
   3.13 venv — see above).
 
+- **Rectangular `imgsz` (640x1152), not square (1280x1280)**: the actual footage is
+  16:9, so a square export pads ~30% of the input with wasted letterbox pixels.
+  Exporting at a rectangular size matching the footage aspect ratio drops only
+  that padding, not player detail, so on-pitch detection recall is unchanged —
+  verified visually frame-by-frame against the square export on both a 4K and a
+  1080p clip; the only box-count difference was crowd/stand false positives,
+  never a missed player. Went through 736x1280 first (inference 50.2ms ->
+  34.8ms avg on `match_4.mp4`), then shrunk further to 640x1152 once the same
+  visual-recall check passed again (34.8ms -> ~29-31ms avg) — this is what gets
+  a 50fps source (`match_5.mp4`) under its 20ms native frame budget for the
+  first time; worker frame drops on `match_5.mp4` went 1126/1750 (square@1280,
+  64%) -> 795/1750 (rect@1280, 45%) -> 585/1750 (rect@1152, 33%). `match_3`/
+  `match_4` (25-30fps) now drop 0 frames. `scripts/track_players.py`'s
+  `INFERENCE_IMGSZ` must stay in sync with whatever shape the model was last
+  exported at. Export command:
+  `model.export(format="coreml", imgsz=(640, 1152), half=True)`.
+  (Int8 quantization would cut latency further but needs a new `scikit-learn`
+  dependency for ultralytics' CoreML k-means quantization path — not added
+  without checking first, see "Working conventions" below.)
+
+- **`PlayerIdentityManager`, not raw BoT-SORT `track_id`, as the application's
+  player identity**: debugged (while checking whether `match_5.mp4`'s frame
+  drops were a quality regression) that BoT-SORT reassigns a brand-new
+  `track_id` to the same physical player after a single missed frame — a
+  small/distant, borderline-confidence box (median first-appearance area
+  ~717px² on 3840x2160 footage) fails BoT-SORT's own IoU/motion match well
+  before `track_buffer` (90 frames) would expire it. Confirmed by dumping
+  BoT-SORT's internal tracked/lost pools frame-by-frame around one exact case
+  (track 95 -> 159, ~9px apart, 1-frame gap). This is pre-existing — present
+  equally on clean 25fps footage with no async frame-dropping at all — not
+  caused by the imgsz work above. Fixed at two levels (see `docs/PLAN.md` Plan
+  2.5 for the full numbers): `botsort_custom.yaml` thresholds tuned to reduce
+  churn at the source, plus `PlayerIdentityManager` in `track_players.py` as an
+  app-level safety net that reconciles a freshly-appearing `track_id` against
+  recently-lost players (predicted position + bbox-size gate) before anything
+  downstream (team classification, display confirm/grace state) keys off it.
+  Ruled out: async frame-dropping itself (a synchronous, drop-free feed churned
+  *worse*), GMC (only a partial contributor), appearance ReID (only a partial
+  fix, added cost and an auto-downloaded model). Covered by
+  `tests/test_player_identity.py` (fast/synthetic) and
+  `tests/test_tracking_quality.py` (slow, real-footage regression ceilings).
+
 - **Async inference worker keeps latest + previous result, not just latest**: enables
   `MotionExtrapolator` to estimate each track's velocity and shift its displayed
   position forward by however long it's been since the last AI result, so markers

@@ -39,6 +39,57 @@ Take a fixed-camera football video and show a marker on each player that moves w
         detection quality as PyTorch/MPS, ~18% faster (57-61ms vs 70ms/frame)
   - [X] Migrate project to Python 3.13 (coremltools has no working native extensions
         on 3.14 yet)
+  - [X] Rectangular `imgsz` matching the footage's 16:9 aspect ratio, instead of
+        padding to a square — cuts wasted padding pixels, not player detail, so
+        recall on the pitch is unchanged (verified visually on both a 4K and a
+        1080p clip: same players/confidences detected at every step below; any
+        box-count difference was crowd/stand false positives, never a missed
+        player). Iterated twice:
+          - 736x1280 first: inference 50.2ms -> 34.8ms avg on match_4.mp4.
+          - Then 640x1152 (smaller still, same aspect): 34.8ms -> ~29-31ms avg,
+            which gets a 50fps source (match_5.mp4) under its 20ms native frame
+            budget for the first time — previously inference was *always* slower
+            than 50fps playback, so the async worker was structurally guaranteed
+            to drop frames no matter how it was tuned.
+          - Frame drops on match_5.mp4 (full clip, 1750 frames): square@1280
+            1126 dropped (64%) -> rect@1280 795 (45%) -> rect@1152 585 (33%).
+            match_3/match_4 (25-30fps) dropped 0 frames at rect@1152.
+          - Int8 quantization (a further latency lever) needs a new `scikit-learn`
+            dependency ultralytics' CoreML export path pulls in for k-means
+            quantization — not added since dependencies need checking with the
+            user first (see CLAUDE.md).
+          - Export command: `model.export(format="coreml", imgsz=(640, 1152), half=True)`.
+  - [X] Debugged BoT-SORT track_id churn (found while checking match_5.mp4's frame
+        drops didn't look like a quality regression — turned out to be pre-existing,
+        present equally on clean 25fps footage). Root cause: a small/distant,
+        borderline-confidence box (median first-appearance area ~717px^2 on
+        3840x2160 footage) loses its IoU/motion match for a single missed frame and
+        gets a brand-new track_id, well before `track_buffer` (90 frames) would
+        expire it — confirmed by dumping BoT-SORT's internal tracked/lost pools
+        frame-by-frame around one exact case (track 95 -> 159, ~9px apart, 1-frame
+        gap). Fixed two levels up:
+          - `botsort_custom.yaml`: raised `new_track_thresh` 0.25->0.5 (a fresh
+            track now needs real confidence to exist) and `match_thresh` 0.8->0.9
+            (more permissive re-matching of marginal-confidence redetections to
+            their old/lost track). Cut raw BoT-SORT track_id churn on match_4.mp4
+            (300 frames, ~22-28 real people) from 52 -> 29 unique IDs.
+          - `PlayerIdentityManager` (new, in `track_players.py`): an app-level
+            identity layer above BoT-SORT's own track_id, so whatever churn the
+            tracker-level tuning doesn't catch is absorbed before it reaches team
+            classification / display state. Reconciles a freshly-appearing
+            track_id against recently-lost players using predicted position
+            (velocity-extrapolated over the frame gap) normalized by bbox height,
+            plus a size-ratio gate — deliberately conservative (start strict on
+            merges, loosen only against measured false-splits).
+          - Ruled out along the way: frame drops from the async worker (a
+            synchronous, drop-free feed churned *worse*, not better); GMC/camera
+            motion compensation (disabling it only cut churn 79->64, not the main
+            cause); appearance ReID (`with_reid: True`, only cut ~64->50 IDs, added
+            per-box cost and an auto-downloaded model — not adopted).
+          - Tests: `tests/test_player_identity.py` (fast, synthetic — pins the
+            exact 95->159 case plus the merge gates) and
+            `tests/test_tracking_quality.py` (slow, real footage — churn-ratio and
+            frame-drop-ratio regression ceilings on match_3/4/5).
 
 - [ ] **Plan 3: Player & Match Analytics**
 

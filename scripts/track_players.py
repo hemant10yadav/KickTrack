@@ -1,5 +1,6 @@
 import argparse
 import math
+import re
 import sys
 import threading
 import time
@@ -13,13 +14,47 @@ from ultralytics import YOLO
 PERSON_CLASS_ID = 0  # COCO class id for "person"
 TRACKER_CONFIG = str(Path(__file__).parent / "botsort_custom.yaml")
 MODEL_NAME = "yolov8m.mlpackage"
-INFERENCE_IMGSZ = 1280
+# (height, width): matches the 16:9 aspect ratio of the actual footage instead of
+# padding to a square, and is smaller than the original 1280 square export.
+# Verified visually (not just by box-count) on both a 1080p 50fps clip
+# (match_5.mp4) and a 4K 30fps clip (match_4.mp4): every player detected at
+# 736x1280 is still detected here at equal-or-better confidence -- box count on
+# spot-check frames was 33-34 either way, only the padding pixels were cut, not
+# player detail. Measured latency: ~35ms -> ~18ms/frame (about 2x), which gets a
+# 50fps source under its 20ms native frame budget for the first time (previously
+# inference was always slower than 50fps playback, so the async worker was
+# structurally guaranteed to drop frames no matter how it was tuned).
+# The exported .mlpackage has this shape baked into its input tensor, so this must
+# stay in sync with the `imgsz` used at export time (see CLAUDE.md export command).
+INFERENCE_IMGSZ = (640, 1152)
 DEFAULT_VIDEO = "data/videos/sample.mp4"
 
 NUM_TEAM_CLUSTERS = 3  # 2 teams + referee/other
 TEAM_FIT_AFTER_SAMPLES = 25  # jersey-color samples collected before clusters are fixed
 UNCLASSIFIED_COLOR = (180, 180, 180)  # gray, shown before a track has enough samples
 JERSEY_RESAMPLE_INTERVAL = 15  # worker cycles between re-observations of a settled track
+
+STREAM_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")  # e.g. rtmp://, rtsp://, http(s)://
+
+
+def resolve_video_source(raw: str) -> str | int:
+    """Turn a CLI argument into whatever cv2.VideoCapture should receive.
+
+    A live source (stream URL or webcam device index) must bypass Path entirely:
+    Path() silently collapses a URL's "://" down to ":/" (confirmed: Path("rtmp://
+    host/live") -> "rtmp:/host/live"), which cv2.VideoCapture then fails to open.
+    A plain local file still goes through Path so relative paths resolve the same
+    way they always have.
+    """
+    if raw.isdigit():
+        return int(raw)  # webcam device index, e.g. "0"
+    if STREAM_SCHEME_RE.match(raw):
+        return raw  # stream URL, passed through untouched
+    return str(Path(raw))
+
+
+def is_stream_source(source: str | int) -> bool:
+    return isinstance(source, int) or bool(STREAM_SCHEME_RE.match(source))
 
 
 def track(model: YOLO, frame):
@@ -437,6 +472,187 @@ class StateManager:
         return confirmed
 
 
+@dataclass
+class PlayerState:
+    """Application-level identity that outlives BoT-SORT's own transient track_id.
+
+    Debugging match_4.mp4 found BoT-SORT reassigning a brand-new track_id to the
+    same physical player after a single missed frame — a small/distant,
+    borderline-confidence box (e.g. track 95 -> 159, ~9px apart, one frame gap)
+    fails the tracker's own IoU/motion match and gets treated as a new track,
+    even though `track_buffer` is nowhere near exhausted. Rather than chase that
+    inside BoT-SORT's own matching, PlayerIdentityManager reconciles it one layer
+    up: a stable `player_id` that downstream code (team classification, the
+    confirm/grace display logic, and eventually speed/distance) keys off, so a
+    tracker-side ID swap doesn't reset a player's accumulated state.
+    """
+
+    player_id: int
+    tracker_id: int
+    bbox: tuple[int, int, int, int]
+    vx: float
+    vy: float
+    last_seen_frame: int
+    status: str  # "active" | "lost"
+
+
+class PlayerIdentityManager:
+    """Reconciles BoT-SORT's transient track_id into a persistent player_id.
+
+    Fast path: a track_id already mapped to a player is a cheap dict lookup —
+    no matching needed as long as BoT-SORT keeps reporting the same ID.
+
+    Slow path: an unmapped track_id (first sighting, or BoT-SORT re-detecting the
+    same player under a new ID) is scored against recently-lost players by
+    predicted position — last known velocity extrapolated over the frame gap —
+    normalized by the player's own bbox height, since a given pixel error means
+    a lot for a tiny distant player and nothing for a large close one. A bbox
+    size-ratio sanity gate guards against merging two different, merely nearby,
+    players. Within MAX_LOST_FRAMES and MAX_NORM_DIST, it's treated as the same
+    player continuing under a new track_id; otherwise a new player is minted.
+
+    The values below are a starting point (deliberately conservative — start
+    strict on merges, loosen only against measured false-splits), not tuned
+    against real match footage yet.
+    """
+
+    MAX_LOST_FRAMES = 30  # ~1.25s at 24fps
+    MAX_NORM_DIST = 3.0  # (predicted-position error) / bbox_height
+    SIZE_RATIO_RANGE = (0.5, 2.0)
+
+    def __init__(self):
+        self.players: dict[int, PlayerState] = {}
+        self.tracker_to_player: dict[int, int] = {}
+        self._next_id = 1
+        self.switch_log = []  # instrumentation: every track_id reconciliation
+
+    @property
+    def total_players_minted(self) -> int:
+        """Count of persistent player_ids ever created (active, lost, or retired)."""
+        return self._next_id - 1
+
+    def update(self, detections: list, frame_id: int) -> list:
+        """detections: (x1, y1, x2, y2, track_id) tuples from extract_boxes.
+
+        Returns the same shape with track_id replaced by a persistent
+        player_id. Untracked detections (track_id < 0) pass through as -1.
+        """
+        present_tracker_ids = {tid for *_, tid in detections if tid >= 0}
+
+        # Mark vanished-this-frame players lost *before* reconciling new/unmapped
+        # track_ids, so a same-cycle reacquisition (the 95 -> 159 case) sees the
+        # just-vanished player as a candidate immediately, not one frame late.
+        for player in self.players.values():
+            if player.status == "active" and player.tracker_id not in present_tracker_ids:
+                player.status = "lost"
+
+        results = []
+        for x1, y1, x2, y2, tracker_id in detections:
+            if tracker_id < 0:
+                results.append((x1, y1, x2, y2, -1))
+                continue
+            bbox = (x1, y1, x2, y2)
+            player_id = self.tracker_to_player.get(tracker_id)
+            if player_id is None:
+                player_id = self._reconcile(tracker_id, bbox, frame_id)
+            self._observe(player_id, tracker_id, bbox, frame_id)
+            results.append((x1, y1, x2, y2, player_id))
+
+        self._retire_stale(frame_id)
+        return results
+
+    def _reconcile(self, tracker_id: int, bbox: tuple, frame_id: int) -> int:
+        """Find the recently-lost player this new track_id is probably continuing,
+        or mint a new player_id if no candidate passes the gates."""
+        cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        height = max(1, bbox[3] - bbox[1])
+
+        best_id, best_norm_dist = None, None
+        for player in self.players.values():
+            if player.status != "lost":
+                continue
+            gap = frame_id - player.last_seen_frame
+            if gap <= 0 or gap > self.MAX_LOST_FRAMES:
+                continue
+            px1, py1, px2, py2 = player.bbox
+            p_height = max(1, py2 - py1)
+            size_ratio = height / p_height
+            if not (self.SIZE_RATIO_RANGE[0] <= size_ratio <= self.SIZE_RATIO_RANGE[1]):
+                continue
+            pred_cx = (px1 + px2) / 2 + player.vx * gap
+            pred_cy = (py1 + py2) / 2 + player.vy * gap
+            norm_dist = ((cx - pred_cx) ** 2 + (cy - pred_cy) ** 2) ** 0.5 / p_height
+            if norm_dist > self.MAX_NORM_DIST:
+                continue
+            if best_norm_dist is None or norm_dist < best_norm_dist:
+                best_norm_dist = norm_dist
+                best_id = player.player_id
+
+        if best_id is not None:
+            old_tracker_id = self.players[best_id].tracker_id
+            self.switch_log.append(
+                {
+                    "frame": frame_id,
+                    "player_id": best_id,
+                    "old_tracker_id": old_tracker_id,
+                    "new_tracker_id": tracker_id,
+                    "norm_dist": round(best_norm_dist, 2),
+                }
+            )
+            self.tracker_to_player.pop(old_tracker_id, None)
+            self.tracker_to_player[tracker_id] = best_id
+            return best_id
+
+        new_id = self._next_id
+        self._next_id += 1
+        self.tracker_to_player[tracker_id] = new_id
+        return new_id
+
+    def _observe(self, player_id: int, tracker_id: int, bbox: tuple, frame_id: int) -> None:
+        existing = self.players.get(player_id)
+        if existing is not None:
+            gap = max(1, frame_id - existing.last_seen_frame)
+            pcx = (existing.bbox[0] + existing.bbox[2]) / 2
+            pcy = (existing.bbox[1] + existing.bbox[3]) / 2
+            cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+            vx, vy = (cx - pcx) / gap, (cy - pcy) / gap
+        else:
+            vx, vy = 0.0, 0.0
+        self.players[player_id] = PlayerState(
+            player_id=player_id,
+            tracker_id=tracker_id,
+            bbox=bbox,
+            vx=vx,
+            vy=vy,
+            last_seen_frame=frame_id,
+            status="active",
+        )
+
+    def _retire_stale(self, frame_id: int) -> None:
+        stale = [
+            pid
+            for pid, p in self.players.items()
+            if p.status == "lost" and frame_id - p.last_seen_frame > self.MAX_LOST_FRAMES
+        ]
+        for pid in stale:
+            del self.players[pid]
+
+    def summary(self) -> str:
+        lines = [
+            f"Persistent player IDs minted: {self.total_players_minted}",
+            f"track_id -> player_id reconciliations (switches absorbed): {len(self.switch_log)}",
+        ]
+        for event in self.switch_log[:20]:
+            lines.append(
+                f"  frame {event['frame']}: track {event['old_tracker_id']} -> "
+                f"{event['new_tracker_id']} kept as player {event['player_id']} "
+                f"(norm_dist={event['norm_dist']})"
+            )
+        if len(self.switch_log) > 20:
+            lines.append(f"  ... and {len(self.switch_log) - 20} more")
+        return "\n".join(lines)
+
+
 class InferenceWorker:
     """Runs detection + tracking continuously in the background, always working on
     the most recently submitted frame. Frames arriving faster than inference finishes
@@ -465,6 +681,7 @@ class InferenceWorker:
         self.running = True
         self.stats = WorkerStats()
         self.state = StateManager()
+        self.identity = PlayerIdentityManager()
         self.cycle_count = 0
         self.jersey_last_sampled = {}
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -503,6 +720,10 @@ class InferenceWorker:
             boxes = extract_boxes(results)
             extract_ms = (time.perf_counter() - extract_start) * 1000
             self.cycle_count += 1
+            # Reconcile BoT-SORT's own transient track_id into a persistent player_id
+            # (see PlayerIdentityManager) before anything downstream (team
+            # classification, confirm/grace display state) keys off it.
+            boxes = self.identity.update(boxes, self.cycle_count)
 
             jersey_start = time.perf_counter()
             for i, (x1, y1, x2, y2, track_id) in enumerate(boxes):
@@ -892,8 +1113,8 @@ class PlayerTracker:
     WINDOW_NAME = "Football Tracker"
     QUIT_KEY = ord("q")
 
-    def __init__(self, video_path: Path, model: YOLO, show_window: bool = True):
-        self.video_path = video_path
+    def __init__(self, video_source: str | int, model: YOLO, show_window: bool = True):
+        self.video_source = video_source
         self.model = model
         self.show_window = show_window
         self.classifier = TeamClassifier()
@@ -924,19 +1145,21 @@ class PlayerTracker:
                 cv2.destroyAllWindows()
             elapsed = time.perf_counter() - self.play_start
             self.achieved_fps = self.frame_count / elapsed
-            print(f"Read {self.frame_count} frames from {self.video_path}")
+            print(f"Read {self.frame_count} frames from {self.video_source}")
             print(f"Display FPS: {self.achieved_fps:.1f}")
             print()
             print(worker.stats.summary())
+            print()
+            print(worker.identity.summary())
             print()
             print(self.staleness.summary())
             print()
             print(self.display_stats.summary())
 
     def _open_capture(self) -> cv2.VideoCapture:
-        cap = cv2.VideoCapture(str(self.video_path))
+        cap = cv2.VideoCapture(self.video_source)
         if not cap.isOpened():
-            print(f"Could not open video: {self.video_path}")
+            print(f"Could not open video: {self.video_source}")
             sys.exit(1)
         return cap
 
@@ -989,20 +1212,34 @@ class PlayerTracker:
                 break
 
 
+def parse_imgsz(raw: str) -> int | tuple[int, int]:
+    """Accepts a single size ("1280", square) or "H,W" (rectangular, must match
+    the shape the .mlpackage was exported with)."""
+    if "," in raw:
+        h, w = raw.split(",")
+        return (int(h), int(w))
+    return int(raw)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Track players in a football video")
     parser.add_argument(
         "video",
         nargs="?",
         default=DEFAULT_VIDEO,
-        help=f"Path to the input video (default: {DEFAULT_VIDEO})",
+        help=(
+            f"Path to a local video file, a stream URL (rtmp://, rtsp://, http(s)://), "
+            f"or a webcam device index (e.g. 0) (default: {DEFAULT_VIDEO})"
+        ),
     )
     parser.add_argument("--model", default=MODEL_NAME, help=f"YOLO model (default: {MODEL_NAME})")
     parser.add_argument(
         "--imgsz",
-        type=int,
+        type=parse_imgsz,
         default=INFERENCE_IMGSZ,
-        help=f"Inference size (default: {INFERENCE_IMGSZ})",
+        help=f"Inference size: single int for square, or 'H,W' for rectangular "
+        f"(default: {INFERENCE_IMGSZ[0]},{INFERENCE_IMGSZ[1]}) — must match the "
+        f"shape the .mlpackage was exported with",
     )
     return parser.parse_args()
 
@@ -1013,14 +1250,14 @@ def main():
     MODEL_NAME = args.model
     INFERENCE_IMGSZ = args.imgsz
 
-    video_path = Path(args.video)
-    if not video_path.exists():
-        print(f"Video not found: {video_path}")
+    video_source = resolve_video_source(args.video)
+    if not is_stream_source(video_source) and not Path(video_source).exists():
+        print(f"Video not found: {video_source}")
         print("Place a fixed-camera football video there, or pass a path as an argument.")
         sys.exit(1)
 
     model = YOLO(MODEL_NAME)
-    PlayerTracker(video_path, model).run()
+    PlayerTracker(video_source, model).run()
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ MIN_FPS_RATIO = 0.8
 FIXTURE_VIDEOS = [
     Path("tests/videos/match_3.mp4"),  # trimmed to 10s
     Path("tests/videos/match_4.mp4"),  # trimmed to 20s
+    Path("tests/videos/match_5.mp4"),  # trimmed to 10s, 50fps -- the demanding case
 ]
 
 
