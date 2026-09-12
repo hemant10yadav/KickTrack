@@ -4,8 +4,9 @@ __pycache__/
 *.pyc
 .env
 
-# Model weights (downloaded automatically, don't commit)
+# Model weights (downloaded/exported automatically, don't commit)
 *.pt
+*.mlpackage/
 
 # Test/sample footage (large binaries)
 data/
