@@ -1,5 +1,6 @@
 import argparse
 import math
+import re
 import sys
 import threading
 import time
@@ -20,6 +21,28 @@ NUM_TEAM_CLUSTERS = 3  # 2 teams + referee/other
 TEAM_FIT_AFTER_SAMPLES = 25  # jersey-color samples collected before clusters are fixed
 UNCLASSIFIED_COLOR = (180, 180, 180)  # gray, shown before a track has enough samples
 JERSEY_RESAMPLE_INTERVAL = 15  # worker cycles between re-observations of a settled track
+
+STREAM_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")  # e.g. rtmp://, rtsp://, http(s)://
+
+
+def resolve_video_source(raw: str) -> str | int:
+    """Turn a CLI argument into whatever cv2.VideoCapture should receive.
+
+    A live source (stream URL or webcam device index) must bypass Path entirely:
+    Path() silently collapses a URL's "://" down to ":/" (confirmed: Path("rtmp://
+    host/live") -> "rtmp:/host/live"), which cv2.VideoCapture then fails to open.
+    A plain local file still goes through Path so relative paths resolve the same
+    way they always have.
+    """
+    if raw.isdigit():
+        return int(raw)  # webcam device index, e.g. "0"
+    if STREAM_SCHEME_RE.match(raw):
+        return raw  # stream URL, passed through untouched
+    return str(Path(raw))
+
+
+def is_stream_source(source: str | int) -> bool:
+    return isinstance(source, int) or bool(STREAM_SCHEME_RE.match(source))
 
 
 def track(model: YOLO, frame):
@@ -892,8 +915,8 @@ class PlayerTracker:
     WINDOW_NAME = "Football Tracker"
     QUIT_KEY = ord("q")
 
-    def __init__(self, video_path: Path, model: YOLO, show_window: bool = True):
-        self.video_path = video_path
+    def __init__(self, video_source: str | int, model: YOLO, show_window: bool = True):
+        self.video_source = video_source
         self.model = model
         self.show_window = show_window
         self.classifier = TeamClassifier()
@@ -924,7 +947,7 @@ class PlayerTracker:
                 cv2.destroyAllWindows()
             elapsed = time.perf_counter() - self.play_start
             self.achieved_fps = self.frame_count / elapsed
-            print(f"Read {self.frame_count} frames from {self.video_path}")
+            print(f"Read {self.frame_count} frames from {self.video_source}")
             print(f"Display FPS: {self.achieved_fps:.1f}")
             print()
             print(worker.stats.summary())
@@ -934,9 +957,9 @@ class PlayerTracker:
             print(self.display_stats.summary())
 
     def _open_capture(self) -> cv2.VideoCapture:
-        cap = cv2.VideoCapture(str(self.video_path))
+        cap = cv2.VideoCapture(self.video_source)
         if not cap.isOpened():
-            print(f"Could not open video: {self.video_path}")
+            print(f"Could not open video: {self.video_source}")
             sys.exit(1)
         return cap
 
@@ -995,7 +1018,10 @@ def parse_args():
         "video",
         nargs="?",
         default=DEFAULT_VIDEO,
-        help=f"Path to the input video (default: {DEFAULT_VIDEO})",
+        help=(
+            f"Path to a local video file, a stream URL (rtmp://, rtsp://, http(s)://), "
+            f"or a webcam device index (e.g. 0) (default: {DEFAULT_VIDEO})"
+        ),
     )
     parser.add_argument("--model", default=MODEL_NAME, help=f"YOLO model (default: {MODEL_NAME})")
     parser.add_argument(
@@ -1013,14 +1039,14 @@ def main():
     MODEL_NAME = args.model
     INFERENCE_IMGSZ = args.imgsz
 
-    video_path = Path(args.video)
-    if not video_path.exists():
-        print(f"Video not found: {video_path}")
+    video_source = resolve_video_source(args.video)
+    if not is_stream_source(video_source) and not Path(video_source).exists():
+        print(f"Video not found: {video_source}")
         print("Place a fixed-camera football video there, or pass a path as an argument.")
         sys.exit(1)
 
     model = YOLO(MODEL_NAME)
-    PlayerTracker(video_path, model).run()
+    PlayerTracker(video_source, model).run()
 
 
 if __name__ == "__main__":
