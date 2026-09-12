@@ -17,6 +17,9 @@ concurrency:
   group: demo-video-${{ github.workflow }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   render:
     runs-on: macos-14
