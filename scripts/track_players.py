@@ -47,7 +47,7 @@ class MarkerRenderer:
         self.size = size
 
     def draw(self, frame, boxes):
-        for x1, y1, x2, y2, track_id in boxes:
+        for x1, y1, x2, _y2, track_id in boxes:
             self._draw_triangle(frame, x1, y1, x2)
             self._draw_label(frame, x1, y1, track_id)
 
@@ -67,8 +67,13 @@ class MarkerRenderer:
 
     def _draw_label(self, frame, x1, y1, track_id):
         cv2.putText(
-            frame, f"ID {track_id}", (x1, y1 - 36),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.color, 2,
+            frame,
+            f"ID {track_id}",
+            (x1, y1 - 36),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            self.color,
+            2,
         )
 
 
