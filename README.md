@@ -37,7 +37,7 @@ uv run prek install
 Run the tracker on a video (defaults to `data/videos/sample.mp4` if no path given):
 
 ```bash
-uv run python scripts/track_players.py data/videos/match_1.mp4
+uv run python -m scripts.track_players data/videos/match_1.mp4
 ```
 
 This opens a live window playing the video with a marker + ID on each detected player. Press `q` to quit.
@@ -45,7 +45,10 @@ This opens a live window playing the video with a marker + ID on each detected p
 ## Project structure
 
 ```
-scripts/track_players.py   # tracking pipeline (PlayerTracker, InferenceWorker, MarkerRenderer, FramePacer)
+scripts/track_players.py   # CLI entrypoint (parse_args, main)
+scripts/pipeline.py        # tracking pipeline (PlayerTracker, InferenceWorker, detection, video source)
+scripts/player.py          # TeamClassifier, PlayerIdentityManager, StateManager
+scripts/display.py         # MarkerRenderer, FramePacer, motion/fade/stats
 scripts/botsort_custom.yaml # tracker tuning (camera motion compensation, track buffer)
 data/videos/                # test footage
 docs/PLAN.md                 # milestone checklist

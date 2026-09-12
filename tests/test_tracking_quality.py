@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from ultralytics import YOLO
 
-from scripts.track_players import MODEL_NAME, InferenceWorker, PlayerTracker
+from scripts.pipeline import MODEL_NAME, InferenceWorker, PlayerTracker
 
 # match_5.mp4 (50fps) is the demanding case: inference (~29ms) is still slower than
 # its 20ms native frame budget, so some drops are structurally expected -- this
