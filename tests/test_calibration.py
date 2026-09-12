@@ -10,7 +10,7 @@ from pathlib import Path
 import cv2
 import pytest
 
-from scripts.calibration import PitchCalibrator
+from scripts.calibration import CalibrationResult, PitchCalibrator
 
 FIXTURE_VIDEO = Path("tests/videos/match_4.mp4")
 WEIGHTS_DIR = Path("weights/pnlcalib")
@@ -62,3 +62,60 @@ def test_calibrate_returns_none_homography_when_no_correspondences():
     result = calibrator.calibrate(blank)
 
     assert result.homography is None
+
+
+class _FakeCalibrator:
+    """No real model -- exercises CalibrationWorker's threading/cadence logic
+    only, deterministically and fast."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def calibrate(self, frame):
+        self.calls += 1
+        return CalibrationResult(
+            homography=None,
+            num_keypoints=0,
+            num_lines=0,
+            top_kp_score=0.0,
+            top_line_score=0.0,
+        )
+
+
+def test_calibration_worker_updates_result_after_submit():
+    import time
+
+    from scripts.calibration import CalibrationWorker
+
+    fake = _FakeCalibrator()
+    worker = CalibrationWorker(fake, keyframe_interval=1).start()
+    try:
+        worker.submit(frame="fake_frame", frame_id=1)
+        for _ in range(50):
+            if fake.calls > 0:
+                break
+            time.sleep(0.01)
+        assert fake.calls > 0
+        assert worker.get_result() is not None
+    finally:
+        worker.stop()
+
+
+def test_calibration_worker_respects_keyframe_interval():
+    """Submitting frames faster than the keyframe interval must not
+    calibrate every single one -- that's the whole point of a keyframe
+    cadence."""
+    import time
+
+    from scripts.calibration import CalibrationWorker
+
+    fake = _FakeCalibrator()
+    worker = CalibrationWorker(fake, keyframe_interval=1000).start()
+    try:
+        for frame_id in range(1, 21):
+            worker.submit(frame="fake_frame", frame_id=frame_id)
+            time.sleep(0.005)
+        time.sleep(0.1)
+        assert fake.calls <= 1
+    finally:
+        worker.stop()

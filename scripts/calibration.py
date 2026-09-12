@@ -10,6 +10,8 @@ at a sustainable keyframe cadence in the background.
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -135,3 +137,62 @@ class PitchCalibrator:
             top_kp_score=top_kp_score,
             top_line_score=top_line_score,
         )
+
+
+class CalibrationWorker:
+    """Runs PitchCalibrator in the background at a fixed keyframe cadence,
+    never blocking the caller. Mirrors InferenceWorker's submit/get_result
+    pattern (see scripts/pipeline.py) but only actually calibrates every
+    `keyframe_interval`-th submitted frame_id -- calibration is too slow
+    (0.3-1.8s) to run on every frame like detection does.
+    """
+
+    def __init__(self, calibrator: PitchCalibrator, keyframe_interval: int = 30):
+        self.calibrator = calibrator
+        self.keyframe_interval = keyframe_interval
+        self.lock = threading.Lock()
+        self.pending = None  # (frame, frame_id)
+        self.latest: CalibrationResult | None = None
+        self.last_calibrated_frame_id = None
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> CalibrationWorker:
+        self.thread.start()
+        return self
+
+    def stop(self):
+        self.running = False
+        self.thread.join(timeout=2)
+
+    def submit(self, frame, frame_id: int):
+        if not self._is_keyframe(frame_id):
+            return
+        with self.lock:
+            self.pending = (frame, frame_id)
+
+    def get_result(self) -> CalibrationResult | None:
+        with self.lock:
+            return self.latest
+
+    def _is_keyframe(self, frame_id: int) -> bool:
+        if self.last_calibrated_frame_id is None:
+            return True
+        return frame_id - self.last_calibrated_frame_id >= self.keyframe_interval
+
+    def _run(self):
+        while self.running:
+            pending = self._take_pending()
+            if pending is None:
+                time.sleep(0.005)
+                continue
+            frame, frame_id = pending
+            result = self.calibrator.calibrate(frame)
+            with self.lock:
+                self.latest = result
+                self.last_calibrated_frame_id = frame_id
+
+    def _take_pending(self):
+        with self.lock:
+            pending, self.pending = self.pending, None
+            return pending
