@@ -1,4 +1,5 @@
 import argparse
+import math
 import sys
 import threading
 import time
@@ -80,6 +81,28 @@ def extract_jersey_color(frame, x1, y1, x2, y2):
     return np.median(pixels, axis=0)
 
 
+def boxes_overlap(box_a, box_b, overlap_ratio_threshold=0.2, iou_threshold=0.15) -> bool:
+    """True if two boxes overlap enough that jersey-color sampling would risk
+    picking up the other player — e.g. two opposing players contesting a ball.
+    Checked both as a fraction of the smaller box's area (catches a small box mostly
+    swallowed by a bigger one) and as IoU (catches two similarly-sized boxes
+    overlapping less than fully).
+    """
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    iw = max(0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0, min(ay2, by2) - max(ay1, by1))
+    intersection = iw * ih
+    if intersection == 0:
+        return False
+
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    overlap_ratio = intersection / min(area_a, area_b)
+    iou = intersection / (area_a + area_b - intersection)
+    return overlap_ratio > overlap_ratio_threshold or iou > iou_threshold
+
+
 class TeamClassifier:
     """Assigns each tracked player to a team based on jersey color.
 
@@ -151,19 +174,52 @@ class TeamClassifier:
 
 
 class MarkerRenderer:
-    """Draws player markers (triangle + ID label), color-coded by team."""
+    """Draws each player as a small downward-pointing pin floating a clear gap
+    above the player's head (FIFA-broadcast style), rather than touching it —
+    a smaller take on the original overhead triangle marker. Size scales down
+    with bbox height so distant players get smaller markers.
 
-    def __init__(self, classifier: TeamClassifier, size=14):
+    The anchor point (tip of the pin) is smoothed with its own, more aggressive
+    exponential average than DisplaySmoother's box easing: a standing/running
+    player's raw detection box wiggles a few pixels frame to frame (pose changes,
+    detector noise), which DisplaySmoother's alpha=0.5 (tuned for the box to stay
+    responsive, not for visual stillness) still lets most of through — enough for
+    a marker floating a fixed spot above the head to visibly wiggle. A slower,
+    marker-only anchor average removes that jitter without touching the box easing
+    other consumers (extrapolation, coasting) rely on.
+    """
+
+    MIN_HALF_WIDTH = 8
+    MAX_HALF_WIDTH = 14
+    HALF_WIDTH_FROM_HEIGHT = 0.12
+    PIN_HEIGHT_RATIO = 2.2  # pin height as a multiple of its half-width
+    MIN_HEAD_GAP = 10
+    MAX_HEAD_GAP = 20
+    HEAD_GAP_FROM_HEIGHT = 0.15
+    MARKER_ALPHA = 0.85
+    OUTLINE_COLOR = (0, 0, 0)
+    ANCHOR_EASING = 0.2
+    ANCHOR_SNAP_DISTANCE_PX = 150
+
+    def __init__(self, classifier: TeamClassifier):
         self.classifier = classifier
-        self.size = size
+        self.anchor_positions = {}  # track_id -> (tip_x, tip_y) floats
 
-    def draw(self, frame, boxes):
-        for x1, y1, x2, _y2, track_id in boxes:
+    def draw(self, frame, boxes, alphas=None):
+        current_ids = set()
+        for x1, y1, x2, y2, track_id in boxes:
             if track_id < 0:
                 continue  # unconfirmed BoT-SORT detection, not a real player ID yet
+            current_ids.add(track_id)
+            alpha = self.MARKER_ALPHA if alphas is None else alphas.get(track_id, self.MARKER_ALPHA)
+            if alpha <= 0.02:
+                continue  # fully faded out, nothing to draw
             color = self._color_for(track_id)
-            self._draw_triangle(frame, x1, y1, x2, color)
-            self._draw_label(frame, x1, y1, track_id, color)
+            tip = self._smoothed_tip(track_id, x1, y1, x2, y2)
+            bbox_height = y2 - y1
+            self._draw_marker(frame, tip, bbox_height, color, alpha)
+            self._draw_label(frame, x1, tip, bbox_height, track_id, color)
+        self._prune_anchors(current_ids)
 
     def _color_for(self, track_id):
         team = self.classifier.team_for(track_id)
@@ -171,29 +227,83 @@ class MarkerRenderer:
             return UNCLASSIFIED_COLOR
         return self.classifier.team_color(team)
 
-    def _draw_triangle(self, frame, x1, y1, x2, color):
-        center_x = (x1 + x2) // 2
-        top_y = y1 - 4
+    def _smoothed_tip(self, track_id, x1, y1, x2, y2):
+        head_gap = np.clip(
+            (y2 - y1) * self.HEAD_GAP_FROM_HEIGHT, self.MIN_HEAD_GAP, self.MAX_HEAD_GAP
+        )
+        raw_tip = ((x1 + x2) / 2, y1 - head_gap)
+        previous = self.anchor_positions.get(track_id)
+        if previous is None or math.hypot(raw_tip[0] - previous[0], raw_tip[1] - previous[1]) > (
+            self.ANCHOR_SNAP_DISTANCE_PX
+        ):
+            smoothed = raw_tip
+        else:
+            smoothed = (
+                previous[0] + (raw_tip[0] - previous[0]) * self.ANCHOR_EASING,
+                previous[1] + (raw_tip[1] - previous[1]) * self.ANCHOR_EASING,
+            )
+        self.anchor_positions[track_id] = smoothed
+        return (int(round(smoothed[0])), int(round(smoothed[1])))
+
+    def _prune_anchors(self, current_ids):
+        for track_id in [tid for tid in self.anchor_positions if tid not in current_ids]:
+            del self.anchor_positions[track_id]
+
+    def _draw_marker(self, frame, tip, bbox_height, color, alpha):
+        half_width = int(
+            np.clip(
+                bbox_height * self.HALF_WIDTH_FROM_HEIGHT, self.MIN_HALF_WIDTH, self.MAX_HALF_WIDTH
+            )
+        )
+        pin_height = int(half_width * self.PIN_HEIGHT_RATIO)
+
         points = np.array(
             [
-                [center_x, top_y],
-                [center_x - self.size, top_y - self.size * 2],
-                [center_x + self.size, top_y - self.size * 2],
+                [tip[0], tip[1]],
+                [tip[0] - half_width, tip[1] - pin_height],
+                [tip[0] + half_width, tip[1] - pin_height],
             ],
             dtype=np.int32,
         )
-        cv2.fillPoly(frame, [points], color)
-        cv2.polylines(frame, [points], isClosed=True, color=(0, 0, 0), thickness=1)
+        self._blend_triangle(frame, points, color, alpha)
 
-    def _draw_label(self, frame, x1, y1, track_id, color):
+    def _blend_triangle(self, frame, points, color, alpha):
+        h, w = frame.shape[:2]
+        pad = 2
+        x0, y0 = max(0, points[:, 0].min() - pad), max(0, points[:, 1].min() - pad)
+        x1, y1 = min(w, points[:, 0].max() + pad), min(h, points[:, 1].max() + pad)
+        if x1 <= x0 or y1 <= y0:
+            return
+        roi = frame[y0:y1, x0:x1]
+        overlay = roi.copy()
+        shifted = points - [x0, y0]
+        cv2.fillPoly(overlay, [shifted], color, lineType=cv2.LINE_AA)
+        cv2.polylines(
+            overlay,
+            [shifted],
+            isClosed=True,
+            color=self.OUTLINE_COLOR,
+            thickness=1,
+            lineType=cv2.LINE_AA,
+        )
+        cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0, dst=roi)
+
+    def _draw_label(self, frame, x1, tip, bbox_height, track_id, color):
+        half_width = int(
+            np.clip(
+                bbox_height * self.HALF_WIDTH_FROM_HEIGHT, self.MIN_HALF_WIDTH, self.MAX_HALF_WIDTH
+            )
+        )
+        pin_height = int(half_width * self.PIN_HEIGHT_RATIO)
         cv2.putText(
             frame,
             f"ID {track_id}",
-            (x1, y1 - 36),
+            (x1, max(0, tip[1] - pin_height - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             color,
             2,
+            lineType=cv2.LINE_AA,
         )
 
 
@@ -204,6 +314,7 @@ class InferenceResult:
     captured_at: float
     previous_boxes: list
     previous_captured_at: float | None
+    coasting_progress: dict = None  # track_id -> fraction (0-1) through its grace window
 
 
 class WorkerStats:
@@ -268,6 +379,64 @@ class WorkerStats:
         return "\n".join(lines)
 
 
+class StateManager:
+    """Confirms a track as visible only after it's been detected for CONFIRM_CYCLES
+    consecutive worker cycles, so a single spurious/noise detection doesn't blink
+    onto screen for one frame and vanish. Operates on worker cycles (AI results),
+    not display frames, since a single result is redisplayed across several display
+    frames via extrapolation.
+
+    Once a track is confirmed, a lone missed detection (motion blur, brief occlusion,
+    ordinary detector noise) coasts on its last known box for up to GRACE_CYCLES
+    cycles instead of vanishing immediately and having to re-earn CONFIRM_CYCLES from
+    scratch — measured on real footage, an unconditional instant-drop caused a
+    confirmed track dropout roughly once per worker cycle, i.e. constant flicker.
+    """
+
+    CONFIRM_CYCLES = 2
+    GRACE_CYCLES = 2
+
+    def __init__(self):
+        self.consecutive_counts = {}  # track_id -> consecutive cycles detected
+        self.miss_counts = {}  # track_id -> consecutive cycles missed since last seen
+        self.last_box = {}  # track_id -> last known (x1, y1, x2, y2), while confirmed
+
+    def update(self, boxes):
+        """Call once per worker cycle with that cycle's raw detected boxes. Returns
+        the subset of boxes for tracks that have reached CONFIRM_CYCLES, including
+        confirmed tracks currently coasting through a within-grace miss."""
+        present_ids = set()
+        confirmed = []
+        for x1, y1, x2, y2, track_id in boxes:
+            if track_id < 0:
+                confirmed.append((x1, y1, x2, y2, track_id))
+                continue
+            present_ids.add(track_id)
+            count = self.consecutive_counts.get(track_id, 0) + 1
+            self.consecutive_counts[track_id] = count
+            self.miss_counts[track_id] = 0
+            if count >= self.CONFIRM_CYCLES:
+                self.last_box[track_id] = (x1, y1, x2, y2)
+                confirmed.append((x1, y1, x2, y2, track_id))
+
+        for track_id in list(self.consecutive_counts):
+            if track_id in present_ids:
+                continue
+            if track_id not in self.last_box:
+                del self.consecutive_counts[track_id]  # never confirmed, no grace
+                continue
+            self.miss_counts[track_id] += 1
+            if self.miss_counts[track_id] > self.GRACE_CYCLES:
+                del self.consecutive_counts[track_id]
+                del self.miss_counts[track_id]
+                del self.last_box[track_id]
+            else:
+                x1, y1, x2, y2 = self.last_box[track_id]
+                confirmed.append((x1, y1, x2, y2, track_id))
+
+        return confirmed
+
+
 class InferenceWorker:
     """Runs detection + tracking continuously in the background, always working on
     the most recently submitted frame. Frames arriving faster than inference finishes
@@ -286,10 +455,16 @@ class InferenceWorker:
         self.lock = threading.Lock()
         self.pending = None  # (frame, frame_id, captured_at)
         self.latest = InferenceResult(
-            boxes=[], frame_id=None, captured_at=None, previous_boxes=[], previous_captured_at=None
+            boxes=[],
+            frame_id=None,
+            captured_at=None,
+            previous_boxes=[],
+            previous_captured_at=None,
+            coasting_progress={},
         )
         self.running = True
         self.stats = WorkerStats()
+        self.state = StateManager()
         self.cycle_count = 0
         self.jersey_last_sampled = {}
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -330,11 +505,13 @@ class InferenceWorker:
             self.cycle_count += 1
 
             jersey_start = time.perf_counter()
-            for x1, y1, x2, y2, track_id in boxes:
+            for i, (x1, y1, x2, y2, track_id) in enumerate(boxes):
                 self.stats.boxes_seen += 1
                 if track_id < 0:
                     continue
                 if not self._should_sample_jersey(track_id):
+                    continue
+                if self._overlaps_another(boxes, i):
                     continue
                 self.stats.jersey_extractions += 1
                 color = extract_jersey_color(frame, x1, y1, x2, y2)
@@ -344,19 +521,35 @@ class InferenceWorker:
             total_ms = (time.perf_counter() - total_start) * 1000
             self.stats.record_processed(inference_ms, extract_ms, jersey_ms, total_ms)
 
+            confirmed_boxes = self.state.update(boxes)
+            coasting_progress = {
+                track_id: min(1.0, miss_count / self.state.GRACE_CYCLES)
+                for track_id, miss_count in self.state.miss_counts.items()
+                if miss_count > 0
+            }
+
             with self.lock:
                 self.latest = InferenceResult(
-                    boxes=boxes,
+                    boxes=confirmed_boxes,
                     frame_id=frame_id,
                     captured_at=captured_at,
                     previous_boxes=self.latest.boxes,
                     previous_captured_at=self.latest.captured_at,
+                    coasting_progress=coasting_progress,
                 )
 
     def _take_pending(self):
         with self.lock:
             pending, self.pending = self.pending, None
             return pending
+
+    def _overlaps_another(self, boxes, index) -> bool:
+        x1, y1, x2, y2, _ = boxes[index]
+        return any(
+            boxes_overlap((x1, y1, x2, y2), (ox1, oy1, ox2, oy2))
+            for i, (ox1, oy1, ox2, oy2, _) in enumerate(boxes)
+            if i != index
+        )
 
     def _should_sample_jersey(self, track_id) -> bool:
         # Always sample while the track is still unclassified or clusters aren't fit yet
@@ -410,6 +603,101 @@ class MotionExtrapolator:
 
     def _clamp(self, shift: float) -> int:
         return int(max(-self.max_shift_px, min(self.max_shift_px, shift)))
+
+
+class DisplaySmoother:
+    """Eases each track's displayed box position toward its latest target instead of
+    jumping straight to it, so a fresh AI/extrapolation result doesn't read as a
+    micro-teleport. Position is floated end-to-end and only rounded at draw time so
+    easing doesn't stall on integer rounding.
+
+    Snaps instead of gliding for a track's first sighting (nothing to ease from) or
+    when the target jumps further than a real player could move in one cycle (an ID
+    switch reusing a track_id at a new location) — gliding across an ID switch would
+    look like the marker sliding across the pitch.
+    """
+
+    EASING = 0.5
+    SNAP_DISTANCE_PX = 150
+
+    def __init__(self):
+        self.positions = {}  # track_id -> (x1, y1, x2, y2) floats
+
+    def smooth(self, boxes):
+        current_ids = set()
+        smoothed = []
+        for x1, y1, x2, y2, track_id in boxes:
+            if track_id < 0:
+                smoothed.append((x1, y1, x2, y2, track_id))
+                continue
+
+            current_ids.add(track_id)
+            target = (float(x1), float(y1), float(x2), float(y2))
+            previous = self.positions.get(track_id)
+            if previous is None or self._jumped(previous, target):
+                eased = target
+            else:
+                eased = tuple(
+                    p + (t - p) * self.EASING for p, t in zip(previous, target, strict=True)
+                )
+            self.positions[track_id] = eased
+            smoothed.append((*(int(round(v)) for v in eased), track_id))
+
+        self._prune(current_ids)
+        return smoothed
+
+    def _jumped(self, previous, target) -> bool:
+        px1, py1, px2, py2 = previous
+        tx1, ty1, tx2, ty2 = target
+        dist = math.hypot((tx1 + tx2) / 2 - (px1 + px2) / 2, (ty1 + ty2) / 2 - (py1 + py2) / 2)
+        return dist > self.SNAP_DISTANCE_PX
+
+    def _prune(self, current_ids):
+        for track_id in [tid for tid in self.positions if tid not in current_ids]:
+            del self.positions[track_id]
+
+
+class FadeController:
+    """Ramps each track's marker opacity in/out across display frames instead of
+    cutting it in or out instantly, so a newly confirmed track fades in and a track
+    coasting through the back half of its StateManager grace window fades out —
+    appearances/disappearances read as fades, not cuts.
+
+    Operates per display frame (like DisplaySmoother), driven by the latest worker
+    result's coasting_progress: a track past half its grace window (progress > 0.5)
+    ramps toward 0; every other visible track ramps toward TARGET_ALPHA.
+    """
+
+    TARGET_ALPHA = MarkerRenderer.MARKER_ALPHA
+    FADE_IN_FRAMES = 5
+    FADE_OUT_FRAMES = 5
+
+    def __init__(self):
+        self.opacity = {}  # track_id -> current alpha
+
+    def update(self, boxes, coasting_progress):
+        coasting_progress = coasting_progress or {}
+        current_ids = set()
+        alphas = {}
+        for *_, track_id in boxes:
+            if track_id < 0:
+                continue
+            current_ids.add(track_id)
+            current = self.opacity.get(track_id, 0.0)
+            fading_out = coasting_progress.get(track_id, 0.0) > 0.5
+            target = 0.0 if fading_out else self.TARGET_ALPHA
+            frames = self.FADE_OUT_FRAMES if fading_out else self.FADE_IN_FRAMES
+            step = self.TARGET_ALPHA / frames
+            if current < target:
+                current = min(target, current + step)
+            elif current > target:
+                current = max(target, current - step)
+            self.opacity[track_id] = current
+            alphas[track_id] = current
+
+        for track_id in [tid for tid in self.opacity if tid not in current_ids]:
+            del self.opacity[track_id]
+        return alphas
 
 
 class StalenessTracker:
@@ -539,6 +827,8 @@ class PlayerTracker:
         self.classifier = TeamClassifier()
         self.renderer = MarkerRenderer(self.classifier)
         self.extrapolator = MotionExtrapolator()
+        self.smoother = DisplaySmoother()
+        self.fader = FadeController()
         self.staleness = StalenessTracker()
         self.display_stats = DisplayStats()
         self.frame_count = 0
@@ -597,7 +887,9 @@ class PlayerTracker:
             self.staleness.record(self.frame_count, result.frame_id, result.captured_at)
 
             boxes = self.extrapolator.extrapolate(result, now)
-            self.renderer.draw(frame, boxes)
+            boxes = self.smoother.smooth(boxes)
+            alphas = self.fader.update(boxes, result.coasting_progress)
+            self.renderer.draw(frame, boxes, alphas)
             t3 = time.perf_counter()
             cv2.imshow(self.WINDOW_NAME, frame)
             t4 = time.perf_counter()
