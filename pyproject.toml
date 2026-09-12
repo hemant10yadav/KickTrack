@@ -1,0 +1,17 @@
+[project]
+name = "kicktrack"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn[standard]==0.52.4",
+    "pydantic==2.13.5",
+    "pydantic-settings==2.15.0",
+    "python-multipart==0.0.32",
+    "ultralytics==8.4.148",
+    "opencv-python==5.0.0.93",
+    "lap==0.5.13",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'darwin'"]

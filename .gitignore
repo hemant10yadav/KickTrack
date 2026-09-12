@@ -1,0 +1,17 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Model weights (downloaded automatically, don't commit)
+*.pt
+
+# Test/sample footage (large binaries)
+data/
+
+# Ultralytics run artifacts (exports, predictions, etc.)
+runs/
+
+# OS/editor cruft
+.DS_Store
