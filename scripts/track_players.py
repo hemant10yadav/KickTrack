@@ -2,6 +2,7 @@ import argparse
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -181,18 +182,35 @@ class MarkerRenderer:
         )
 
 
+@dataclass
+class InferenceResult:
+    boxes: list
+    frame_id: int
+    captured_at: float
+    previous_boxes: list
+    previous_captured_at: float | None
+
+
 class InferenceWorker:
     """Runs detection + tracking continuously in the background, always working on
     the most recently submitted frame. Frames arriving faster than inference finishes
     are dropped (never queued), so the worker never falls further and further behind.
+
+    Each submitted frame carries a frame_id and capture timestamp, which is echoed
+    back with the result — this lets the caller measure exactly how many frames (and
+    how many milliseconds) old the boxes it's currently displaying are, and also
+    extrapolate player motion forward using the two most recent results (see
+    MotionExtrapolator).
     """
 
     def __init__(self, model: YOLO, classifier: TeamClassifier):
         self.model = model
         self.classifier = classifier
         self.lock = threading.Lock()
-        self.latest_frame = None
-        self.latest_boxes = []
+        self.pending = None  # (frame, frame_id, captured_at)
+        self.latest = InferenceResult(
+            boxes=[], frame_id=None, captured_at=None, previous_boxes=[], previous_captured_at=None
+        )
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
 
@@ -204,20 +222,21 @@ class InferenceWorker:
         self.running = False
         self.thread.join(timeout=2)
 
-    def submit(self, frame):
+    def submit(self, frame, frame_id: int):
         with self.lock:
-            self.latest_frame = frame
+            self.pending = (frame, frame_id, time.perf_counter())
 
-    def get_boxes(self):
+    def get_result(self) -> InferenceResult:
         with self.lock:
-            return self.latest_boxes
+            return self.latest
 
     def _run(self):
         while self.running:
-            frame = self._take_pending_frame()
-            if frame is None:
+            pending = self._take_pending()
+            if pending is None:
                 time.sleep(0.001)
                 continue
+            frame, frame_id, captured_at = pending
 
             results = track(self.model, frame)
             boxes = extract_boxes(results)
@@ -227,12 +246,89 @@ class InferenceWorker:
                 self.classifier.observe(track_id, color)
 
             with self.lock:
-                self.latest_boxes = boxes
+                self.latest = InferenceResult(
+                    boxes=boxes,
+                    frame_id=frame_id,
+                    captured_at=captured_at,
+                    previous_boxes=self.latest.boxes,
+                    previous_captured_at=self.latest.captured_at,
+                )
 
-    def _take_pending_frame(self):
+    def _take_pending(self):
         with self.lock:
-            frame, self.latest_frame = self.latest_frame, None
-            return frame
+            pending, self.pending = self.pending, None
+            return pending
+
+
+class MotionExtrapolator:
+    """Shifts each player's last known box forward in time using the velocity
+    estimated between the two most recent AI results, so the displayed marker keeps
+    moving smoothly between inference updates instead of freezing at a stale position.
+
+    A max shift cap guards against runaway extrapolation from a noisy velocity
+    estimate (e.g. an ID that just switched, or a very short dt between results).
+    """
+
+    def __init__(self, max_shift_px=120):
+        self.max_shift_px = max_shift_px
+
+    def extrapolate(self, result: InferenceResult, now: float):
+        if result.captured_at is None or result.previous_captured_at is None:
+            return result.boxes
+
+        dt = result.captured_at - result.previous_captured_at
+        elapsed = now - result.captured_at
+        if dt <= 0 or elapsed <= 0:
+            return result.boxes
+
+        previous_by_id = {
+            track_id: (x1, y1, x2, y2) for x1, y1, x2, y2, track_id in result.previous_boxes
+        }
+
+        extrapolated = []
+        for x1, y1, x2, y2, track_id in result.boxes:
+            previous = previous_by_id.get(track_id)
+            if previous is None:
+                extrapolated.append((x1, y1, x2, y2, track_id))
+                continue
+
+            px1, py1, _, _ = previous
+            shift_x = self._clamp((x1 - px1) / dt * elapsed)
+            shift_y = self._clamp((y1 - py1) / dt * elapsed)
+            extrapolated.append((x1 + shift_x, y1 + shift_y, x2 + shift_x, y2 + shift_y, track_id))
+        return extrapolated
+
+    def _clamp(self, shift: float) -> int:
+        return int(max(-self.max_shift_px, min(self.max_shift_px, shift)))
+
+
+class StalenessTracker:
+    """Measures how far behind the AI result being displayed is from the current
+    frame — in both frame count and wall-clock time. This quantifies the "markers
+    lag the real player position" effect inherent to async inference.
+    """
+
+    def __init__(self):
+        self.frame_gaps = []
+        self.ms_gaps = []
+
+    def record(self, current_frame_id: int, result_frame_id, result_captured_at):
+        if result_frame_id is None:
+            return  # no AI result yet
+        self.frame_gaps.append(current_frame_id - result_frame_id)
+        self.ms_gaps.append((time.perf_counter() - result_captured_at) * 1000)
+
+    def summary(self) -> str:
+        if not self.frame_gaps:
+            return "Staleness: no AI results were ever displayed"
+        return (
+            "Staleness (frames behind): "
+            f"avg={sum(self.frame_gaps) / len(self.frame_gaps):.1f} "
+            f"min={min(self.frame_gaps)} max={max(self.frame_gaps)}\n"
+            "Staleness (ms behind): "
+            f"avg={sum(self.ms_gaps) / len(self.ms_gaps):.1f}ms "
+            f"min={min(self.ms_gaps):.1f}ms max={max(self.ms_gaps):.1f}ms"
+        )
 
 
 class FramePacer:
@@ -265,6 +361,8 @@ class PlayerTracker:
         self.model = model
         self.classifier = TeamClassifier()
         self.renderer = MarkerRenderer(self.classifier)
+        self.extrapolator = MotionExtrapolator()
+        self.staleness = StalenessTracker()
         self.frame_count = 0
 
     def run(self):
@@ -280,6 +378,7 @@ class PlayerTracker:
             cap.release()
             cv2.destroyAllWindows()
             print(f"Read {self.frame_count} frames from {self.video_path}")
+            print(self.staleness.summary())
 
     def _open_capture(self) -> cv2.VideoCapture:
         cap = cv2.VideoCapture(str(self.video_path))
@@ -302,8 +401,13 @@ class PlayerTracker:
                 break
             self.frame_count += 1
 
-            worker.submit(frame.copy())
-            self.renderer.draw(frame, worker.get_boxes())
+            worker.submit(frame.copy(), self.frame_count)
+            result = worker.get_result()
+            now = time.perf_counter()
+            self.staleness.record(self.frame_count, result.frame_id, result.captured_at)
+
+            boxes = self.extrapolator.extrapolate(result, now)
+            self.renderer.draw(frame, boxes)
             cv2.imshow(self.WINDOW_NAME, frame)
 
             if pacer.wait(iteration_start) == self.QUIT_KEY:
