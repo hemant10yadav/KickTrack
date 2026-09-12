@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from scripts.calibration import CalibrationWorker, PitchCalibrator
 from scripts.display import (
     DisplaySmoother,
     DisplayStats,
@@ -350,6 +351,7 @@ class PlayerTracker:
         self.frame_count = 0
         self.play_start = None
         self.achieved_fps = None
+        self.latest_calibration = None
 
     def run(self):
         cap = self._open_capture()
@@ -357,11 +359,13 @@ class PlayerTracker:
         self._warmup()
 
         worker = InferenceWorker(self.model, self.classifier).start()
+        calibration_worker = CalibrationWorker(PitchCalibrator()).start()
         self.play_start = time.perf_counter()
         try:
-            self._play(cap, worker, pacer)
+            self._play(cap, worker, calibration_worker, pacer)
         finally:
             worker.stop()
+            calibration_worker.stop()
             cap.release()
             if self.show_window:
                 cv2.destroyAllWindows()
@@ -377,6 +381,16 @@ class PlayerTracker:
             print(self.staleness.summary())
             print()
             print(self.display_stats.summary())
+            print()
+            if self.latest_calibration is not None:
+                homography_found = self.latest_calibration.homography is not None
+                print(
+                    f"Calibration: homography_found={homography_found} "
+                    f"keypoints={self.latest_calibration.num_keypoints} "
+                    f"lines={self.latest_calibration.num_lines}"
+                )
+            else:
+                print("Calibration: no result yet")
 
     def _open_capture(self) -> cv2.VideoCapture:
         cap = cv2.VideoCapture(self.video_source)
@@ -390,7 +404,13 @@ class PlayerTracker:
         blank_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         track(self.model, blank_frame)
 
-    def _play(self, cap: cv2.VideoCapture, worker: InferenceWorker, pacer: FramePacer):
+    def _play(
+        self,
+        cap: cv2.VideoCapture,
+        worker: InferenceWorker,
+        calibration_worker: CalibrationWorker,
+        pacer: FramePacer,
+    ):
         while True:
             iteration_start = time.perf_counter()
             self.fps_overlay.tick(iteration_start)
@@ -403,7 +423,9 @@ class PlayerTracker:
             t1 = time.perf_counter()
 
             worker.submit(frame.copy(), self.frame_count)
+            calibration_worker.submit(frame.copy(), self.frame_count)
             result = worker.get_result()
+            self.latest_calibration = calibration_worker.get_result()
             t2 = time.perf_counter()
             now = time.perf_counter()
             self.staleness.record(self.frame_count, result.frame_id, result.captured_at)
