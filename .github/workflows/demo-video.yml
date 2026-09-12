@@ -29,6 +29,9 @@ jobs:
           python-version: "3.13"
           enable-cache: true
 
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
       - name: Install dependencies
         run: uv sync
 
