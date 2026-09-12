@@ -18,6 +18,7 @@ dependencies = [
 dev = [
     "ruff==0.16.7",
     "prek==0.5.2",
+    "pytest==9.0.1",
 ]
 
 [tool.ruff]
@@ -26,6 +27,12 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+markers = [
+    "slow: runs the real CoreML pipeline against a fixture video; opt-in via `-m slow`",
+]
 
 [tool.uv]
 environments = ["sys_platform == 'darwin'"]

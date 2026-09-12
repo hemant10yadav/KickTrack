@@ -8,7 +8,8 @@ __pycache__/
 *.pt
 *.mlpackage/
 
-# Test/sample footage (large binaries)
+# Test/sample footage (large binaries). Trimmed fixtures for the pytest FPS
+# regression suite live under tests/videos/ instead and are committed there.
 data/
 
 # Ultralytics run artifacts (exports, predictions, etc.)
