@@ -11,13 +11,14 @@ from ultralytics import YOLO
 
 PERSON_CLASS_ID = 0  # COCO class id for "person"
 TRACKER_CONFIG = str(Path(__file__).parent / "botsort_custom.yaml")
-MODEL_NAME = "yolov8m.pt"
+MODEL_NAME = "yolov8m.mlpackage"
 INFERENCE_IMGSZ = 1280
 DEFAULT_VIDEO = "data/videos/sample.mp4"
 
 NUM_TEAM_CLUSTERS = 3  # 2 teams + referee/other
 TEAM_FIT_AFTER_SAMPLES = 25  # jersey-color samples collected before clusters are fixed
 UNCLASSIFIED_COLOR = (180, 180, 180)  # gray, shown before a track has enough samples
+JERSEY_RESAMPLE_INTERVAL = 15  # worker cycles between re-observations of a settled track
 
 
 def track(model: YOLO, frame):
@@ -35,13 +36,25 @@ def track(model: YOLO, frame):
 
 
 def extract_boxes(results):
-    """Convert Ultralytics results into a plain list of (x1, y1, x2, y2, track_id)."""
-    boxes = []
-    for box in results.boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        track_id = int(box.id[0]) if box.id is not None else -1
-        boxes.append((x1, y1, x2, y2, track_id))
-    return boxes
+    """Convert Ultralytics results into a plain list of (x1, y1, x2, y2, track_id).
+
+    Transfers the whole xyxy/id tensors off the GPU in one shot rather than
+    indexing per-box — per-box tensor access forces a separate device sync each
+    time, which measured as the dominant worker cost (~23ms/frame at ~20 boxes).
+    """
+    boxes_obj = results.boxes
+    if boxes_obj is None or len(boxes_obj) == 0:
+        return []
+    xyxy = boxes_obj.xyxy.cpu().numpy().astype(int)
+    ids = (
+        boxes_obj.id.cpu().numpy().astype(int)
+        if boxes_obj.id is not None
+        else np.full(len(xyxy), -1, dtype=int)
+    )
+    return [
+        (int(x1), int(y1), int(x2), int(y2), int(tid))
+        for (x1, y1, x2, y2), tid in zip(xyxy, ids, strict=True)
+    ]
 
 
 def extract_jersey_color(frame, x1, y1, x2, y2):
@@ -146,6 +159,8 @@ class MarkerRenderer:
 
     def draw(self, frame, boxes):
         for x1, y1, x2, _y2, track_id in boxes:
+            if track_id < 0:
+                continue  # unconfirmed BoT-SORT detection, not a real player ID yet
             color = self._color_for(track_id)
             self._draw_triangle(frame, x1, y1, x2, color)
             self._draw_label(frame, x1, y1, track_id, color)
@@ -191,6 +206,68 @@ class InferenceResult:
     previous_captured_at: float | None
 
 
+class WorkerStats:
+    """Breaks down where worker time actually goes: pure YOLO+tracker inference vs.
+    total per-frame processing (inference + jersey color extraction + team
+    classification), plus how many submitted frames the latest-frame buffer ended up
+    dropping before the worker could get to them.
+    """
+
+    def __init__(self):
+        self.frames_submitted = 0
+        self.frames_skipped = 0
+        self.inference_ms = []
+        self.extract_ms = []
+        self.jersey_ms = []
+        self.residual_ms = []
+        self.total_ms = []
+        self.boxes_seen = 0
+        self.jersey_extractions = 0
+
+    def record_submit(self, was_pending_overwritten: bool):
+        self.frames_submitted += 1
+        if was_pending_overwritten:
+            self.frames_skipped += 1
+
+    def record_processed(
+        self, inference_ms: float, extract_ms: float, jersey_ms: float, total_ms: float
+    ):
+        self.inference_ms.append(inference_ms)
+        self.extract_ms.append(extract_ms)
+        self.jersey_ms.append(jersey_ms)
+        self.residual_ms.append(total_ms - inference_ms - extract_ms - jersey_ms)
+        self.total_ms.append(total_ms)
+
+    def summary(self) -> str:
+        frames_processed = len(self.total_ms)
+        lines = [
+            f"Frames submitted: {self.frames_submitted}",
+            f"Frames skipped (overwritten before processing): {self.frames_skipped}",
+            f"Frames processed by worker: {frames_processed}",
+        ]
+        if frames_processed:
+
+            def stat(name, values):
+                arr = np.array(values)
+                return f"{name}: avg={arr.mean():.1f} min={arr.min():.1f} max={arr.max():.1f}"
+
+            inf = np.array(self.inference_ms)
+            lines.append(
+                f"YOLO+tracker inference latency (ms): avg={inf.mean():.1f} "
+                f"min={inf.min():.1f} max={inf.max():.1f}"
+            )
+            lines.append(f"Effective inference FPS: {1000 / inf.mean():.1f}")
+            lines.append(stat("extract_boxes (ms)", self.extract_ms))
+            lines.append(stat("jersey extraction loop (ms)", self.jersey_ms))
+            lines.append(stat("residual/unaccounted (ms)", self.residual_ms))
+            lines.append(stat("Worker total latency (ms)", self.total_ms))
+            lines.append(
+                f"Jersey extractions: {self.jersey_extractions}/{self.boxes_seen} boxes seen "
+                f"({100 * self.jersey_extractions / max(1, self.boxes_seen):.1f}%)"
+            )
+        return "\n".join(lines)
+
+
 class InferenceWorker:
     """Runs detection + tracking continuously in the background, always working on
     the most recently submitted frame. Frames arriving faster than inference finishes
@@ -212,6 +289,9 @@ class InferenceWorker:
             boxes=[], frame_id=None, captured_at=None, previous_boxes=[], previous_captured_at=None
         )
         self.running = True
+        self.stats = WorkerStats()
+        self.cycle_count = 0
+        self.jersey_last_sampled = {}
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -224,6 +304,7 @@ class InferenceWorker:
 
     def submit(self, frame, frame_id: int):
         with self.lock:
+            self.stats.record_submit(was_pending_overwritten=self.pending is not None)
             self.pending = (frame, frame_id, time.perf_counter())
 
     def get_result(self) -> InferenceResult:
@@ -237,13 +318,31 @@ class InferenceWorker:
                 time.sleep(0.001)
                 continue
             frame, frame_id, captured_at = pending
+            total_start = time.perf_counter()
 
+            inference_start = time.perf_counter()
             results = track(self.model, frame)
-            boxes = extract_boxes(results)
+            inference_ms = (time.perf_counter() - inference_start) * 1000
 
+            extract_start = time.perf_counter()
+            boxes = extract_boxes(results)
+            extract_ms = (time.perf_counter() - extract_start) * 1000
+            self.cycle_count += 1
+
+            jersey_start = time.perf_counter()
             for x1, y1, x2, y2, track_id in boxes:
+                self.stats.boxes_seen += 1
+                if track_id < 0:
+                    continue
+                if not self._should_sample_jersey(track_id):
+                    continue
+                self.stats.jersey_extractions += 1
                 color = extract_jersey_color(frame, x1, y1, x2, y2)
                 self.classifier.observe(track_id, color)
+            jersey_ms = (time.perf_counter() - jersey_start) * 1000
+
+            total_ms = (time.perf_counter() - total_start) * 1000
+            self.stats.record_processed(inference_ms, extract_ms, jersey_ms, total_ms)
 
             with self.lock:
                 self.latest = InferenceResult(
@@ -258,6 +357,17 @@ class InferenceWorker:
         with self.lock:
             pending, self.pending = self.pending, None
             return pending
+
+    def _should_sample_jersey(self, track_id) -> bool:
+        # Always sample while the track is still unclassified or clusters aren't fit yet
+        if self.classifier.team_for(track_id) is None:
+            return True
+        # Settled track: re-sample only every Nth worker cycle
+        last = self.jersey_last_sampled.get(track_id, -JERSEY_RESAMPLE_INTERVAL)
+        if self.cycle_count - last >= JERSEY_RESAMPLE_INTERVAL:
+            self.jersey_last_sampled[track_id] = self.cycle_count
+            return True
+        return False
 
 
 class MotionExtrapolator:
@@ -331,18 +441,85 @@ class StalenessTracker:
         )
 
 
-class FramePacer:
-    """Waits out the remainder of a frame's time budget, accounting for time
-    already spent this iteration, so processing cost doesn't compound into extra lag.
+class DisplayStats:
+    """Times each segment of the main display loop (frame read, submitting to the
+    worker, drawing markers, cv2.imshow, and the pacer's wait) so we can see exactly
+    where main-thread time goes, rather than assuming it's all in one place.
     """
+
+    def __init__(self):
+        self.read_ms = []
+        self.submit_ms = []
+        self.draw_ms = []
+        self.imshow_ms = []
+        self.wait_ms = []
+        self.pre_wait_overrun_count = 0
+        self.frame_budget_ms = None
+
+    def record(self, read_ms, submit_ms, draw_ms, imshow_ms, wait_ms, frame_budget_ms):
+        self.frame_budget_ms = frame_budget_ms
+        self.read_ms.append(read_ms)
+        self.submit_ms.append(submit_ms)
+        self.draw_ms.append(draw_ms)
+        self.imshow_ms.append(imshow_ms)
+        self.wait_ms.append(wait_ms)
+        pre_wait = read_ms + submit_ms + draw_ms + imshow_ms
+        if pre_wait > frame_budget_ms:
+            self.pre_wait_overrun_count += 1
+
+    def summary(self) -> str:
+        if not self.read_ms:
+            return "Display timing: no frames were ever displayed"
+
+        def stat(name, values):
+            arr = np.array(values)
+            return f"{name}: avg={arr.mean():.1f} max={arr.max():.1f}"
+
+        lines = [
+            stat("read (ms)", self.read_ms),
+            stat("submit (ms)", self.submit_ms),
+            stat("draw (extrapolate+render) (ms)", self.draw_ms),
+            stat("imshow (ms)", self.imshow_ms),
+            stat("wait (ms)", self.wait_ms),
+            f"Pre-wait work exceeding {self.frame_budget_ms:.1f}ms budget: "
+            f"{self.pre_wait_overrun_count}/{len(self.read_ms)} frames",
+        ]
+        return "\n".join(lines)
+
+
+class FramePacer:
+    """Paces against an absolute frame schedule (not a per-iteration budget), so
+    a single frame's timing error self-corrects on the next frame instead of
+    compounding. Per-iteration budgeting drifted in practice: cv2.waitKey()
+    overshoots its requested delay by ~4-5ms on macOS (it also pumps the GUI
+    event loop), and since that overshoot was never repaid, avg wait crept up
+    to ~43ms against a 41.7ms budget — a small, silent, permanent FPS loss.
+
+    Re-anchors the schedule if playback falls behind by more than a few frames
+    (e.g. after a long stall), rather than trying to burn through a backlog of
+    missed deadlines in a rapid-fire burst.
+    """
+
+    REANCHOR_AFTER_FRAMES_BEHIND = 3
+    WAITKEY_OVERSHOOT_MS = 6  # observed average cv2.waitKey overshoot on macOS
 
     def __init__(self, fps: float):
         self.frame_budget_ms = 1000 / fps
+        self.frame_interval = 1 / fps
+        self.next_deadline = None
 
-    def wait(self, iteration_start: float) -> int:
-        elapsed_ms = (time.perf_counter() - iteration_start) * 1000
-        remaining_ms = max(1, int(self.frame_budget_ms - elapsed_ms))
-        return cv2.waitKey(remaining_ms) & 0xFF
+    def wait(self, _iteration_start: float) -> int:
+        now = time.perf_counter()
+        if self.next_deadline is None:
+            self.next_deadline = now + self.frame_interval
+        elif now - self.next_deadline > self.REANCHOR_AFTER_FRAMES_BEHIND * self.frame_interval:
+            self.next_deadline = now + self.frame_interval
+
+        remaining_ms = (self.next_deadline - now) * 1000
+        self.next_deadline += self.frame_interval
+
+        wait_ms = max(1, int(remaining_ms - self.WAITKEY_OVERSHOOT_MS))
+        return cv2.waitKey(wait_ms) & 0xFF
 
 
 class PlayerTracker:
@@ -363,7 +540,9 @@ class PlayerTracker:
         self.renderer = MarkerRenderer(self.classifier)
         self.extrapolator = MotionExtrapolator()
         self.staleness = StalenessTracker()
+        self.display_stats = DisplayStats()
         self.frame_count = 0
+        self.play_start = None
 
     def run(self):
         cap = self._open_capture()
@@ -371,14 +550,22 @@ class PlayerTracker:
         self._warmup()
 
         worker = InferenceWorker(self.model, self.classifier).start()
+        self.play_start = time.perf_counter()
         try:
             self._play(cap, worker, pacer)
         finally:
             worker.stop()
             cap.release()
             cv2.destroyAllWindows()
+            elapsed = time.perf_counter() - self.play_start
             print(f"Read {self.frame_count} frames from {self.video_path}")
+            print(f"Display FPS: {self.frame_count / elapsed:.1f}")
+            print()
+            print(worker.stats.summary())
+            print()
             print(self.staleness.summary())
+            print()
+            print(self.display_stats.summary())
 
     def _open_capture(self) -> cv2.VideoCapture:
         cap = cv2.VideoCapture(str(self.video_path))
@@ -396,21 +583,38 @@ class PlayerTracker:
         while True:
             iteration_start = time.perf_counter()
 
+            t0 = time.perf_counter()
             ret, frame = cap.read()
             if not ret:
                 break
             self.frame_count += 1
+            t1 = time.perf_counter()
 
             worker.submit(frame.copy(), self.frame_count)
             result = worker.get_result()
+            t2 = time.perf_counter()
             now = time.perf_counter()
             self.staleness.record(self.frame_count, result.frame_id, result.captured_at)
 
             boxes = self.extrapolator.extrapolate(result, now)
             self.renderer.draw(frame, boxes)
+            t3 = time.perf_counter()
             cv2.imshow(self.WINDOW_NAME, frame)
+            t4 = time.perf_counter()
 
-            if pacer.wait(iteration_start) == self.QUIT_KEY:
+            key = pacer.wait(iteration_start)
+            t5 = time.perf_counter()
+
+            self.display_stats.record(
+                read_ms=(t1 - t0) * 1000,
+                submit_ms=(t2 - t1) * 1000,
+                draw_ms=(t3 - t2) * 1000,
+                imshow_ms=(t4 - t3) * 1000,
+                wait_ms=(t5 - t4) * 1000,
+                frame_budget_ms=pacer.frame_budget_ms,
+            )
+
+            if key == self.QUIT_KEY:
                 break
 
 
@@ -422,11 +626,21 @@ def parse_args():
         default=DEFAULT_VIDEO,
         help=f"Path to the input video (default: {DEFAULT_VIDEO})",
     )
+    parser.add_argument("--model", default=MODEL_NAME, help=f"YOLO model (default: {MODEL_NAME})")
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=INFERENCE_IMGSZ,
+        help=f"Inference size (default: {INFERENCE_IMGSZ})",
+    )
     return parser.parse_args()
 
 
 def main():
+    global MODEL_NAME, INFERENCE_IMGSZ
     args = parse_args()
+    MODEL_NAME = args.model
+    INFERENCE_IMGSZ = args.imgsz
 
     video_path = Path(args.video)
     if not video_path.exists():
