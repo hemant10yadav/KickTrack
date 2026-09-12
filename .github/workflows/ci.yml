@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # TODO: move to ubuntu-latest once the CoreML-only dependency (coremltools,
   # pinned via tool.uv.environments = ["sys_platform == 'darwin'"] in
@@ -18,6 +22,10 @@ jobs:
         uses: astral-sh/setup-uv@v10.1.0
         with:
           python-version: "3.13"
+          enable-cache: true
+
+      - name: Check uv.lock is up to date
+        run: uv lock --check
 
       - name: Install dependencies
         run: uv sync --group dev
@@ -37,9 +45,27 @@ jobs:
         uses: astral-sh/setup-uv@v10.1.0
         with:
           python-version: "3.13"
+          enable-cache: true
 
       - name: Install dependencies
         run: uv sync --group dev
 
       - name: Run tests
         run: uv run pytest -m "not slow"
+
+  pre-commit:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run pre-commit hooks
+        run: uv run prek run --all-files
