@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 import sys
 import threading
 import time
@@ -19,6 +20,10 @@ NUM_TEAM_CLUSTERS = 3  # 2 teams + referee/other
 TEAM_FIT_AFTER_SAMPLES = 25  # jersey-color samples collected before clusters are fixed
 UNCLASSIFIED_COLOR = (180, 180, 180)  # gray, shown before a track has enough samples
 JERSEY_RESAMPLE_INTERVAL = 15  # worker cycles between re-observations of a settled track
+COASTING_GRACE_SECONDS = 0.75  # how long a missed player still renders (extrapolated)
+STATE_EVICT_AFTER_SECONDS = (
+    5.0  # prune tracks not seen this long (bounds memory, avoids stale-ID reuse)
+)
 
 
 def track(model: YOLO, frame):
@@ -28,7 +33,7 @@ def track(model: YOLO, frame):
         classes=[PERSON_CLASS_ID],
         persist=True,
         tracker=TRACKER_CONFIG,
-        device="mps",
+        device="mps",  # ignored for the CoreML backend (.mlpackage picks its own compute unit)
         conf=0.15,
         imgsz=INFERENCE_IMGSZ,
         verbose=False,
@@ -36,9 +41,10 @@ def track(model: YOLO, frame):
 
 
 def extract_boxes(results):
-    """Convert Ultralytics results into a plain list of (x1, y1, x2, y2, track_id).
+    """Convert Ultralytics results into a plain list of
+    (x1, y1, x2, y2, track_id, confidence).
 
-    Transfers the whole xyxy/id tensors off the GPU in one shot rather than
+    Transfers the whole xyxy/id/conf tensors off the GPU in one shot rather than
     indexing per-box — per-box tensor access forces a separate device sync each
     time, which measured as the dominant worker cost (~23ms/frame at ~20 boxes).
     """
@@ -51,9 +57,10 @@ def extract_boxes(results):
         if boxes_obj.id is not None
         else np.full(len(xyxy), -1, dtype=int)
     )
+    confs = boxes_obj.conf.cpu().numpy()
     return [
-        (int(x1), int(y1), int(x2), int(y2), int(tid))
-        for (x1, y1, x2, y2), tid in zip(xyxy, ids, strict=True)
+        (int(x1), int(y1), int(x2), int(y2), int(tid), float(conf))
+        for (x1, y1, x2, y2), tid, conf in zip(xyxy, ids, confs, strict=True)
     ]
 
 
@@ -150,6 +157,104 @@ class TeamClassifier:
         self.centers = centers
 
 
+@dataclass
+class PlayerState:
+    """Canonical per-player data. Everything downstream (rendering, extrapolation,
+    and eventually match analytics — distance, speed, heatmaps) reads from this
+    instead of passing around raw (x1, y1, x2, y2, track_id) tuples.
+    """
+
+    track_id: int
+    bbox: tuple[int, int, int, int]
+    position: tuple[float, float]  # bottom-center of bbox (the feet), in pixels
+    velocity: tuple[float, float]  # pixels/sec, smoothed
+    team: int | None
+    confidence: float
+    last_seen_frame: int
+    last_seen_at: float  # time.perf_counter() timestamp
+    is_coasting: bool = False  # True if not detected this cycle, riding the grace window
+
+
+class StateManager:
+    """Maintains the canonical PlayerState per track, updated from each worker
+    cycle's detections. Computes smoothed velocity from consecutive position
+    updates for the same track — this replaces the old two-result-diff velocity
+    calc that used to live in MotionExtrapolator, and is now the single source of
+    truth for position/velocity/team that everything else reads from.
+    """
+
+    VELOCITY_SMOOTHING = 0.7
+
+    def __init__(self, classifier: TeamClassifier):
+        self.classifier = classifier
+        self.states: dict[int, PlayerState] = {}
+
+    def update(self, detections, frame_id: int, captured_at: float) -> dict[int, PlayerState]:
+        """detections: list of (x1, y1, x2, y2, track_id, confidence).
+
+        Updates state for every track detected this cycle, then returns all
+        *visible* states — including players missed this cycle but seen recently
+        enough to still coast on their last known position/velocity (see
+        COASTING_GRACE_SECONDS). A player YOLO misses for a single cycle shouldn't
+        instantly vanish; that grace window is what prevents it.
+        """
+        current_ids = set()
+        for x1, y1, x2, y2, track_id, confidence in detections:
+            if track_id < 0:
+                continue
+            current_ids.add(track_id)
+            position = ((x1 + x2) / 2, float(y2))
+            velocity = self._compute_velocity(track_id, position, captured_at)
+            self.states[track_id] = PlayerState(
+                track_id=track_id,
+                bbox=(x1, y1, x2, y2),
+                position=position,
+                velocity=velocity,
+                team=self.classifier.team_for(track_id),
+                confidence=confidence,
+                last_seen_frame=frame_id,
+                last_seen_at=captured_at,
+                is_coasting=False,
+            )
+
+        self._evict(captured_at)
+        return self.visible(captured_at, current_ids)
+
+    def visible(
+        self, now: float, current_ids=frozenset(), grace_seconds=COASTING_GRACE_SECONDS
+    ) -> dict[int, PlayerState]:
+        result = {}
+        for track_id, state in self.states.items():
+            if now - state.last_seen_at > grace_seconds:
+                continue
+            result[track_id] = (
+                state if track_id in current_ids else dataclasses.replace(state, is_coasting=True)
+            )
+        return result
+
+    def _evict(self, now: float, max_age=STATE_EVICT_AFTER_SECONDS):
+        stale_ids = [
+            track_id
+            for track_id, state in self.states.items()
+            if now - state.last_seen_at > max_age
+        ]
+        for track_id in stale_ids:
+            del self.states[track_id]
+
+    def _compute_velocity(self, track_id, position, captured_at) -> tuple[float, float]:
+        previous = self.states.get(track_id)
+        if previous is None:
+            return (0.0, 0.0)
+        dt = captured_at - previous.last_seen_at
+        if dt <= 0:
+            return previous.velocity
+        raw_vx = (position[0] - previous.position[0]) / dt
+        raw_vy = (position[1] - previous.position[1]) / dt
+        old_vx, old_vy = previous.velocity
+        s = self.VELOCITY_SMOOTHING
+        return (s * old_vx + (1 - s) * raw_vx, s * old_vy + (1 - s) * raw_vy)
+
+
 class MarkerRenderer:
     """Draws player markers (triangle + ID label), color-coded by team."""
 
@@ -157,19 +262,22 @@ class MarkerRenderer:
         self.classifier = classifier
         self.size = size
 
+    COASTING_DIM_FACTOR = 0.5  # darken a coasting (undetected-this-cycle) marker's color
+
     def draw(self, frame, boxes):
-        for x1, y1, x2, _y2, track_id in boxes:
+        for x1, y1, x2, _y2, track_id, is_coasting in boxes:
             if track_id < 0:
                 continue  # unconfirmed BoT-SORT detection, not a real player ID yet
-            color = self._color_for(track_id)
+            color = self._color_for(track_id, is_coasting)
             self._draw_triangle(frame, x1, y1, x2, color)
             self._draw_label(frame, x1, y1, track_id, color)
 
-    def _color_for(self, track_id):
+    def _color_for(self, track_id, is_coasting):
         team = self.classifier.team_for(track_id)
-        if team is None:
-            return UNCLASSIFIED_COLOR
-        return self.classifier.team_color(team)
+        color = UNCLASSIFIED_COLOR if team is None else self.classifier.team_color(team)
+        if is_coasting:
+            color = tuple(int(c * self.COASTING_DIM_FACTOR) for c in color)
+        return color
 
     def _draw_triangle(self, frame, x1, y1, x2, color):
         center_x = (x1 + x2) // 2
@@ -199,11 +307,9 @@ class MarkerRenderer:
 
 @dataclass
 class InferenceResult:
-    boxes: list
+    states: dict[int, PlayerState]
     frame_id: int
     captured_at: float
-    previous_boxes: list
-    previous_captured_at: float | None
 
 
 class WorkerStats:
@@ -275,19 +381,18 @@ class InferenceWorker:
 
     Each submitted frame carries a frame_id and capture timestamp, which is echoed
     back with the result — this lets the caller measure exactly how many frames (and
-    how many milliseconds) old the boxes it's currently displaying are, and also
-    extrapolate player motion forward using the two most recent results (see
+    how many milliseconds) old the state it's currently displaying is, and also
+    extrapolate player motion forward using each PlayerState's own velocity (see
     MotionExtrapolator).
     """
 
-    def __init__(self, model: YOLO, classifier: TeamClassifier):
+    def __init__(self, model: YOLO, classifier: TeamClassifier, state_manager: StateManager):
         self.model = model
         self.classifier = classifier
+        self.state_manager = state_manager
         self.lock = threading.Lock()
         self.pending = None  # (frame, frame_id, captured_at)
-        self.latest = InferenceResult(
-            boxes=[], frame_id=None, captured_at=None, previous_boxes=[], previous_captured_at=None
-        )
+        self.latest = InferenceResult(states={}, frame_id=None, captured_at=None)
         self.running = True
         self.stats = WorkerStats()
         self.cycle_count = 0
@@ -330,7 +435,7 @@ class InferenceWorker:
             self.cycle_count += 1
 
             jersey_start = time.perf_counter()
-            for x1, y1, x2, y2, track_id in boxes:
+            for x1, y1, x2, y2, track_id, _conf in boxes:
                 self.stats.boxes_seen += 1
                 if track_id < 0:
                     continue
@@ -341,16 +446,16 @@ class InferenceWorker:
                 self.classifier.observe(track_id, color)
             jersey_ms = (time.perf_counter() - jersey_start) * 1000
 
+            states = self.state_manager.update(boxes, frame_id, captured_at)
+
             total_ms = (time.perf_counter() - total_start) * 1000
             self.stats.record_processed(inference_ms, extract_ms, jersey_ms, total_ms)
 
             with self.lock:
                 self.latest = InferenceResult(
-                    boxes=boxes,
+                    states=states,
                     frame_id=frame_id,
                     captured_at=captured_at,
-                    previous_boxes=self.latest.boxes,
-                    previous_captured_at=self.latest.captured_at,
                 )
 
     def _take_pending(self):
@@ -371,41 +476,39 @@ class InferenceWorker:
 
 
 class MotionExtrapolator:
-    """Shifts each player's last known box forward in time using the velocity
-    estimated between the two most recent AI results, so the displayed marker keeps
-    moving smoothly between inference updates instead of freezing at a stale position.
+    """Shifts each player's last known box forward in time using that PlayerState's
+    own smoothed velocity, so the displayed marker keeps moving between inference
+    updates instead of freezing at a stale position.
 
     A max shift cap guards against runaway extrapolation from a noisy velocity
-    estimate (e.g. an ID that just switched, or a very short dt between results).
+    estimate (e.g. an ID that just switched, or a very short dt between updates).
     """
 
     def __init__(self, max_shift_px=120):
         self.max_shift_px = max_shift_px
 
-    def extrapolate(self, result: InferenceResult, now: float):
-        if result.captured_at is None or result.previous_captured_at is None:
-            return result.boxes
-
-        dt = result.captured_at - result.previous_captured_at
-        elapsed = now - result.captured_at
-        if dt <= 0 or elapsed <= 0:
-            return result.boxes
-
-        previous_by_id = {
-            track_id: (x1, y1, x2, y2) for x1, y1, x2, y2, track_id in result.previous_boxes
-        }
-
+    def extrapolate(self, states: dict[int, PlayerState], now: float):
         extrapolated = []
-        for x1, y1, x2, y2, track_id in result.boxes:
-            previous = previous_by_id.get(track_id)
-            if previous is None:
-                extrapolated.append((x1, y1, x2, y2, track_id))
+        for state in states.values():
+            x1, y1, x2, y2 = state.bbox
+            elapsed = now - state.last_seen_at
+            if elapsed <= 0:
+                extrapolated.append((x1, y1, x2, y2, state.track_id, state.is_coasting))
                 continue
 
-            px1, py1, _, _ = previous
-            shift_x = self._clamp((x1 - px1) / dt * elapsed)
-            shift_y = self._clamp((y1 - py1) / dt * elapsed)
-            extrapolated.append((x1 + shift_x, y1 + shift_y, x2 + shift_x, y2 + shift_y, track_id))
+            vx, vy = state.velocity
+            shift_x = self._clamp(vx * elapsed)
+            shift_y = self._clamp(vy * elapsed)
+            extrapolated.append(
+                (
+                    x1 + shift_x,
+                    y1 + shift_y,
+                    x2 + shift_x,
+                    y2 + shift_y,
+                    state.track_id,
+                    state.is_coasting,
+                )
+            )
         return extrapolated
 
     def _clamp(self, shift: float) -> int:
@@ -537,6 +640,7 @@ class PlayerTracker:
         self.video_path = video_path
         self.model = model
         self.classifier = TeamClassifier()
+        self.state_manager = StateManager(self.classifier)
         self.renderer = MarkerRenderer(self.classifier)
         self.extrapolator = MotionExtrapolator()
         self.staleness = StalenessTracker()
@@ -549,7 +653,7 @@ class PlayerTracker:
         pacer = FramePacer(fps=cap.get(cv2.CAP_PROP_FPS) or 25)
         self._warmup()
 
-        worker = InferenceWorker(self.model, self.classifier).start()
+        worker = InferenceWorker(self.model, self.classifier, self.state_manager).start()
         self.play_start = time.perf_counter()
         try:
             self._play(cap, worker, pacer)
@@ -575,7 +679,7 @@ class PlayerTracker:
         return cap
 
     def _warmup(self):
-        """Pay the one-time GPU kernel compilation cost (MPS) before playback starts."""
+        """Pay the one-time model compilation cost (CoreML/Neural Engine) before playback starts."""
         blank_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         track(self.model, blank_frame)
 
@@ -596,7 +700,7 @@ class PlayerTracker:
             now = time.perf_counter()
             self.staleness.record(self.frame_count, result.frame_id, result.captured_at)
 
-            boxes = self.extrapolator.extrapolate(result, now)
+            boxes = self.extrapolator.extrapolate(result.states, now)
             self.renderer.draw(frame, boxes)
             t3 = time.perf_counter()
             cv2.imshow(self.WINDOW_NAME, frame)

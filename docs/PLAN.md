@@ -42,9 +42,21 @@ Take a fixed-camera football video and show a marker on each player that moves w
 
 - [ ] **Plan 3: Player & Match Analytics**
 
-  - [ ] `PlayerState`: per-track position (pitch-relative, once calibration exists),
-        velocity, team, distance covered, speed — built on top of the existing
-        tracking + team classification pipeline
+  - [X] `PlayerState` + `StateManager`: canonical per-track data (bbox, position
+        (feet, pixels for now), velocity, team, confidence, last_seen) built on top of
+        the existing tracking + team classification pipeline — replaces the raw
+        `(x1, y1, x2, y2, track_id)` tuples that used to flow through
+        `InferenceResult`/`MotionExtrapolator`; `MotionExtrapolator` now extrapolates
+        directly from each `PlayerState`'s own smoothed velocity
+  - [X] Occlusion grace period: a player YOLO misses for one cycle no longer vanishes
+        instantly — `StateManager` keeps coasting on last known position/velocity for
+        up to `COASTING_GRACE_SECONDS` (0.75s), evicts states unseen for 5s (bounds
+        memory, avoids stale-ID reuse pollution), and marks coasting markers
+        (`is_coasting`) so a guess renders visibly dimmer than a real detection
+  - [ ] Pitch homography: standalone calibration script — click 4-6 known pitch
+        landmarks (penalty box corners, center circle) on one frame, compute the
+        transform, save the matrix. Converts pixel positions to real pitch
+        coordinates, so speed/distance become actual m/s and meters, not pixel math
   - [ ] Heatmaps per player (and per team)
   - [ ] Possession detection (nearest player to ball, possession changes over time)
   - [ ] (Longer-term, not yet scoped in detail) formations/team shape, passing networks
