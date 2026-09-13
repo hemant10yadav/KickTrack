@@ -46,9 +46,9 @@ def _run(video_path: Path) -> tuple[InferenceWorker, PlayerTracker]:
     worker_holder = {}
     orig_run = tracker._play
 
-    def _play_and_capture(cap, worker, pacer):
+    def _play_and_capture(cap, worker, calibration_worker, pacer):
         worker_holder["worker"] = worker
-        return orig_run(cap, worker, pacer)
+        return orig_run(cap, worker, calibration_worker, pacer)
 
     tracker._play = _play_and_capture
     tracker.run()
