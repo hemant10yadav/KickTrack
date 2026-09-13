@@ -230,6 +230,56 @@ to holding the last good homography rather than trusting a bad estimate —
 the hold-on-failure behavior Phase 3 was going to add anyway, pulled
 forward since propagation needs it too.
 
+**Post-implementation FPS regression and fixes (2026-09-13):** live testing
+(`scripts/track_players.py`, real GUI window) showed visible FPS drops
+starting exactly when the pitch overlay first appeared on `match_5.mp4`
+(50fps, 20ms/frame budget — the tightest of the three test clips). Root
+causes found and fixed, in the order discovered:
+
+1. `multiprocessing.Queue`'s internal feeder thread could block the
+   *interpreter's own exit* trying to flush a leftover queued item —
+   observed as multi-minute hangs after the video had already finished
+   processing. Fixed with `cancel_join_thread()` on both queues plus a
+   proper terminate/kill fallback in `CalibrationWorker.stop()`.
+2. A frame-cache eviction bug (bounding the cache by count) could delete
+   the *in-flight* calibration's own cached frame before its result
+   returned, crashing the pipeline (`cv2.error` on a `None` frame). Fixed
+   by tracking exactly which frame_id is in-flight vs. displaced, instead
+   of an arbitrary count cap.
+3. `calibration_worker.submit(frame.copy(), ...)` was called (and copied
+   a full-resolution frame) on *every* frame, even though `submit()`
+   itself only ever enqueues on keyframe boundaries (~1/90 of the time
+   now). Fixed by exposing `CalibrationWorker.is_keyframe()` publicly so
+   the caller only copies when it will actually be used.
+4. **The big one:** `HomographyPropagator.propagate()` was being called
+   synchronously in the main thread every displayed frame. Even though it
+   only costs ~1-3ms, that was enough to push ~9-10% of frames over
+   `match_5`'s 20ms budget. Fixed by adding `HomographyWorker` — the same
+   async submit/get-latest pattern as `InferenceWorker`/`CalibrationWorker`,
+   but a *thread* (not a process): OpenCV's optical-flow calls release the
+   GIL during their C++ computation, so a thread doesn't starve other
+   threads the way `CalibrationWorker`'s PyTorch work did. This alone cut
+   budget-overrun frames from ~150-180/1750 down to ~11-20/1750 (~1%).
+5. **A separate, smaller residual issue**: even with (4) fixed,
+   `InferenceWorker`'s own YOLO thread still dropped ~35-40/502 frames
+   (~7%) on the trimmed `match_5` fixture — real CPU contention between
+   `CalibrationWorker`'s background *process* and `InferenceWorker`'s
+   thread, not a main-thread stall. Tried and measured three mitigations:
+   capping PyTorch's thread pool (helped, already in place from Phase 2),
+   lowering the calibration process's OS scheduling priority via
+   `os.nice(10)` (no measurable effect), and running calibration on CPU
+   instead of MPS (helped on short clips, but reduces to the same ~5.6%
+   on the full-length video — misleading, not a real fix, since it mostly
+   just means fewer total keyframe events fit in a short test window).
+   The real, proportional lever: **contention scales with how often
+   recalibration happens**, not how it's computed. Measured on the full
+   `data/videos/match_5.mp4` (1750 frames): `keyframe_interval` 30 → 10.5%
+   dropped, 60 → 5.3%, 90 → ~4%. Changed the default from 30 to 90 — still
+   ~1.8s between full recalibrations, well covered by `HomographyWorker`'s
+   per-frame propagation in between, and consistently under the 5%
+   regression ceiling with real margin on both the trimmed fixture and
+   the full-length clip.
+
 ### Phase 3 — Low-confidence fallback + `PlayerState` integration
 
 Add the hold-last-homography fallback and confidence flag, then wire

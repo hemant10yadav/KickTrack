@@ -11,6 +11,7 @@ at a sustainable keyframe cadence in the background.
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import queue
 import threading
 import time
@@ -203,6 +204,20 @@ def _calibration_process_main(
     # (measured: still ~70/502 dropped frames on match_5 with this
     # uncapped). Capping it here keeps this process's CPU footprint small.
     torch.set_num_threads(1)
+    # Even with threads capped, this process's bursts of real CPU work
+    # still measurably starved InferenceWorker's thread in the main process
+    # on match_5's tight 50fps/20ms budget. Lowering this process's OS
+    # scheduling priority is the theoretically-correct ask ("prefer the
+    # real-time work when competing for a core") -- measured with A/B
+    # testing, though, it made no detectable difference on its own (still
+    # ~33-40/502 dropped either way). Left in as a harmless, standard
+    # practice for background work; the actual fix was reducing how often
+    # this process's bursts happen at all -- see keyframe_interval's
+    # default and docs/PITCH_CALIBRATION_SPEC.md.
+    try:
+        os.nice(10)
+    except (AttributeError, PermissionError, OSError):
+        pass  # os.nice is POSIX-only and can be refused by the OS; not fatal either way
     calibrator = calibrator_factory()
     # Pay the one-time MPS kernel JIT-compilation cost now (measured: first
     # real call ~570ms vs ~420ms steady-state) rather than on the first real
@@ -242,7 +257,18 @@ class CalibrationWorker:
     def __init__(
         self,
         calibrator_factory: Callable[[], object] = PitchCalibrator,
-        keyframe_interval: int = 30,
+        # 30 (recalibrate ~every 0.6s at 50fps) measurably starved
+        # InferenceWorker's thread even after process isolation + thread
+        # capping (see docs/PITCH_CALIBRATION_SPEC.md): each full
+        # recalibration is a real CPU burst, and drops scaled roughly
+        # proportionally with how often it happens (30->~10.5%, 60->~5.3%,
+        # 90->~4% dropped on match_5.mp4). 90 (~1.8s between recalibrations)
+        # keeps InferenceWorker's drop rate consistently under the 5%
+        # regression ceiling with real margin, while HomographyWorker's
+        # per-frame propagation (not this) is what actually keeps the
+        # homography smooth in between -- this interval only controls how
+        # often it gets "trued up" against a fresh full calibration.
+        keyframe_interval: int = 90,
     ):
         self.keyframe_interval = keyframe_interval
         self.input_queue: mp.Queue = mp.Queue(maxsize=1)
@@ -387,8 +413,10 @@ class HomographyPropagator:
 
     See docs/PITCH_CALIBRATION_SPEC.md Phase 2 for the drift measurement
     that motivated this: match_4-style footage (more camera movement)
-    drifts ~125px on average by the time the current 30-frame keyframe
-    interval elapses if the homography is just held stale.
+    drifts ~125px on average over 30 frames if the homography is just held
+    stale rather than propagated (CalibrationWorker's keyframe_interval has
+    since grown to 90 for an unrelated reason -- CPU contention, see its
+    own docstring -- making propagation's job here even more important).
 
     If tracking ever fails (too few inlier points -- fast pan, occlusion,
     a bad frame), propagate() returns None and keeps failing on the *same*
