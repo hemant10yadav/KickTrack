@@ -46,7 +46,7 @@ uv run prek install
 Run the tracker on a video (defaults to `data/videos/sample.mp4` if no path given):
 
 ```bash
-uv run python -m scripts.track_players data/videos/match_1.mp4
+uv run python -m scripts.track_players data/videos/match_5.mp4
 ```
 
 This opens a live window playing the video with a marker + ID on each detected player. Press `q` to quit.

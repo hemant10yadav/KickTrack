@@ -9,6 +9,12 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from scripts.calibration import (
+    CalibrationWorker,
+    HomographyPropagator,
+    HomographyWorker,
+    PitchCalibrator,
+)
 from scripts.display import (
     DisplaySmoother,
     DisplayStats,
@@ -17,6 +23,7 @@ from scripts.display import (
     FramePacer,
     MarkerRenderer,
     MotionExtrapolator,
+    PitchOverlayRenderer,
     StalenessTracker,
 )
 from scripts.player import (
@@ -351,6 +358,7 @@ class PlayerTracker:
         self.writer = None
         self.classifier = TeamClassifier()
         self.renderer = MarkerRenderer(self.classifier)
+        self.pitch_overlay = PitchOverlayRenderer()
         self.extrapolator = MotionExtrapolator()
         self.smoother = DisplaySmoother()
         self.fader = FadeController()
@@ -360,6 +368,10 @@ class PlayerTracker:
         self.frame_count = 0
         self.play_start = None
         self.achieved_fps = None
+        self.latest_calibration = None
+        self.current_homography = None
+        self.homography_worker = HomographyWorker(HomographyPropagator())
+        self._last_keyframe_id = None
 
     def run(self):
         cap = self._open_capture()
@@ -369,11 +381,15 @@ class PlayerTracker:
         self._warmup()
 
         worker = InferenceWorker(self.model, self.classifier).start()
+        calibration_worker = CalibrationWorker(PitchCalibrator).start()
+        self.homography_worker.start()
         self.play_start = time.perf_counter()
         try:
-            self._play(cap, worker, pacer)
+            self._play(cap, worker, calibration_worker, pacer)
         finally:
             worker.stop()
+            calibration_worker.stop()
+            self.homography_worker.stop()
             cap.release()
             if self.writer is not None:
                 self.writer.release()
@@ -391,6 +407,17 @@ class PlayerTracker:
             print(self.staleness.summary())
             print()
             print(self.display_stats.summary())
+            print()
+            if self.latest_calibration is not None:
+                print(
+                    f"Calibration: keyframe_homography_found="
+                    f"{self.latest_calibration.homography is not None} "
+                    f"keypoints={self.latest_calibration.num_keypoints} "
+                    f"lines={self.latest_calibration.num_lines} "
+                    f"propagation_active={self.current_homography is not None}"
+                )
+            else:
+                print("Calibration: no result yet")
 
     def _open_capture(self) -> cv2.VideoCapture:
         cap = cv2.VideoCapture(self.video_source)
@@ -404,13 +431,45 @@ class PlayerTracker:
         blank_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         track(self.model, blank_frame)
 
+    def _update_calibration(self, calibration_worker: CalibrationWorker, frame: np.ndarray):
+        """Forwards each new full recalibration from CalibrationWorker
+        (keyframe rate) to HomographyWorker's reset(), and submits every
+        displayed frame for propagation -- both calls return immediately;
+        HomographyWorker does the actual optical-flow tracking on its own
+        background thread. See docs/PITCH_CALIBRATION_SPEC.md Phase 2: this
+        used to call HomographyPropagator directly here, synchronously,
+        which pushed ~9-10% of frames over budget on match_5's tight 20ms
+        window even though the work itself only cost ~1-3ms -- moving it
+        off-thread removes it from the budget entirely.
+        """
+        keyframe = calibration_worker.get_keyframe()
+        if keyframe is not None:
+            self.latest_calibration, keyframe_frame = keyframe
+            is_new_keyframe = self.latest_calibration.frame_id != self._last_keyframe_id
+            if is_new_keyframe and self.latest_calibration.homography is not None:
+                self.homography_worker.reset(
+                    keyframe_frame,
+                    self.latest_calibration.homography,
+                    self.latest_calibration.frame_id,
+                )
+                self._last_keyframe_id = self.latest_calibration.frame_id
+
+        self.homography_worker.submit(frame, self.frame_count)
+        self.current_homography, _ = self.homography_worker.get_latest()
+
     def _open_writer(self, cap: cv2.VideoCapture, frame_budget_ms: float) -> cv2.VideoWriter:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         return cv2.VideoWriter(self.output_path, fourcc, 1000 / frame_budget_ms, (width, height))
 
-    def _play(self, cap: cv2.VideoCapture, worker: InferenceWorker, pacer: FramePacer):
+    def _play(
+        self,
+        cap: cv2.VideoCapture,
+        worker: InferenceWorker,
+        calibration_worker: CalibrationWorker,
+        pacer: FramePacer,
+    ):
         while True:
             iteration_start = time.perf_counter()
             self.fps_overlay.tick(iteration_start)
@@ -423,7 +482,10 @@ class PlayerTracker:
             t1 = time.perf_counter()
 
             worker.submit(frame.copy(), self.frame_count)
+            if calibration_worker.is_keyframe(self.frame_count):
+                calibration_worker.submit(frame.copy(), self.frame_count)
             result = worker.get_result()
+            self._update_calibration(calibration_worker, frame)
             t2 = time.perf_counter()
             now = time.perf_counter()
             self.staleness.record(self.frame_count, result.frame_id, result.captured_at)
@@ -431,6 +493,7 @@ class PlayerTracker:
             boxes = self.extrapolator.extrapolate(result, now)
             boxes = self.smoother.smooth(boxes)
             alphas = self.fader.update(boxes, result.coasting_progress)
+            self.pitch_overlay.draw(frame, self.current_homography)
             self.renderer.draw(frame, boxes, alphas)
             t3 = time.perf_counter()
             if self.show_window:
