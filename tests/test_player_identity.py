@@ -15,13 +15,15 @@ def _box(x1, y1, x2, y2, track_id):
 
 
 class _FakeClassifier:
-    """Minimal stand-in for TeamClassifier: just the two bits of state
-    PlayerIdentityManager reads (track_colors keyed by player_id, and a
-    controllable team_for lookup) -- no kmeans fitting needed for these tests.
+    """Minimal stand-in for TeamClassifier: just the bits of state
+    PlayerIdentityManager reads (track_colors and observation_counts keyed by
+    player_id, and a controllable team_for lookup) -- no kmeans fitting needed
+    for these tests.
     """
 
     def __init__(self):
         self.track_colors: dict[int, tuple] = {}
+        self.observation_counts: dict[int, int] = {}
         self.teams: dict[int, int] = {}
 
     def team_for(self, player_id):
@@ -107,6 +109,112 @@ def test_untracked_detections_pass_through_unassigned():
     assert len(identity.players) == 0
 
 
+def test_ambiguous_reappearance_is_not_merged():
+    """Found on real footage (match_5.mp4, frames ~1436-1477): a crowded moment
+    put two genuinely distinct, recently-lost players within MAX_NORM_DIST of
+    the very same reappearing detection, close enough to each other that
+    guessing was a coin flip -- and the naive nearest-candidate match guessed
+    wrong on real footage (two on-screen player_ids were silently renumbered).
+    When the top two candidates are this close, refuse to merge at all and
+    mint a new player_id instead -- a wrongly split identity is recoverable
+    and visible; a wrongly merged one silently corrupts two players' analytics.
+    """
+    identity = PlayerIdentityManager()
+    identity.update([_box(100, 100, 130, 160, 1)], frame_id=1)  # player A, center (115, 130)
+    identity.update([_box(140, 100, 170, 160, 2)], frame_id=1)  # player B, center (155, 130)
+    player_a = identity.tracker_to_player[1]
+    player_b = identity.tracker_to_player[2]
+
+    # both vanish; frame 2, one new detection reappears almost exactly between
+    # them -- nearly equidistant from both lost players' predicted positions
+    (r,) = identity.update([_box(122, 100, 152, 160, 3)], frame_id=2)  # center (137, 130)
+
+    assert r[4] not in (player_a, player_b), (
+        "an ambiguous reappearance must mint a new player_id, not guess between "
+        "two nearly-equidistant candidates"
+    )
+    assert len(identity.players) == 3
+    assert identity.ambiguous_log, "the refused match should be recorded for instrumentation"
+
+
+def test_reconciliation_is_order_independent():
+    """The historical bug: PlayerIdentityManager used to reconcile one unmapped
+    track_id at a time, in whatever order BoT-SORT's detections happened to
+    list them, greedily claiming the best *currently available* candidate --
+    so if a worse-matching track_id merely appeared earlier in the list, it
+    could claim a lost player out from under a track_id that was actually the
+    closer, more deserving match. Reconciling every unmapped track_id in a
+    frame jointly (a bipartite assignment) must give the same result no
+    matter what order the detections arrive in.
+    """
+    # frame 2: track 1 vanishes. Two new track_ids appear -- both close enough
+    # to A's predicted position to pass the gates, but track 10 (8px away) is
+    # clearly closer than track 20 (17px away); neither is anywhere near
+    # enough to any *other* lost player to be a valid alternative (there is no
+    # other lost player), so this isn't the ambiguity case above -- there is a
+    # single objectively-correct answer regardless of list order.
+    close = _box(108, 100, 138, 160, 10)  # center (123, 130), 8px from A
+    far = _box(117, 100, 147, 160, 20)  # center (132, 130), 17px from A
+
+    identity_a = PlayerIdentityManager()
+    identity_a.update([_box(100, 100, 130, 160, 1)], frame_id=1)
+    player_id_a = identity_a.tracker_to_player[1]
+    (r_close, r_far) = identity_a.update([close, far], frame_id=2)
+
+    identity_b = PlayerIdentityManager()
+    identity_b.update([_box(100, 100, 130, 160, 1)], frame_id=1)
+    player_id_b = identity_b.tracker_to_player[1]
+    (r_far2, r_close2) = identity_b.update([far, close], frame_id=2)  # same detections, reversed
+
+    assert r_close[4] == player_id_a, "the objectively closer detection should keep player A"
+    assert r_far[4] != player_id_a, "the objectively farther detection must not steal player A"
+    assert r_close2[4] == player_id_b, "listing order must not change who gets player A"
+    assert r_far2[4] != player_id_b, "listing order must not change who gets player A"
+
+
+def test_duplicate_tracks_alternating_on_one_player_are_aliased():
+    """Seen on match_5.mp4 (ID 45 <-> ID 3, eight flips in 90 frames): BoT-SORT
+    runs two tracks on one body and alternates which it emits. Both are
+    already-mapped player_ids, so no reconciliation path ever touches them.
+    After enough frames of the two boxes sitting on top of each other, the
+    newer id must be folded into the older one and stop appearing."""
+    identity = PlayerIdentityManager()
+    box_a = _box(100, 100, 130, 160, 1)
+    elsewhere = _box(900, 900, 930, 960, 2)  # track 2 starts life on a different person
+    for f in range(1, 4):
+        identity.update([box_a, elsewhere], frame_id=f)
+    older, newer = identity.tracker_to_player[1], identity.tracker_to_player[2]
+    assert newer != older
+
+    # BoT-SORT's track 2 then jumps onto player 1's body and the two tracks
+    # alternate there, one emitted per frame, for a long stretch
+    box_b = _box(101, 100, 131, 160, 2)
+    outputs = []
+    for f in range(4, 4 + PlayerIdentityManager.ALIAS_WINDOW + 10):
+        (r,) = identity.update([box_a if f % 2 else box_b], frame_id=f)
+        outputs.append(r[4])
+    assert identity.alias_log, "two tracks that only ever overlap are one player"
+    assert outputs[-1] == older and outputs[-2] == older, "after aliasing, one stable id"
+    assert newer not in identity.players
+    assert identity.tracker_to_player[2] == older
+
+
+def test_players_recently_seen_apart_are_not_aliased_when_they_overlap():
+    """Two real teammates lining up along the camera axis overlap heavily for a
+    moment -- but they were seen clearly apart just before. That must veto
+    aliasing, or a real duel would fuse two players permanently."""
+    identity = PlayerIdentityManager()
+    far_a, far_b = _box(100, 100, 130, 160, 1), _box(300, 100, 330, 160, 2)
+    for f in range(1, 4):
+        identity.update([far_a, far_b], frame_id=f)  # clearly apart
+    a_id, b_id = identity.tracker_to_player[1], identity.tracker_to_player[2]
+    near_a, near_b = _box(200, 100, 230, 160, 1), _box(202, 100, 232, 160, 2)
+    for f in range(4, 4 + PlayerIdentityManager.ALIAS_CONFIRM_FRAMES + 3):
+        (ra, rb) = identity.update([near_a, near_b], frame_id=f)  # overlapping now
+    assert not identity.alias_log
+    assert {ra[4], rb[4]} == {a_id, b_id}
+
+
 def test_lost_player_is_eventually_retired():
     """A player that never reappears should be forgotten (not accumulate forever)."""
     identity = PlayerIdentityManager()
@@ -130,10 +238,11 @@ def test_long_gap_reappearance_is_merged_by_jersey_color():
     classifier.track_colors[original_player_id] = (10, 20, 200)  # e.g. a red jersey
 
     # player vanishes for longer than MAX_LOST_FRAMES but within LONG_LOST_MAX_FRAMES,
-    # reappearing far from where velocity extrapolation would predict
+    # reappearing well outside the short-gap position window (~5 body-heights
+    # away -- a realistic run for a 40-frame gap) but still physically reachable
     gap = PlayerIdentityManager.MAX_LOST_FRAMES + 10
     reappear_frame = 1 + gap
-    (r,) = identity.update([_box(900, 700, 930, 760, 2)], frame_id=reappear_frame)
+    (r,) = identity.update([_box(400, 100, 430, 160, 2)], frame_id=reappear_frame)
     new_player_id = r[4]
     assert new_player_id != original_player_id, "no color sample yet -- must mint provisionally"
 
@@ -141,11 +250,63 @@ def test_long_gap_reappearance_is_merged_by_jersey_color():
     # keyed by the just-minted player_id) and closely matches the original
     classifier.track_colors[new_player_id] = (12, 18, 195)
 
-    (r2,) = identity.update([_box(902, 702, 932, 762, 2)], frame_id=reappear_frame + 1)
+    (r2,) = identity.update([_box(402, 102, 432, 162, 2)], frame_id=reappear_frame + 1)
     assert r2[4] == original_player_id, (
         "matching jersey color should merge into the long-lost player"
     )
     assert len(identity.players) == 1
+
+
+def test_long_gap_color_match_rejects_physically_impossible_travel():
+    """The long-gap color path used to accept the closest *color* anywhere on the
+    pitch with no position check -- and every teammate's color is within
+    tolerance of every other's, so a same-kit player could be merged into a
+    lost teammate on the far side of the pitch. A reappearance the lost player
+    could not physically have reached in the gap (~17 body-heights in 40
+    frames, roughly twice a flat-out sprint) must not be merged, however well
+    the color matches.
+    """
+    classifier = _FakeClassifier()
+    identity = PlayerIdentityManager(classifier=classifier)
+
+    identity.update([_box(100, 100, 130, 160, 1)], frame_id=1)
+    original_player_id = identity.tracker_to_player[1]
+    classifier.track_colors[original_player_id] = (10, 20, 200)
+
+    gap = PlayerIdentityManager.MAX_LOST_FRAMES + 10
+    reappear_frame = 1 + gap
+    (r,) = identity.update([_box(900, 700, 930, 760, 2)], frame_id=reappear_frame)
+    new_player_id = r[4]
+    classifier.track_colors[new_player_id] = (10, 20, 200)  # identical color
+
+    (r2,) = identity.update([_box(902, 702, 932, 762, 2)], frame_id=reappear_frame + 1)
+    assert r2[4] == new_player_id, "an unreachable reappearance must stay a separate player"
+    assert len(identity.players) == 2
+
+
+def test_long_gap_color_match_refuses_when_two_lost_teammates_are_equally_close():
+    """Two lost teammates (identical smoothed color) both reachable and about
+    equally far from a reappearing track: ranking by color between them is a
+    coin flip, so refuse and mint rather than guess."""
+    classifier = _FakeClassifier()
+    identity = PlayerIdentityManager(classifier=classifier)
+
+    identity.update([_box(100, 100, 130, 160, 1), _box(400, 100, 430, 160, 2)], frame_id=1)
+    a, b = identity.tracker_to_player[1], identity.tracker_to_player[2]
+    classifier.track_colors[a] = (10, 20, 200)
+    classifier.track_colors[b] = (10, 20, 200)
+
+    gap = PlayerIdentityManager.MAX_LOST_FRAMES + 10
+    reappear_frame = 1 + gap
+    # reappears exactly between them
+    (r,) = identity.update([_box(250, 100, 280, 160, 3)], frame_id=reappear_frame)
+    new_player_id = r[4]
+    classifier.track_colors[new_player_id] = (10, 20, 200)
+
+    (r2,) = identity.update([_box(251, 100, 281, 160, 3)], frame_id=reappear_frame + 1)
+    assert r2[4] == new_player_id
+    assert r2[4] not in (a, b)
+    assert any(e.get("note") == "long-gap color match" for e in identity.ambiguous_log)
 
 
 def test_long_gap_reappearance_with_different_color_is_not_merged():
