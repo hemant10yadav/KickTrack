@@ -7,6 +7,7 @@ __pycache__/
 # Model weights (downloaded/exported automatically, don't commit)
 *.pt
 *.mlpackage/
+weights/pnlcalib/
 
 # Test/sample footage (large binaries). Trimmed fixtures for the pytest FPS
 # regression suite live under tests/videos/ instead and are committed there.

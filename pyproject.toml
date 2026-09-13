@@ -12,6 +12,13 @@ dependencies = [
     "opencv-python==5.0.0.93",
     "lap==0.5.13",
     "coremltools>=9.0",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+    "scipy>=1.18.1",
+    "shapely>=2.1.2",
+    "matplotlib>=3.11.1",
+    "pyyaml>=6.0.3",
+    "pillow>=12.3.0",
 ]
 
 [dependency-groups]
@@ -24,6 +31,8 @@ dev = [
 [tool.ruff]
 target-version = "py313"
 line-length = 100
+extend-exclude = ["scripts/pnlcalib"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
