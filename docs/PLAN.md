@@ -91,6 +91,69 @@ Take a fixed-camera football video and show a marker on each player that moves w
             `tests/test_tracking_quality.py` (slow, real footage — churn-ratio and
             frame-drop-ratio regression ceilings on match_3/4/5).
 
+- [X] **Plan 2.6: Player ID stability (measured on real footage, not synthetic tests)**
+
+  Motivation: on-screen player numbers were visibly changing mid-clip on
+  match_5.mp4, which would silently corrupt every per-player Plan 3 stat
+  (distance, speed, heatmaps are all keyed by `player_id`). Each round below
+  was found by running the real realtime CLI and dumping annotated frames
+  (a `--output` run drops ~40% of frames and hid the first bug entirely);
+  all numbers are from the realtime run of `match_5.mp4` (1750 frames, 0 skipped).
+
+  - [X] Crossing-swap correction thrashed forever (33 swaps, all one pair,
+        every 3 frames). `_swap()` flipped the tracker mapping but left
+        `TeamClassifier`'s 0.7-smoothed color history on the wrong player_id,
+        so `team_for()` kept reporting the wrong team and re-triggered an undo
+        swap. Fix: move the color history with the identity; plus a
+        `SWAP_COOLDOWN_FRAMES` backstop. 33 -> 1 swap.
+  - [X] Greedy per-detection reconciliation was order-dependent. Replaced with
+        a per-frame bipartite assignment (`scipy.optimize.linear_sum_assignment`)
+        plus `AMBIGUITY_MARGIN`: a runner-up within 30% of the best refuses the
+        merge and mints a new id (a wrong split is visible/recoverable; a wrong
+        merge silently corrupts two players). Exposed and fixed two latent
+        state bugs: a recycled BoT-SORT track_id clobbering another player's
+        mapping, and a lost player whose own track reappeared being matched to
+        a second detection in the same frame (`KeyError` on real footage).
+  - [X] `MAX_NORM_DIST` 3.0 -> 1.5: every wrong merge in the frame-1436 cluster
+        scored 1.87-2.86 (right under the old ceiling); every legitimate one
+        scored < 1.0. Verified visually (ID 45 -> 3, ID 47 -> 48 renumbering
+        gone) and against the slow regression ceilings (33/37/34 ids minted
+        vs 70/45/65).
+  - [X] Long-gap color match had no position or ambiguity gate and, after the
+        above, carried ~90% of merges: it took the closest *color* anywhere on
+        the pitch, and teammates all match. Now color is a gate, candidates
+        must be reachable (`MAX_TRAVEL_PER_FRAME` * gap), are ranked by travel
+        distance, and a close runner-up refuses. Also: only an *active*
+        candidate may merge, one target per cycle (two tracks were merging
+        into player 37 in consecutive frames -> duplicate ids on screen), and
+        the target's stale tracker mapping is dropped on merge.
+  - [X] `VELOCITY_HORIZON_FRAMES` = 10: constant-velocity extrapolation over
+        25+ frame gaps landed far from where a player who slowed down actually
+        reappeared (a 0.64-h reappearance went unmatched).
+  - [X] Duplicate BoT-SORT tracks -- the dominant remaining cause. A
+        same-position ID-change detector found 55 visible flips, most of them
+        one pair alternating (45 <-> 3 eight times); frame dumps showed two
+        labels stacked on one body (ID 3 + ID 22, ID 58 + ID 1). BoT-SORT was
+        running two tracks on one player; both were already mapped, so no
+        reconciliation path ever saw them. `_check_aliases`: two players whose
+        boxes overlap (IoU > 0.55, similar size, not different teams) on 4
+        frames in a 45-frame window are merged into the older id -- vetoed if
+        the pair was seen clearly apart in that window (real players lining
+        up in perspective are seen apart before/after; duplicate tracks never
+        are). 55 -> 29 visible flips (many of the rest are the one-time snap
+        to the kept id); 11 pairs aliased, spot-checked visually (14 into 10:
+        both labels on one player at frames 857 and 1034).
+  - Net on match_5.mp4: reconciliations 27 -> 6, swap corrections 33 -> 1.
+    Tests: `tests/test_player_identity.py` 11 -> 17 (order-independence,
+    ambiguity refusal, teleport-distance color match refused, two equidistant
+    lost teammates refused, alias merge, seen-apart veto);
+    `tests/test_tracking_quality.py` 6/6 with frame drops unchanged.
+  - Known limit (from the literature -- GTA, SoccerNet GSR): two same-kit
+    teammates shoulder-to-shoulder are indistinguishable by position + team
+    color; SOTA sits at HOTA ~81-83%, not 100%. Next levers if needed:
+    per-player appearance embeddings (not team-average color), and an offline
+    global tracklet re-association pass for analytics-grade tracks.
+
 - [ ] **Plan 3: Player & Match Analytics**
 
   - [ ] `PlayerState`: per-track position (pitch-relative, once calibration exists),
