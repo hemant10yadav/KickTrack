@@ -4,6 +4,7 @@ import time
 import cv2
 import numpy as np
 
+from scripts.calibration import PITCH_LINES
 from scripts.player import TeamClassifier
 
 UNCLASSIFIED_COLOR = (180, 180, 180)  # gray, shown before a track has enough samples
@@ -141,6 +142,43 @@ class MarkerRenderer:
             2,
             lineType=cv2.LINE_AA,
         )
+
+
+class PitchOverlayRenderer:
+    """Draws the pitch's standard line markings (PITCH_LINES, in
+    scripts/calibration.py) reprojected through the current pitch
+    homography, so calibration is visible on the live video instead of
+    only reported as end-of-run stats (see docs/PITCH_CALIBRATION_SPEC.md).
+
+    Coordinates far outside the frame (a homography extrapolated well
+    beyond where it was actually fit -- see the Phase 2 drift-measurement
+    write-up on why that's numerically unstable) are clamped before
+    drawing so a bad calibration can't overflow OpenCV's int line drawing.
+    """
+
+    LINE_COLOR = (0, 0, 255)  # red, distinct from team marker colors
+    LINE_THICKNESS = 2
+    CLAMP_MARGIN = 10_000  # px beyond the frame edge; well past anything meaningful
+
+    def draw(self, frame, homography):
+        if homography is None:
+            return
+        h, w = frame.shape[:2]
+        for (x1, y1), (x2, y2) in PITCH_LINES:
+            p1 = self._project(homography, x1, y1, w, h)
+            p2 = self._project(homography, x2, y2, w, h)
+            if p1 is None or p2 is None:
+                continue
+            cv2.line(frame, p1, p2, self.LINE_COLOR, self.LINE_THICKNESS)
+
+    def _project(self, homography, x, y, w, h):
+        point = homography @ np.array([x, y, 1.0])
+        if abs(point[2]) < 1e-6:
+            return None
+        point /= point[2]
+        px = int(np.clip(point[0], -self.CLAMP_MARGIN, w + self.CLAMP_MARGIN))
+        py = int(np.clip(point[1], -self.CLAMP_MARGIN, h + self.CLAMP_MARGIN))
+        return px, py
 
 
 class MotionExtrapolator:

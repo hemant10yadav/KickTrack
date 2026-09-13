@@ -43,6 +43,33 @@ CONFIG_DIR = Path(__file__).parent / "pnlcalib" / "config"
 KP_THRESHOLD = 0.3434
 LINE_THRESHOLD = 0.7867
 
+# Standard pitch line markings (meters, centered at the pitch's own center
+# spot per this module's world-coordinate convention -- see
+# _homography_from_cam_params). Used by scripts/display.py's
+# PitchOverlayRenderer to draw the calibrated pitch outline on screen.
+_RAW_PITCH_LINES = [
+    [[0.0, 54.16], [16.5, 54.16]],
+    [[16.5, 13.84], [16.5, 54.16]],
+    [[16.5, 13.84], [0.0, 13.84]],
+    [[88.5, 54.16], [105.0, 54.16]],
+    [[88.5, 13.84], [88.5, 54.16]],
+    [[88.5, 13.84], [105.0, 13.84]],
+    [[52.5, 0.0], [52.5, 68.0]],
+    [[0.0, 68.0], [105.0, 68.0]],
+    [[0.0, 0.0], [0.0, 68.0]],
+    [[105.0, 0.0], [105.0, 68.0]],
+    [[0.0, 0.0], [105.0, 0.0]],
+    [[0.0, 43.16], [5.5, 43.16]],
+    [[5.5, 43.16], [5.5, 24.84]],
+    [[5.5, 24.84], [0.0, 24.84]],
+    [[99.5, 43.16], [105.0, 43.16]],
+    [[99.5, 43.16], [99.5, 24.84]],
+    [[99.5, 24.84], [105.0, 24.84]],
+]
+PITCH_LINES: list[tuple[tuple[float, float], tuple[float, float]]] = [
+    ((x1 - 52.5, y1 - 34.0), (x2 - 52.5, y2 - 34.0)) for (x1, y1), (x2, y2) in _RAW_PITCH_LINES
+]
+
 
 def _select_device() -> str:
     return "mps" if torch.backends.mps.is_available() else "cpu"

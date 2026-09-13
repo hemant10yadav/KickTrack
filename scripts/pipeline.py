@@ -18,6 +18,7 @@ from scripts.display import (
     FramePacer,
     MarkerRenderer,
     MotionExtrapolator,
+    PitchOverlayRenderer,
     StalenessTracker,
 )
 from scripts.player import (
@@ -342,6 +343,7 @@ class PlayerTracker:
         self.show_window = show_window
         self.classifier = TeamClassifier()
         self.renderer = MarkerRenderer(self.classifier)
+        self.pitch_overlay = PitchOverlayRenderer()
         self.extrapolator = MotionExtrapolator()
         self.smoother = DisplaySmoother()
         self.fader = FadeController()
@@ -454,6 +456,7 @@ class PlayerTracker:
             boxes = self.extrapolator.extrapolate(result, now)
             boxes = self.smoother.smooth(boxes)
             alphas = self.fader.update(boxes, result.coasting_progress)
+            self.pitch_overlay.draw(frame, self.current_homography)
             self.renderer.draw(frame, boxes, alphas)
             t3 = time.perf_counter()
             if self.show_window:
