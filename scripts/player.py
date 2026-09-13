@@ -202,6 +202,8 @@ class PlayerState:
     vy: float
     last_seen_frame: int
     status: str  # "active" | "lost"
+    team: int | None = None  # established TeamClassifier team_for() reading
+    team_mismatch_streak: int = 0  # consecutive cycles team_for() disagreed with `team`
 
 
 class PlayerIdentityManager:
@@ -222,17 +224,43 @@ class PlayerIdentityManager:
     The values below are a starting point (deliberately conservative — start
     strict on merges, loosen only against measured false-splits), not tuned
     against real match footage yet.
+
+    Two failure modes this position/size-only logic cannot catch on its own,
+    both requiring a `classifier` (a TeamClassifier, keyed by player_id since
+    jersey-color sampling runs downstream of this reconciliation):
+
+    - A player gone longer than MAX_LOST_FRAMES: predicted position from
+      extrapolated velocity gets unreliable over a long gap, so instead of
+      widening the position window, a freshly-minted track_id is held as a
+      color-match candidate and retried each cycle against players lost up to
+      LONG_LOST_MAX_FRAMES ago, using jersey-color distance instead of position.
+    - A crossing/ID swap: two *already-active* track_ids can get their
+      detections swapped by BoT-SORT's own matching mid-crossing. Since both
+      stay "active" the whole time, the reconciliation above never runs for
+      them at all. `_check_swaps` instead watches each active player's
+      TeamClassifier team assignment for a sustained mismatch against its own
+      established team, and swaps two mutually-mismatched, nearby players'
+      track_id mappings back.
     """
 
     MAX_LOST_FRAMES = 30  # ~1.25s at 24fps
     MAX_NORM_DIST = 3.0  # (predicted-position error) / bbox_height
     SIZE_RATIO_RANGE = (0.5, 2.0)
 
-    def __init__(self):
+    LONG_LOST_MAX_FRAMES = 90  # ~3.75s at 24fps -- color-gated, not position-gated
+    COLOR_MAX_DIST = 40.0  # max BGR L2 distance between smoothed jersey colors
+
+    SWAP_MISMATCH_CYCLES = 3  # consecutive cycles of team disagreement before acting
+    SWAP_PROXIMITY_RATIO = 3.0  # max center distance / bbox height to call it a crossing
+
+    def __init__(self, classifier=None):
         self.players: dict[int, PlayerState] = {}
         self.tracker_to_player: dict[int, int] = {}
         self._next_id = 1
         self.switch_log = []  # instrumentation: every track_id reconciliation
+        self.swap_log = []  # instrumentation: every crossing swap corrected
+        self.classifier = classifier
+        self._color_pending: dict[int, int] = {}  # player_id -> frame first minted
 
     @property
     def total_players_minted(self) -> int:
@@ -254,6 +282,8 @@ class PlayerIdentityManager:
             if player.status == "active" and player.tracker_id not in present_tracker_ids:
                 player.status = "lost"
 
+        self._retry_color_pending(frame_id)
+
         results = []
         for x1, y1, x2, y2, tracker_id in detections:
             if tracker_id < 0:
@@ -265,6 +295,9 @@ class PlayerIdentityManager:
                 player_id = self._reconcile(tracker_id, bbox, frame_id)
             self._observe(player_id, tracker_id, bbox, frame_id)
             results.append((x1, y1, x2, y2, player_id))
+
+        if self.classifier is not None:
+            self._check_swaps(frame_id)
 
         self._retire_stale(frame_id)
         return results
@@ -314,6 +347,8 @@ class PlayerIdentityManager:
         new_id = self._next_id
         self._next_id += 1
         self.tracker_to_player[tracker_id] = new_id
+        if self.classifier is not None:
+            self._color_pending[new_id] = frame_id
         return new_id
 
     def _observe(self, player_id: int, tracker_id: int, bbox: tuple, frame_id: int) -> None:
@@ -324,8 +359,10 @@ class PlayerIdentityManager:
             pcy = (existing.bbox[1] + existing.bbox[3]) / 2
             cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
             vx, vy = (cx - pcx) / gap, (cy - pcy) / gap
+            team, team_mismatch_streak = existing.team, existing.team_mismatch_streak
         else:
             vx, vy = 0.0, 0.0
+            team, team_mismatch_streak = None, 0
         self.players[player_id] = PlayerState(
             player_id=player_id,
             tracker_id=tracker_id,
@@ -334,28 +371,182 @@ class PlayerIdentityManager:
             vy=vy,
             last_seen_frame=frame_id,
             status="active",
+            team=team,
+            team_mismatch_streak=team_mismatch_streak,
         )
 
     def _retire_stale(self, frame_id: int) -> None:
+        # Without a classifier there's no color-matching to wait for, so keep the
+        # original short window; with one, hold lost players around longer so a
+        # late color-matched candidate (see _retry_color_pending) still has a
+        # target to merge into.
+        limit = self.LONG_LOST_MAX_FRAMES if self.classifier is not None else self.MAX_LOST_FRAMES
         stale = [
             pid
             for pid, p in self.players.items()
-            if p.status == "lost" and frame_id - p.last_seen_frame > self.MAX_LOST_FRAMES
+            if p.status == "lost" and frame_id - p.last_seen_frame > limit
         ]
         for pid in stale:
             del self.players[pid]
+            self._color_pending.pop(pid, None)
+
+    def _retry_color_pending(self, frame_id: int) -> None:
+        """Retry color-based matching for track_ids that were minted as brand-new
+        players (no position match within MAX_LOST_FRAMES) but might still be a
+        player who's been gone longer -- position prediction alone isn't reliable
+        over a long gap, so this waits for the candidate to get its first
+        jersey-color sample (recorded downstream, keyed by player_id) and then
+        compares it against everyone still lost within LONG_LOST_MAX_FRAMES.
+        """
+        if not self.classifier or not self._color_pending:
+            return
+        resolved = []
+        for player_id, created_frame in self._color_pending.items():
+            candidate = self.players.get(player_id)
+            if candidate is None or frame_id - created_frame > self.LONG_LOST_MAX_FRAMES:
+                resolved.append(player_id)
+                continue
+            color = self.classifier.track_colors.get(player_id)
+            if color is None:
+                continue  # no jersey-color sample yet -- keep waiting
+            match_id = self._find_color_match(candidate, color, frame_id)
+            if match_id is not None:
+                self._merge_into(candidate, match_id, frame_id)
+                resolved.append(player_id)
+        for player_id in resolved:
+            del self._color_pending[player_id]
+
+    def _find_color_match(self, candidate: PlayerState, color, frame_id: int):
+        best_id, best_dist = None, None
+        for player in self.players.values():
+            if player.status != "lost" or player.player_id == candidate.player_id:
+                continue
+            gap = frame_id - player.last_seen_frame
+            # Short gaps are already handled by position matching in _reconcile;
+            # this path only covers the window position matching gave up on.
+            if gap <= self.MAX_LOST_FRAMES or gap > self.LONG_LOST_MAX_FRAMES:
+                continue
+            old_color = self.classifier.track_colors.get(player.player_id)
+            if old_color is None:
+                continue
+            c_height = max(1, candidate.bbox[3] - candidate.bbox[1])
+            p_height = max(1, player.bbox[3] - player.bbox[1])
+            size_ratio = c_height / p_height
+            if not (self.SIZE_RATIO_RANGE[0] <= size_ratio <= self.SIZE_RATIO_RANGE[1]):
+                continue
+            dist = float(
+                np.linalg.norm(np.asarray(color, dtype=float) - np.asarray(old_color, dtype=float))
+            )
+            if dist > self.COLOR_MAX_DIST:
+                continue
+            if best_dist is None or dist < best_dist:
+                best_dist, best_id = dist, player.player_id
+        return best_id
+
+    def _merge_into(self, candidate: PlayerState, target_player_id: int, frame_id: int) -> None:
+        """Fold a color-pending candidate into the long-lost player it matched,
+        so future frames report the old, established player_id instead."""
+        self.tracker_to_player[candidate.tracker_id] = target_player_id
+        target = self.players[target_player_id]
+        target.tracker_id = candidate.tracker_id
+        target.bbox = candidate.bbox
+        target.vx, target.vy = candidate.vx, candidate.vy
+        target.last_seen_frame = candidate.last_seen_frame
+        target.status = candidate.status
+        self.switch_log.append(
+            {
+                "frame": frame_id,
+                "player_id": target_player_id,
+                "old_tracker_id": target.tracker_id,
+                "new_tracker_id": candidate.tracker_id,
+                "note": "long-gap color match",
+            }
+        )
+        del self.players[candidate.player_id]
+
+    def _check_swaps(self, frame_id: int) -> None:
+        """Detect and correct a crossing-players ID swap: two track_ids that stayed
+        continuously active the whole time (so _reconcile never saw them as
+        unmapped) but got their detections swapped mid-crossing by BoT-SORT's own
+        matching. A sustained team-classification mismatch on both sides, plus
+        the two players being close together, is treated as evidence of a swap.
+
+        Only corrects the mapping going forward -- frames already emitted during
+        the SWAP_MISMATCH_CYCLES it took to detect the swap stay as reported.
+        """
+        mismatched = []
+        for player in self.players.values():
+            if player.status != "active":
+                continue
+            team = self.classifier.team_for(player.player_id)
+            if team is None:
+                continue
+            if player.team is None:
+                player.team = team
+                player.team_mismatch_streak = 0
+                continue
+            if team == player.team:
+                player.team_mismatch_streak = 0
+                continue
+            player.team_mismatch_streak += 1
+            if player.team_mismatch_streak >= self.SWAP_MISMATCH_CYCLES:
+                mismatched.append((player, team))
+
+        swapped_ids = set()
+        for i, (player_a, current_a) in enumerate(mismatched):
+            if player_a.player_id in swapped_ids:
+                continue
+            for player_b, current_b in mismatched[i + 1 :]:
+                if player_b.player_id in swapped_ids:
+                    continue
+                if current_a != player_b.team or current_b != player_a.team:
+                    continue  # not a mutual swap between exactly these two teams
+                height = max(
+                    1, player_a.bbox[3] - player_a.bbox[1], player_b.bbox[3] - player_b.bbox[1]
+                )
+                cx_a = (player_a.bbox[0] + player_a.bbox[2]) / 2
+                cy_a = (player_a.bbox[1] + player_a.bbox[3]) / 2
+                cx_b = (player_b.bbox[0] + player_b.bbox[2]) / 2
+                cy_b = (player_b.bbox[1] + player_b.bbox[3]) / 2
+                dist = ((cx_a - cx_b) ** 2 + (cy_a - cy_b) ** 2) ** 0.5
+                if dist / height > self.SWAP_PROXIMITY_RATIO:
+                    continue
+                self._swap(player_a, player_b, frame_id)
+                swapped_ids.add(player_a.player_id)
+                swapped_ids.add(player_b.player_id)
+                break
+
+    def _swap(self, player_a: PlayerState, player_b: PlayerState, frame_id: int) -> None:
+        self.tracker_to_player[player_a.tracker_id], self.tracker_to_player[player_b.tracker_id] = (
+            player_b.player_id,
+            player_a.player_id,
+        )
+        player_a.tracker_id, player_b.tracker_id = player_b.tracker_id, player_a.tracker_id
+        player_a.team_mismatch_streak = 0
+        player_b.team_mismatch_streak = 0
+        self.swap_log.append(
+            {"frame": frame_id, "player_a": player_a.player_id, "player_b": player_b.player_id}
+        )
 
     def summary(self) -> str:
         lines = [
             f"Persistent player IDs minted: {self.total_players_minted}",
             f"track_id -> player_id reconciliations (switches absorbed): {len(self.switch_log)}",
+            f"crossing-player ID swaps corrected: {len(self.swap_log)}",
         ]
         for event in self.switch_log[:20]:
+            detail = event.get("note") or f"norm_dist={event.get('norm_dist')}"
             lines.append(
                 f"  frame {event['frame']}: track {event['old_tracker_id']} -> "
-                f"{event['new_tracker_id']} kept as player {event['player_id']} "
-                f"(norm_dist={event['norm_dist']})"
+                f"{event['new_tracker_id']} kept as player {event['player_id']} ({detail})"
             )
         if len(self.switch_log) > 20:
             lines.append(f"  ... and {len(self.switch_log) - 20} more")
+        for event in self.swap_log[:20]:
+            lines.append(
+                f"  frame {event['frame']}: swapped tracker mapping between "
+                f"player {event['player_a']} and player {event['player_b']}"
+            )
+        if len(self.swap_log) > 20:
+            lines.append(f"  ... and {len(self.swap_log) - 20} more")
         return "\n".join(lines)

@@ -221,7 +221,7 @@ class InferenceWorker:
         self.running = True
         self.stats = WorkerStats()
         self.state = StateManager()
-        self.identity = PlayerIdentityManager()
+        self.identity = PlayerIdentityManager(classifier=self.classifier)
         self.cycle_count = 0
         self.jersey_last_sampled = {}
         self.thread = threading.Thread(target=self._run, daemon=True)
