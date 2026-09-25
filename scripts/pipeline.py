@@ -2,14 +2,15 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from scripts.analytics import MatchAnalytics
+from scripts.analytics import MatchAnalytics, PitchProjector
+from scripts.ball import BallAnalytics
 from scripts.calibration import (
     CalibrationWorker,
     HomographyPropagator,
@@ -17,6 +18,7 @@ from scripts.calibration import (
     PitchCalibrator,
 )
 from scripts.display import (
+    BallRenderer,
     DisplaySmoother,
     DisplayStats,
     FadeController,
@@ -41,6 +43,12 @@ from scripts.player import (
 STREAM_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")  # e.g. rtmp://, rtsp://, http(s)://
 
 PERSON_CLASS_ID = 0  # COCO class id for "person"
+BALL_CLASS_ID = 32  # COCO class id for "sports ball"
+# Ball candidates are kept down to this confidence: on match_4/match_5 the ball is
+# a 10-17px blob the detector sees at a median confidence of 0.12-0.20 (docs/PLAN.md
+# Plan 3.2), far below anything BoT-SORT would start a track for. Persons are
+# unaffected -- BoT-SORT applies its own thresholds (botsort_custom.yaml).
+DETECTION_CONF = 0.05
 TRACKER_CONFIG = str(Path(__file__).parent / "botsort_custom.yaml")
 MODEL_NAME = "yolo26s.mlpackage"
 # Switched from yolov8s (docs/PLAN.md Plan 2.9): the swaps of Plan 2.8 all began
@@ -109,13 +117,51 @@ def track(model: YOLO, frame):
     """
     return model.track(
         frame,
-        classes=[PERSON_CLASS_ID],
+        classes=[PERSON_CLASS_ID, BALL_CLASS_ID],
         persist=True,
         tracker=TRACKER_CONFIG,
-        conf=0.15,
+        conf=DETECTION_CONF,
         imgsz=INFERENCE_IMGSZ,
         verbose=False,
     )[0]
+
+
+class BallCandidateCapture:
+    """Grabs the raw "sports ball" detections of each forward pass.
+
+    `model.track()` only returns *tracked* boxes, and BoT-SORT never starts a
+    track for a 0.1-confidence blob, which is what the ball usually is. The
+    predictor runs its `on_predict_postprocess_end` callbacks in registration
+    order and the tracker's callback replaces the results in place, so a
+    callback registered *before* the first `track()` call (i.e. before the
+    tracker registers its own) sees every raw detection of the pass. Nothing
+    extra is inferred; the ball comes out of the pass we already pay for.
+    """
+
+    def __init__(self):
+        self.latest: list = []  # (x1, y1, x2, y2, conf) in pixels, this pass
+
+    def install(self, model: YOLO) -> "BallCandidateCapture":
+        model.add_callback("on_predict_postprocess_end", self)
+        return self
+
+    def __call__(self, predictor) -> None:
+        result = predictor.results[0]
+        boxes = result.boxes
+        if boxes is None or len(boxes) == 0:
+            self.latest = []
+            return
+        cls = boxes.cls.cpu().numpy().astype(int)
+        keep = cls == BALL_CLASS_ID
+        if not keep.any():
+            self.latest = []
+            return
+        xyxy = boxes.xyxy.cpu().numpy()[keep]
+        conf = boxes.conf.cpu().numpy()[keep]
+        self.latest = [
+            (float(x1), float(y1), float(x2), float(y2), float(c))
+            for (x1, y1, x2, y2), c in zip(xyxy, conf, strict=True)
+        ]
 
 
 def extract_boxes(results):
@@ -134,9 +180,12 @@ def extract_boxes(results):
         if boxes_obj.id is not None
         else np.full(len(xyxy), -1, dtype=int)
     )
+    # The tracker also sees (and may track) the ball class; players only here.
+    cls = boxes_obj.cls.cpu().numpy().astype(int)
     return [
         (int(x1), int(y1), int(x2), int(y2), int(tid))
-        for (x1, y1, x2, y2), tid in zip(xyxy, ids, strict=True)
+        for (x1, y1, x2, y2), tid, c in zip(xyxy, ids, cls, strict=True)
+        if c == PERSON_CLASS_ID
     ]
 
 
@@ -149,6 +198,7 @@ class RawDetections:
     frame: np.ndarray | None
     frame_id: int | None
     captured_at: float | None
+    ball_candidates: list = field(default_factory=list)  # (x1, y1, x2, y2, conf) px
 
 
 @dataclass
@@ -159,6 +209,7 @@ class InferenceResult:
     previous_boxes: list
     previous_captured_at: float | None
     coasting_progress: dict = None  # track_id -> fraction (0-1) through its grace window
+    ball_candidates: list = field(default_factory=list)
 
 
 class WorkerStats:
@@ -229,8 +280,9 @@ class InferenceWorker:
     7.7% here, while the display thread idles ~13ms per frame.
     """
 
-    def __init__(self, model: YOLO):
+    def __init__(self, model: YOLO, ball_capture: BallCandidateCapture | None = None):
         self.model = model
+        self.ball_capture = ball_capture
         self.lock = threading.Lock()
         self.pending = None  # (frame, frame_id, captured_at)
         self.latest = RawDetections(boxes=[], frame=None, frame_id=None, captured_at=None)
@@ -275,9 +327,14 @@ class InferenceWorker:
             total_ms = (time.perf_counter() - total_start) * 1000
             self.stats.record_processed(inference_ms, extract_ms, total_ms)
 
+            ball_candidates = self.ball_capture.latest if self.ball_capture is not None else []
             with self.lock:
                 self.latest = RawDetections(
-                    boxes=boxes, frame=frame, frame_id=frame_id, captured_at=captured_at
+                    boxes=boxes,
+                    frame=frame,
+                    frame_id=frame_id,
+                    captured_at=captured_at,
+                    ball_candidates=ball_candidates,
                 )
 
     def _take_pending(self):
@@ -386,6 +443,7 @@ class IdentityResolver:
             previous_boxes=self.latest.boxes,
             previous_captured_at=self.latest.captured_at,
             coasting_progress=coasting_progress,
+            ball_candidates=raw.ball_candidates,
         )
         return self.latest
 
@@ -432,17 +490,22 @@ class PlayerTracker:
     ):
         self.video_source = video_source
         self.model = model
+        # Must be installed before the first track() call (the warm-up), so it
+        # runs ahead of the tracker's own callback -- see BallCandidateCapture.
+        self.ball_capture = BallCandidateCapture().install(model)
         self.show_window = show_window
         self.output_path = output_path
         self.realtime = realtime
         self.analytics_dir = analytics_dir
         self.analytics = None  # MatchAnalytics, created once the video's fps is known
+        self.ball = None  # BallAnalytics, likewise
         self.writer = None
         self.classifier = TeamClassifier()
         self.resolver = IdentityResolver(self.classifier)
         self.renderer = MarkerRenderer(self.classifier)
         self.pitch_overlay = PitchOverlayRenderer()
         self.minimap = PitchMinimap()
+        self.ball_renderer = BallRenderer()
         self.extrapolator = MotionExtrapolator()
         self.smoother = DisplaySmoother()
         self.fader = FadeController()
@@ -461,11 +524,12 @@ class PlayerTracker:
         cap = self._open_capture()
         pacer = FramePacer(fps=cap.get(cv2.CAP_PROP_FPS) or 25)
         self.analytics = MatchAnalytics(fps=1000 / pacer.frame_budget_ms)
+        self.ball = BallAnalytics(fps=1000 / pacer.frame_budget_ms)
         if self.output_path:
             self.writer = self._open_writer(cap, pacer.frame_budget_ms)
         self._warmup()
 
-        worker = InferenceWorker(self.model).start()
+        worker = InferenceWorker(self.model, self.ball_capture).start()
         calibration_worker = CalibrationWorker(PitchCalibrator).start()
         self.homography_worker.start()
         self.play_start = time.perf_counter()
@@ -497,8 +561,11 @@ class PlayerTracker:
             print()
             self.analytics.finish()
             print(self.analytics.summary())
+            print()
+            print(self.ball.summary(team_name=self.classifier.team_name))
             if self.analytics_dir:
                 self.analytics.write(self.analytics_dir, team_color=self._team_color)
+                self.ball.write(self.analytics_dir, team_name=self.classifier.team_name)
                 print(f"Analytics written to {self.analytics_dir}/")
             print()
             if self.latest_calibration is not None:
@@ -549,6 +616,20 @@ class PlayerTracker:
 
         self.homography_worker.submit(frame, self.frame_count)
         self.current_homography, _ = self.homography_worker.get_latest()
+
+    def _ball_candidates_on_pitch(self, candidates) -> list:
+        """(x1, y1, x2, y2, conf) pixel candidates -> (x_m, y_m, conf) on the
+        pitch, using the box bottom as the ball's contact point; off-pitch and
+        uncalibrated ones are dropped."""
+        projector = PitchProjector(self.current_homography)
+        if not projector.available:
+            return []
+        on_pitch = []
+        for x1, _y1, x2, y2, conf in candidates:
+            position = projector.to_pitch((x1 + x2) / 2, y2)
+            if position is not None:
+                on_pitch.append((position[0], position[1], conf))
+        return on_pitch
 
     def _distance_captions(self, boxes) -> dict:
         captions = {}
@@ -603,6 +684,12 @@ class PlayerTracker:
                 self.current_homography,
                 self.classifier.team_for,
             )
+            self.ball.record(
+                result.frame_id,
+                self._ball_candidates_on_pitch(result.ball_candidates),
+                self.analytics.latest_positions,
+                self.classifier.team_for,
+            )
             t2 = time.perf_counter()
             now = time.perf_counter()
             self.staleness.record(self.frame_count, result.frame_id, result.captured_at)
@@ -613,7 +700,19 @@ class PlayerTracker:
             self.pitch_overlay.draw(frame, self.current_homography)
             self.renderer.draw(frame, boxes, alphas, captions=self._distance_captions(boxes))
             self.minimap.draw(
-                frame, self.analytics.latest_positions, self.classifier.team_for, self._team_color
+                frame,
+                self.analytics.latest_positions,
+                self.classifier.team_for,
+                self._team_color,
+                ball=self.ball.ball,
+                holder=self.ball.holder,
+            )
+            self.ball_renderer.draw(
+                frame,
+                self.ball,
+                self.current_homography,
+                self.analytics.latest_positions,
+                team_name=self.classifier.team_name,
             )
             t3 = time.perf_counter()
             if self.show_window:

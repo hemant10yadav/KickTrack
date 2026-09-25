@@ -190,9 +190,16 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   cancelling, `stats.json` + heatmap PNGs via `--analytics-dir`). See
   `docs/PLAN.md` Plan 3.1 for why per-frame steps are never summed and why
   everyone-moves-together is a calibration event, not motion.
+- `scripts/ball.py` — everything "where is the ball and who has it":
+  `BallTracker` (one physically plausible track from noisy candidates),
+  `PossessionTracker`, `PassCounter` (team totals: completed / lost, short /
+  long), `BallAnalytics` (per-result driver, `passes.json`). See `docs/PLAN.md`
+  Plan 3.2 for why the ball is captured from the raw detections by a predictor
+  callback and why the tracker is not a Kalman filter.
 - `scripts/display.py` — everything "what gets shown on screen": `MarkerRenderer`
   (pins, ID labels, running-distance captions), `PitchMinimap` (live top-down
-  positions), `PitchOverlayRenderer`,
+  positions and the ball), `BallRenderer` (ball ring, holder ring, pass panel),
+  `PitchOverlayRenderer`,
   `MotionExtrapolator`, `DisplaySmoother`, `FadeController`, `FramePacer`,
   `StalenessTracker`/`WorkerStats`/`DisplayStats`
 - `scripts/botsort_custom.yaml` — tracker tuning

@@ -6,7 +6,7 @@ import numpy as np
 
 from scripts.analytics import PITCH_LENGTH_M, PITCH_WIDTH_M, render_pitch
 from scripts.calibration import PITCH_LINES
-from scripts.player import TeamClassifier
+from scripts.player import OTHER_TEAM, TeamClassifier
 
 UNCLASSIFIED_COLOR = (180, 180, 180)  # gray, shown before a track has enough samples
 
@@ -179,9 +179,12 @@ class PitchMinimap:
     def __init__(self):
         self.pitch = render_pitch(self.SCALE)
 
-    def draw(self, frame, positions: dict, team_of, team_color) -> None:
+    BALL_COLOR = (0, 255, 255)
+
+    def draw(self, frame, positions: dict, team_of, team_color, ball=None, holder=None) -> None:
         """positions: player_id -> (x_m, y_m); team_of(id) -> team or None;
-        team_color(team) -> BGR or None."""
+        team_color(team) -> BGR or None; ball: BallState or None; holder: the
+        player_id in possession, ringed."""
         h, w = frame.shape[:2]
         ph, pw = self.pitch.shape[:2]
         if ph + 2 * self.MARGIN > h or pw + 2 * self.MARGIN > w:
@@ -195,6 +198,10 @@ class PitchMinimap:
             team = team_of(player_id)
             color = team_color(team) if team is not None else None
             color = UNCLASSIFIED_COLOR if color is None else color
+            if player_id == holder:
+                cv2.circle(
+                    panel, (px, py), self.DOT_RADIUS + 4, self.BALL_COLOR, 2, lineType=cv2.LINE_AA
+                )
             cv2.circle(panel, (px, py), self.DOT_RADIUS + 1, (0, 0, 0), -1, lineType=cv2.LINE_AA)
             cv2.circle(panel, (px, py), self.DOT_RADIUS, color, -1, lineType=cv2.LINE_AA)
             cv2.putText(
@@ -207,6 +214,12 @@ class PitchMinimap:
                 1,
                 lineType=cv2.LINE_AA,
             )
+        if ball is not None:
+            bx = int((ball.x + PITCH_LENGTH_M / 2) * self.SCALE)
+            by = int((ball.y + PITCH_WIDTH_M / 2) * self.SCALE)
+            if 0 <= bx < pw and 0 <= by < ph:
+                cv2.circle(panel, (bx, by), 3, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+                cv2.circle(panel, (bx, by), 2, self.BALL_COLOR, -1, lineType=cv2.LINE_AA)
         if not positions:
             cv2.putText(
                 panel,
@@ -259,6 +272,78 @@ class PitchOverlayRenderer:
         px = int(np.clip(point[0], -self.CLAMP_MARGIN, w + self.CLAMP_MARGIN))
         py = int(np.clip(point[1], -self.CLAMP_MARGIN, h + self.CLAMP_MARGIN))
         return px, py
+
+
+class BallRenderer:
+    """The tracked ball on the video (a ring at its pitch position, hollow and
+    dimmer while coasting through a gap), a ring around the player in
+    possession, and the team pass counts in the top-right corner."""
+
+    BALL_COLOR = (0, 255, 255)
+    PANEL_MARGIN = 12
+
+    def draw(self, frame, ball_analytics, homography, positions: dict, team_name=str) -> None:
+        """team_name(team) -> the label shown on the panel ("white", "yellow")."""
+        if homography is not None:
+            ball = ball_analytics.ball
+            if ball is not None:
+                point = self._project(homography, ball.x, ball.y, frame.shape)
+                if point is not None:
+                    seen = ball.coasting_s == 0
+                    cv2.circle(frame, point, 9, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+                    cv2.circle(
+                        frame, point, 9, self.BALL_COLOR, 2 if seen else 1, lineType=cv2.LINE_AA
+                    )
+            holder = ball_analytics.holder
+            if holder is not None and holder in positions:
+                x, y = positions[holder]
+                point = self._project(homography, x, y, frame.shape)
+                if point is not None:
+                    cv2.ellipse(
+                        frame, point, (22, 9), 0, 0, 360, self.BALL_COLOR, 2, lineType=cv2.LINE_AA
+                    )
+        self._draw_panel(frame, ball_analytics, team_name)
+
+    PANEL_WIDTH = 260
+
+    def _draw_panel(self, frame, ball_analytics, team_name) -> None:
+        """Completed passes per team, by jersey colour name. The breakdown
+        (short/long/lost) stays in the terminal summary and passes.json."""
+        totals = ball_analytics.passes.team_totals()
+        lines = [
+            f"{team_name(team)} passes: {row['completed']}"
+            for team, row in sorted(totals.items(), key=lambda kv: str(kv[0]))
+            if team is not None and team != OTHER_TEAM
+        ]
+        if not lines:
+            lines = ["no passes yet"]
+        w = frame.shape[1]
+        x0, y0 = w - self.PANEL_MARGIN - self.PANEL_WIDTH, self.PANEL_MARGIN
+        height = 26 * len(lines) + 10
+        overlay = frame[y0 : y0 + height, x0 : x0 + self.PANEL_WIDTH]
+        cv2.addWeighted(np.zeros_like(overlay), 0.55, overlay, 0.45, 0, dst=overlay)
+        for i, text in enumerate(lines):
+            cv2.putText(
+                frame,
+                text,
+                (x0 + 8, y0 + 26 * (i + 1)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+                lineType=cv2.LINE_AA,
+            )
+
+    @staticmethod
+    def _project(homography, x, y, shape):
+        point = homography @ np.array([x, y, 1.0])
+        if abs(point[2]) < 1e-6:
+            return None
+        px, py = point[0] / point[2], point[1] / point[2]
+        h, w = shape[:2]
+        if not (-50 <= px <= w + 50 and -50 <= py <= h + 50):
+            return None
+        return int(px), int(py)
 
 
 class MotionExtrapolator:

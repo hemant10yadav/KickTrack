@@ -380,8 +380,80 @@ Take a fixed-camera football video and show a marker on each player that moves w
 
   - [X] Per-player pitch-relative position, distance covered, speed (Plan 3.1)
   - [X] Heatmaps per player (and per team) (Plan 3.1)
-  - [ ] Possession detection (nearest player to ball, possession changes over time)
+  - [X] Possession detection and team pass counts (Plan 3.2)
   - [ ] (Longer-term, not yet scoped in detail) formations/team shape, passing networks
+
+- [X] **Plan 3.2: Ball, Possession and Team Pass Counts**
+
+  `scripts/ball.py` (`BallTracker`, `PossessionTracker`, `PassCounter`,
+  `BallAnalytics`), fed by `PlayerTracker` with each result's ball candidates
+  projected onto the pitch and the players' gated positions. Live: the ball as
+  a yellow ring on the video (hollow while coasting) and a dot on the minimap,
+  a ring around the player in possession, and a top-right panel with each
+  team's completed pass count. Teams are named by their fitted jersey colour
+  ("white", "yellow", "sky blue" -- `color_name` / `TeamClassifier.team_name`),
+  never by a cluster number; the short/long/lost breakdown is in the terminal
+  summary and in `passes.json` (`--analytics-dir`). Team totals first;
+  per-player counts next.
+
+  - [X] **The ball comes from the pass we already run.** `model.track()` only
+        returns tracked boxes and BoT-SORT never starts a track for the ball
+        (a 10-17px blob at median confidence 0.12-0.20), so
+        `BallCandidateCapture` is a predictor callback registered before the
+        tracker's, which runs first and sees the raw multi-class detections.
+        The predictor now runs with `classes=[0, 32]` and `conf=0.05`; person
+        tracking is unchanged (BoT-SORT keeps its own thresholds) and so is
+        latency (17.9 vs 18.1ms, same 200 fixture frames). Measured on both
+        clips: an on-pitch candidate in 44% (match_5) / 55% (match_4) of
+        results, consecutive ones within 3m 91-98% of the time, gaps median
+        0.12s and 90% under 0.6s.
+  - [X] **Tracker: follow sightings, coast with damped velocity, gate by ball
+        speed.** A Kalman filter was tried first and dropped -- with a gate on
+        top, the stale velocity after a ball stops at a foot kept dragging the
+        estimate away from the sightings that said it had stopped, and no
+        noise setting changed that. Now: position follows the accepted
+        sighting, velocity is the displacement over the last 0.12s, coasting
+        predicts with that velocity damped to 30%/s and gives up after 1.5s.
+        A candidate is only admitted inside 2m + 35 m/s x time-since-sighting.
+        Acquisition needs two sightings within 3m, preferring one at a
+        player's feet.
+  - [X] **Fixed features are not the ball.** The densest candidate cells on
+        match_4 were on the touchline and at fixed spots, and one such blob
+        held the track for seconds until a player walked past and "received"
+        a pass. A track that moves under 1.5m in 2s with no player within
+        2.5m is dropped and its spot banned for 20s (25-43 candidates so
+        rejected per clip). A ball sitting at a player's feet is not affected.
+  - [X] **Possession and passes.** Holder: nearest player within 1.5m of a
+        ball seen within the last 0.3s, for 3 results in a row; released after
+        3 results beyond 2.5m or when someone else takes it. A pass is
+        possession moving to a different player within 4s: completed for a
+        teammate, lost to an opponent; long at >= 30m (Opta's long-ball line).
+  - [X] **Measured (realtime runs).** match_4: ball tracked in 89% of results,
+        44 possessions, white (team 0): 5 completed / 9 lost, yellow (team 1):
+        6 / 5, officials 3 "lost" (a keeper collecting the ball). match_5: 72%
+        tracked, 16 possessions, sky blue (team 0): 0 / 2, white (team 1): 6
+        completed (5 short, 1 long) / 3 lost. Clusters fitted as expected on
+        both clips (kits as teams 0/1; orange keeper and dark officials as
+        other). Strips around
+        six match_4 events checked by eye: 22->6 (14s), 22->4 (31s), 6->8
+        (47s), 8->1 (48s) are real passes; one "lost" at 17s was the touchline
+        blob above (now suppressed; a static blob acquired less than 2s before
+        a player arrives can still slip through).
+  - [X] Tests: `tests/test_ball.py` (14: acquisition, coasting through a gap,
+        loss after a long gap, a far look-alike, a fixed feature vs a ball at a
+        player's feet, a kicked ball, possession hold/release, completed/lost/
+        long passes, gap too long, candidates-to-pass end to end);
+        BallRenderer smoke tests in `tests/test_pitch_overlay.py`.
+  - [ ] **Not yet: precision/recall against hand labels.** The counts above
+        are what the machinery produces, checked on a handful of events, not
+        against a labelled clip. That labelling (20-30 moments per clip) is
+        the prerequisite for tuning any threshold here, and for per-player
+        pass counts and shots, which are the next Plan 3 steps.
+  - [ ] **Known limits.** No ball, no event: a pass whose ball is unseen at
+        both ends is missed; a pass played while either player is out of
+        frame is missed and not guessed. The ball is only a candidate when the
+        detector fires on it, and a fine-tuned detector (Plan 2.9's open item)
+        is the lever if recall proves too low.
 
 - [X] **Plan 3.1: Heatmaps and Distance Covered**
 
@@ -455,15 +527,13 @@ Take a fixed-camera football video and show a marker on each player that moves w
         tracks before fitting, which the phantom-happy yolov8 tracker reached in
         seconds and the YOLO26 + identity-layer pipeline (~40 ids per clip) did
         not reach until late -- match_5 was still all-grey 24s in. Now 16.
-  - [ ] **Finding: k=3 team clustering collapses the two kits on match_5.**
-        With the keeper (orange) and touchline stewards (orange bibs) in the
-        sample set, the three clusters come out as {sky blue + white}, {orange},
-        {dark officials}: the two kits are the closest pair of colours (~75 BGR
-        apart vs ~190 to orange), so k-means merges them, and every outfield
-        marker and minimap dot renders in the merged cluster's grey. match_4
-        (white vs yellow) clusters fine. Fix belongs in `TeamClassifier`: fit
-        on on-pitch people only (calibration now says who is off the pitch),
-        or k=4 with the two largest clusters as the teams and a merge rule for
-        clusters closer than the kit separation -- measure on both clips first.
-  - [ ] **Next:** the team clustering above; fix the keyframe hand-over, then
-        measure top speeds again.
+  - [X] **Finding, fixed in Plan 3.2: k=3 team clustering collapsed the two
+        kits on match_5.** With the keeper (orange) and touchline stewards
+        (orange bibs) in the sample set, the three clusters came out as {sky
+        blue + white}, {orange}, {dark officials}: the two kits are the closest
+        pair of colours (~75 BGR apart vs ~190 to orange), so k-means merged
+        them and every outfield marker rendered grey. `TeamClassifier` now fits
+        four clusters, merges any pair closer than 40 BGR (one kit under two
+        lights), and calls the two most populated groups the teams; keepers,
+        officials and staff are `OTHER_TEAM`. `tests/test_team_classifier.py`.
+  - [ ] **Next:** fix the keyframe hand-over, then measure top speeds again.
