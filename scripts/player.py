@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 NUM_TEAM_CLUSTERS = 3  # 2 teams + referee/other
 TEAM_FIT_AFTER_SAMPLES = 25  # jersey-color samples collected before clusters are fixed
@@ -90,10 +91,13 @@ class TeamClassifier:
             self._try_fit()
 
     def team_for(self, track_id: int):
-        if self.centers is None:
-            return None
-        color = self.track_colors.get(track_id)
-        if color is None:
+        return self.team_for_color(self.track_colors.get(track_id))
+
+    def team_for_color(self, color):
+        """Nearest fixed cluster center for an already-sampled color. Separate
+        from team_for so a color sampled outside the per-track history (a
+        not-yet-identified box being reconciled) can be classified too."""
+        if self.centers is None or color is None:
             return None
         distances = np.linalg.norm(self.centers - color, axis=1)
         return int(np.argmin(distances))
@@ -120,6 +124,35 @@ class TeamClassifier:
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1.0)
         _, _, centers = cv2.kmeans(data, self.k, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
         self.centers = centers
+
+
+class TeamGate:
+    """Team identity for one worker cycle, in the two shapes identity
+    reconciliation needs: the team already learned for a known player, and the
+    team of a box that has no identity yet (sampled straight from the frame).
+
+    Two players in different jerseys can never be the same person, so this is
+    the cheapest hard constraint available against merging one player's track
+    into another's during a crossing -- the failure that silently moves one
+    player's distance and heatmap onto their opponent.
+    """
+
+    def __init__(self, classifier: "TeamClassifier", frame):
+        self.classifier = classifier
+        self.frame = frame
+        # of_box is asked once per (detection, candidate) pair while matching, but
+        # the answer depends only on the box -- sample each one once per cycle.
+        self._sampled = {}
+
+    def of_player(self, player_id: int):
+        return self.classifier.team_for(player_id)
+
+    def of_box(self, bbox) -> int | None:
+        if bbox not in self._sampled:
+            x1, y1, x2, y2 = bbox
+            color = extract_jersey_color(self.frame, x1, y1, x2, y2)
+            self._sampled[bbox] = self.classifier.team_for_color(color)
+        return self._sampled[bbox]
 
 
 class StateManager:
@@ -185,7 +218,7 @@ class PlayerState:
     """Application-level identity that outlives BoT-SORT's own transient track_id.
 
     Debugging match_4.mp4 found BoT-SORT reassigning a brand-new track_id to the
-    same physical player after a single missed frame — a small/distant,
+    same physical player after a single missed frame -- a small/distant,
     borderline-confidence box (e.g. track 95 -> 159, ~9px apart, one frame gap)
     fails the tracker's own IoU/motion match and gets treated as a new track,
     even though `track_buffer` is nowhere near exhausted. Rather than chase that
@@ -193,6 +226,10 @@ class PlayerState:
     up: a stable `player_id` that downstream code (team classification, the
     confirm/grace display logic, and eventually speed/distance) keys off, so a
     tracker-side ID swap doesn't reset a player's accumulated state.
+
+    `clean_bbox`/`clean_frame` are the last position that was *not* contaminated
+    by an occlusion, and `vx`/`vy` the velocity measured from clean positions
+    only -- see PlayerIdentityManager for why the occluded ones can't be used.
     """
 
     player_id: int
@@ -202,24 +239,52 @@ class PlayerState:
     vy: float
     last_seen_frame: int
     status: str  # "active" | "lost"
+    team: int | None = None
+    occluded: bool = False
+    clean_bbox: tuple[int, int, int, int] | None = None
+    clean_frame: int | None = None
 
 
 class PlayerIdentityManager:
     """Reconciles BoT-SORT's transient track_id into a persistent player_id.
 
-    Fast path: a track_id already mapped to a player is a cheap dict lookup —
+    Fast path: a track_id already mapped to a player is a cheap dict lookup --
     no matching needed as long as BoT-SORT keeps reporting the same ID.
 
-    Slow path: an unmapped track_id (first sighting, or BoT-SORT re-detecting the
-    same player under a new ID) is scored against recently-lost players by
-    predicted position — last known velocity extrapolated over the frame gap —
-    normalized by the player's own bbox height, since a given pixel error means
-    a lot for a tiny distant player and nothing for a large close one. A bbox
-    size-ratio sanity gate guards against merging two different, merely nearby,
-    players. Within MAX_LOST_FRAMES and MAX_NORM_DIST, it's treated as the same
-    player continuing under a new track_id; otherwise a new player is minted.
+    Slow path: unmapped track_ids (first sighting, or BoT-SORT re-detecting a
+    player under a new ID) are scored against recently-lost players by predicted
+    position -- last known velocity extrapolated over the frame gap -- normalized
+    by the player's own bbox height, since a given pixel error means a lot for a
+    tiny distant player and nothing for a large close one. A bbox size-ratio
+    sanity gate and a team-color gate guard against merging two different,
+    merely nearby, players.
 
-    The values below are a starting point (deliberately conservative — start
+    Three things make that slow path survive players converging, which is when a
+    wrong merge is both most likely and most damaging (a swapped identity
+    silently moves one player's distance and heatmap onto another's):
+
+    * **Team gate.** Two players in different jerseys are never the same person,
+      so a cross-team merge is refused outright regardless of how well the
+      geometry lines up. Free, since jersey color is already sampled for team
+      classification.
+
+    * **Joint assignment, not greedy.** All unmapped detections in a cycle are
+      matched to all lost candidates at once (Hungarian, via scipy), so the
+      result doesn't depend on detection order and two detections can't compete
+      for the same player. Taking each detection's own nearest match in turn
+      lets the first one claim a player that a later detection fits far better,
+      which is exactly the arrangement a crossing produces.
+
+    * **Occlusion-aware state.** While a player's box overlaps another's -- or
+      has swallowed one whose track just vanished into it -- its position is
+      partly the *other* player's. Velocity is frozen at its last clean value
+      and matching predicts forward from the last clean position, so the players
+      that emerge from a merge are resolved by the motion they carried into it
+      rather than by the merged box's meaningless drift. Occluded players are
+      reported in `occluded_player_ids` so downstream analytics can drop those
+      samples instead of trusting a contaminated position.
+
+    The values below are a starting point (deliberately conservative -- start
     strict on merges, loosen only against measured false-splits), not tuned
     against real match footage yet.
     """
@@ -227,19 +292,30 @@ class PlayerIdentityManager:
     MAX_LOST_FRAMES = 30  # ~1.25s at 24fps
     MAX_NORM_DIST = 3.0  # (predicted-position error) / bbox_height
     SIZE_RATIO_RANGE = (0.5, 2.0)
+    _NO_MATCH = 1e6  # cost standing in for "gate failed"; never an accepted pairing
+    _TEAM_BLOCKED = 2e6  # _NO_MATCH, but attributable to the team gate when counting
 
     def __init__(self):
         self.players: dict[int, PlayerState] = {}
         self.tracker_to_player: dict[int, int] = {}
+        self.occluded_player_ids: set[int] = set()
         self._next_id = 1
         self.switch_log = []  # instrumentation: every track_id reconciliation
+        # instrumentation: ordered player_ids each BoT-SORT track has belonged to.
+        # A track that changes owner is an identity swap in progress, and one that
+        # returns to an owner it already left cannot be anything else -- this is the
+        # measurement switch_log can't give, since it counts merges without saying
+        # whether they were right.
+        self.track_owners: dict[int, list[int]] = {}
+        self.team_blocked_merges = 0
+        self.occluded_cycles = 0
 
     @property
     def total_players_minted(self) -> int:
         """Count of persistent player_ids ever created (active, lost, or retired)."""
         return self._next_id - 1
 
-    def update(self, detections: list, frame_id: int) -> list:
+    def update(self, detections: list, frame_id: int, team_gate=None) -> list:
         """detections: (x1, y1, x2, y2, track_id) tuples from extract_boxes.
 
         Returns the same shape with track_id replaced by a persistent
@@ -250,82 +326,201 @@ class PlayerIdentityManager:
         # Mark vanished-this-frame players lost *before* reconciling new/unmapped
         # track_ids, so a same-cycle reacquisition (the 95 -> 159 case) sees the
         # just-vanished player as a candidate immediately, not one frame late.
+        just_lost = []
         for player in self.players.values():
             if player.status == "active" and player.tracker_id not in present_tracker_ids:
                 player.status = "lost"
+                just_lost.append(player)
 
-        results = []
-        for x1, y1, x2, y2, tracker_id in detections:
+        contamination = self._occlusion_flags(detections, just_lost)
+
+        results = [None] * len(detections)
+        unmapped = []
+        for i, (x1, y1, x2, y2, tracker_id) in enumerate(detections):
             if tracker_id < 0:
-                results.append((x1, y1, x2, y2, -1))
+                results[i] = (x1, y1, x2, y2, -1)
                 continue
-            bbox = (x1, y1, x2, y2)
             player_id = self.tracker_to_player.get(tracker_id)
             if player_id is None:
-                player_id = self._reconcile(tracker_id, bbox, frame_id)
-            self._observe(player_id, tracker_id, bbox, frame_id)
-            results.append((x1, y1, x2, y2, player_id))
+                unmapped.append(i)
+                continue
+            occluded = self._is_occluded(contamination[i], player_id)
+            self._observe(player_id, tracker_id, (x1, y1, x2, y2), frame_id, occluded, team_gate)
+            results[i] = (x1, y1, x2, y2, player_id)
+
+        for i, player_id in self._reconcile_batch(detections, unmapped, frame_id, team_gate):
+            x1, y1, x2, y2, tracker_id = detections[i]
+            occluded = self._is_occluded(contamination[i], player_id)
+            self._observe(player_id, tracker_id, (x1, y1, x2, y2), frame_id, occluded, team_gate)
+            results[i] = (x1, y1, x2, y2, player_id)
 
         self._retire_stale(frame_id)
+        self.occluded_player_ids = {
+            p.player_id for p in self.players.values() if p.status == "active" and p.occluded
+        }
+        self.occluded_cycles += len(self.occluded_player_ids)
         return results
 
-    def _reconcile(self, tracker_id: int, bbox: tuple, frame_id: int) -> int:
-        """Find the recently-lost player this new track_id is probably continuing,
-        or mint a new player_id if no candidate passes the gates."""
-        cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-        height = max(1, bbox[3] - bbox[1])
+    def _occlusion_flags(self, detections: list, just_lost: list) -> list:
+        """Per detection: which other players contaminate this box right now,
+        as (overlaps a live detection, {player_ids swallowed by it}).
 
-        best_id, best_norm_dist = None, None
-        for player in self.players.values():
-            if player.status != "lost":
-                continue
-            gap = frame_id - player.last_seen_frame
-            if gap <= 0 or gap > self.MAX_LOST_FRAMES:
-                continue
-            px1, py1, px2, py2 = player.bbox
-            p_height = max(1, py2 - py1)
-            size_ratio = height / p_height
-            if not (self.SIZE_RATIO_RANGE[0] <= size_ratio <= self.SIZE_RATIO_RANGE[1]):
-                continue
-            pred_cx = (px1 + px2) / 2 + player.vx * gap
-            pred_cy = (py1 + py2) / 2 + player.vy * gap
-            norm_dist = ((cx - pred_cx) ** 2 + (cy - pred_cy) ** 2) ** 0.5 / p_height
-            if norm_dist > self.MAX_NORM_DIST:
-                continue
-            if best_norm_dist is None or norm_dist < best_norm_dist:
-                best_norm_dist = norm_dist
-                best_id = player.player_id
+        Two ways that happens. The box still overlaps another live detection --
+        two players contesting a ball, each box containing some of the other.
+        Or the detector collapsed both players into one box, in which case there
+        is no second detection to overlap; the tell is that a player's track
+        vanished this cycle into a box that covers where it just was.
+        """
+        contamination = []
+        for i, (x1, y1, x2, y2, _) in enumerate(detections):
+            box = (x1, y1, x2, y2)
+            overlaps_live = any(
+                boxes_overlap(box, (ox1, oy1, ox2, oy2))
+                for j, (ox1, oy1, ox2, oy2, _) in enumerate(detections)
+                if j != i
+            )
+            swallowed = {p.player_id for p in just_lost if boxes_overlap(box, p.bbox)}
+            contamination.append((overlaps_live, swallowed))
+        return contamination
 
-        if best_id is not None:
-            old_tracker_id = self.players[best_id].tracker_id
+    @staticmethod
+    def _is_occluded(contamination, player_id: int) -> bool:
+        """A box sitting on top of the track it is itself continuing is just a
+        reacquisition, not an occlusion -- only *another* player's presence in
+        the box contaminates it."""
+        overlaps_live, swallowed = contamination
+        return overlaps_live or bool(swallowed - {player_id})
+
+    def _reconcile_batch(self, detections: list, unmapped: list, frame_id: int, team_gate) -> list:
+        """Assign every unmapped detection in this cycle to a recently-lost
+        player, or mint a new player_id where nothing fits. Solved as one
+        assignment problem so the outcome doesn't depend on detection order and
+        no two detections can claim the same player."""
+        if not unmapped:
+            return []
+
+        candidates = [
+            p
+            for p in self.players.values()
+            if p.status == "lost" and 0 < frame_id - p.last_seen_frame <= self.MAX_LOST_FRAMES
+        ]
+        assignments = {}
+        if candidates:
+            costs = np.array(
+                [
+                    [
+                        self._match_cost(detections[i], candidate, frame_id, team_gate)
+                        for candidate in candidates
+                    ]
+                    for i in unmapped
+                ]
+            )
+            # Count a refusal once per detection, not once per candidate it was
+            # scored against -- a detection rejected against ten candidates is
+            # one merge refused, not ten.
+            self.team_blocked_merges += int(
+                sum(
+                    1
+                    for row in costs
+                    if (row == self._TEAM_BLOCKED).any() and (row < self._NO_MATCH).sum() == 0
+                )
+            )
+            rows, cols = linear_sum_assignment(costs)
+            for row, col in zip(rows, cols, strict=True):
+                if costs[row][col] >= self._NO_MATCH:
+                    continue
+                assignments[unmapped[row]] = (candidates[col], costs[row][col])
+
+        resolved = []
+        for i in unmapped:
+            tracker_id = detections[i][4]
+            matched = assignments.get(i)
+            if matched is None:
+                resolved.append((i, self._mint(tracker_id)))
+                continue
+            player, cost = matched
             self.switch_log.append(
                 {
                     "frame": frame_id,
-                    "player_id": best_id,
-                    "old_tracker_id": old_tracker_id,
+                    "player_id": player.player_id,
+                    "old_tracker_id": player.tracker_id,
                     "new_tracker_id": tracker_id,
-                    "norm_dist": round(best_norm_dist, 2),
+                    "norm_dist": round(float(cost), 2),
                 }
             )
-            self.tracker_to_player.pop(old_tracker_id, None)
-            self.tracker_to_player[tracker_id] = best_id
-            return best_id
+            self.tracker_to_player.pop(player.tracker_id, None)
+            self.tracker_to_player[tracker_id] = player.player_id
+            resolved.append((i, player.player_id))
+        return resolved
 
+    def _match_cost(self, detection, player: PlayerState, frame_id: int, team_gate) -> float:
+        """Normalized predicted-position error, or _NO_MATCH if any gate rejects
+        the pairing outright."""
+        x1, y1, x2, y2, _ = detection
+        px1, py1, px2, py2 = player.clean_bbox or player.bbox
+        p_height = max(1, py2 - py1)
+
+        size_ratio = max(1, y2 - y1) / p_height
+        if not (self.SIZE_RATIO_RANGE[0] <= size_ratio <= self.SIZE_RATIO_RANGE[1]):
+            return self._NO_MATCH
+
+        if team_gate is not None and player.team is not None:
+            team = team_gate.of_box((x1, y1, x2, y2))
+            if team is not None and team != player.team:
+                return self._TEAM_BLOCKED
+
+        # Predict from the last *clean* sighting: once a player's box has merged
+        # with someone else's, both its position and the time since it was last
+        # trustworthy are measured from before the merge.
+        gap = frame_id - (player.clean_frame or player.last_seen_frame)
+        if gap <= 0 or gap > self.MAX_LOST_FRAMES:
+            return self._NO_MATCH
+        pred_cx = (px1 + px2) / 2 + player.vx * gap
+        pred_cy = (py1 + py2) / 2 + player.vy * gap
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        norm_dist = ((cx - pred_cx) ** 2 + (cy - pred_cy) ** 2) ** 0.5 / p_height
+        return norm_dist if norm_dist <= self.MAX_NORM_DIST else self._NO_MATCH
+
+    def _mint(self, tracker_id: int) -> int:
         new_id = self._next_id
         self._next_id += 1
         self.tracker_to_player[tracker_id] = new_id
         return new_id
 
-    def _observe(self, player_id: int, tracker_id: int, bbox: tuple, frame_id: int) -> None:
+    def _observe(
+        self,
+        player_id: int,
+        tracker_id: int,
+        bbox: tuple,
+        frame_id: int,
+        occluded: bool,
+        team_gate=None,
+    ) -> None:
         existing = self.players.get(player_id)
+        vx, vy = 0.0, 0.0
+        clean_bbox, clean_frame = (None, None) if occluded else (bbox, frame_id)
+        team = None
         if existing is not None:
-            gap = max(1, frame_id - existing.last_seen_frame)
-            pcx = (existing.bbox[0] + existing.bbox[2]) / 2
-            pcy = (existing.bbox[1] + existing.bbox[3]) / 2
-            cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-            vx, vy = (cx - pcx) / gap, (cy - pcy) / gap
-        else:
-            vx, vy = 0.0, 0.0
+            team = existing.team
+            if occluded:
+                # The box is partly someone else's: neither its position nor the
+                # jump to it says anything about this player's own motion.
+                vx, vy = existing.vx, existing.vy
+                clean_bbox, clean_frame = existing.clean_bbox, existing.clean_frame
+            elif existing.clean_frame is not None:
+                gap = max(1, frame_id - existing.clean_frame)
+                pcx = (existing.clean_bbox[0] + existing.clean_bbox[2]) / 2
+                pcy = (existing.clean_bbox[1] + existing.clean_bbox[3]) / 2
+                cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+                vx, vy = (cx - pcx) / gap, (cy - pcy) / gap
+        if team_gate is not None:
+            known = team_gate.of_player(player_id)
+            team = known if known is not None else team
+
+        owners = self.track_owners.setdefault(tracker_id, [])
+        if not owners or owners[-1] != player_id:
+            owners.append(player_id)
+
         self.players[player_id] = PlayerState(
             player_id=player_id,
             tracker_id=tracker_id,
@@ -334,6 +529,10 @@ class PlayerIdentityManager:
             vy=vy,
             last_seen_frame=frame_id,
             status="active",
+            team=team,
+            occluded=occluded,
+            clean_bbox=clean_bbox or bbox,
+            clean_frame=clean_frame if clean_frame is not None else frame_id,
         )
 
     def _retire_stale(self, frame_id: int) -> None:
@@ -345,10 +544,21 @@ class PlayerIdentityManager:
         for pid in stale:
             del self.players[pid]
 
+    @property
+    def contested_tracks(self) -> dict[int, list[int]]:
+        """Tracks that changed hands between player_ids -- the direct swap count."""
+        return {t: owners for t, owners in self.track_owners.items() if len(owners) > 1}
+
     def summary(self) -> str:
+        contested = self.contested_tracks
         lines = [
             f"Persistent player IDs minted: {self.total_players_minted}",
             f"track_id -> player_id reconciliations (switches absorbed): {len(self.switch_log)}",
+            f"Reconciliations refused outright on a team-color mismatch: "
+            f"{self.team_blocked_merges}",
+            f"Player-cycles spent occluded (position unreliable): {self.occluded_cycles}",
+            f"Tracks that changed owner (identity swaps): {len(contested)}"
+            + (f" {contested}" if contested else ""),
         ]
         for event in self.switch_log[:20]:
             lines.append(

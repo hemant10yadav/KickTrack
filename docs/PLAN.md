@@ -91,6 +91,75 @@ Take a fixed-camera football video and show a marker on each player that moves w
             `tests/test_tracking_quality.py` (slow, real footage — churn-ratio and
             frame-drop-ratio regression ceilings on match_3/4/5).
 
+- [X] **Plan 2.6: Identity Swaps When Players Converge**
+
+  Plan 2.5 fixed *fragmentation* (one player, a new `track_id` after a gap). The
+  other failure mode is a *swap*: two players converge and the tracks come apart
+  attached to the wrong bodies. It is the more damaging of the two for Plan 3 —
+  fragmentation loses data and looks broken, a swap silently moves one player's
+  distance and heatmap onto another's and looks fine. `PlayerIdentityManager` had
+  no defense against it: reconciliation only ever considered *lost* players, and
+  its greedy per-detection argmin with a 3.0-bbox-height radius would happily
+  hand a detection its neighbour during a crossing.
+
+  - [X] **Team-color gate.** Jersey color is already sampled for team
+        classification, so refusing a merge between two different teams costs
+        nothing and rules out roughly the half of crossings that are contested
+        balls between opponents. `TeamClassifier.team_for_color` classifies a
+        color sampled outside the per-track history; `TeamGate` (one instance per
+        worker cycle, box samples cached) answers "what team is this player" and
+        "what team is this not-yet-identified box". Only gates when both sides
+        are known, so it can't block merges before the clusters are fit.
+        Refused 7 merges on match_5.mp4.
+  - [X] **Joint assignment, not greedy.** All of a cycle's unmapped detections
+        are matched against all lost candidates in one `linear_sum_assignment`
+        (scipy, already a dependency), gates expressed as an unreachable cost.
+        Order-independent, and two detections can no longer compete for one
+        player — the greedy version let the first detection claim a player that
+        a later one fit far better, which is exactly what a crossing produces.
+  - [X] **Occlusion-aware state.** While a box overlaps another detection, or has
+        swallowed a track that vanished into it (the detector merging two players
+        into one box — no second detection to overlap, so the tell is a player
+        going lost inside it), the box is partly someone else's. Velocity freezes
+        at its last clean value and matching predicts from the last clean
+        position/frame, so players emerging from a merge are resolved by the
+        motion they carried in rather than the merged box's meaningless drift. A
+        box sitting on its own just-lost track is a reacquisition, not an
+        occlusion, and is not flagged. `occluded_player_ids` exposes the
+        contaminated players per cycle so Plan 3 stats can drop those samples
+        instead of trusting a wrong position — 173 player-cycles on match_5.mp4.
+  - [X] Tests: six scenarios in `tests/test_player_identity.py` (crossing with a
+        merged box and new track_ids on both sides; cross-team merge refused, and
+        the same geometry merged when teams match; an ordering that defeats greedy
+        matching; velocity freeze; occluded-player reporting). `test_tracking_quality.py`
+        churn ceilings unchanged on match_3/4/5.
+  - [ ] **Not yet covered: a swap where both tracks stay alive.** Everything above
+        acts on reconciliation, which only runs for unmapped track_ids. If BoT-SORT
+        keeps both tracks through the crossing and simply exchanges the bodies, no
+        reconciliation happens and nothing here fires. Detecting that needs a
+        per-track motion-consistency check (a discontinuity in one track mirrored
+        by the inverse in another), and measuring it needs hand-labeled crossing
+        events — the synthetic tests can't tell us the real rate.
+  - [ ] **Open (pre-existing, not an identity bug): duplicate boxes on one
+        player.** The match_5 swap traces back to YOLO emitting two boxes on one
+        body -- at f1443, `[1221,664,1242,715]` and `[1221,664,1256,715]`, the
+        second a narrow sliver beside the real box. Both runs get it, since
+        detection is identical. What differs is what the identity layer does with
+        the spare box: main reconciled it onto player 2, an established identity
+        from elsewhere, so player 2 teleported onto a body player 47 already
+        owned (and the two disagreed on team, 2 vs 0 -- visible in the frame
+        dumps). The fix refuses that merge and mints a local id instead, so the
+        two boxes are two fresh ids on one body with agreeing teams. Correct
+        behavior for the identity layer, but the duplicate detection itself would
+        still double-count that player in Plan 3 stats. It belongs upstream, in
+        NMS / detection dedup, not here.
+  - [ ] **Not yet measured on real footage.** The counters above show the
+        machinery firing, not that it fires *correctly*: `switch_log` counts
+        reconciliations absorbed and is blind to swaps. A swap-specific benchmark
+        (hand-labeled crossings on match_4.mp4, asserting post-crossing identity)
+        is the prerequisite for tuning `MAX_NORM_DIST`/`SIZE_RATIO_RANGE` against
+        anything better than intuition.
+
 - [ ] **Plan 3: Player & Match Analytics**
 
   - [ ] `PlayerState`: per-track position (pitch-relative, once calibration exists),

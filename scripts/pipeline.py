@@ -30,6 +30,7 @@ from scripts.player import (
     PlayerIdentityManager,
     StateManager,
     TeamClassifier,
+    TeamGate,
     boxes_overlap,
     extract_jersey_color,
 )
@@ -269,8 +270,9 @@ class InferenceWorker:
             self.cycle_count += 1
             # Reconcile BoT-SORT's own transient track_id into a persistent player_id
             # (see PlayerIdentityManager) before anything downstream (team
-            # classification, confirm/grace display state) keys off it.
-            boxes = self.identity.update(boxes, self.cycle_count)
+            # classification, confirm/grace display state) keys off it. The team
+            # gate lets that reconciliation refuse a cross-team merge outright.
+            boxes = self.identity.update(boxes, self.cycle_count, TeamGate(self.classifier, frame))
 
             jersey_start = time.perf_counter()
             for i, (x1, y1, x2, y2, track_id) in enumerate(boxes):
