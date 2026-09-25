@@ -28,8 +28,10 @@ from scripts.display import (
 )
 from scripts.player import (
     PlayerIdentityManager,
+    SplitDetectionSuppressor,
     StateManager,
     TeamClassifier,
+    TeamGate,
     boxes_overlap,
     extract_jersey_color,
 )
@@ -229,6 +231,7 @@ class InferenceWorker:
         self.stats = WorkerStats()
         self.state = StateManager()
         self.identity = PlayerIdentityManager()
+        self.splits = SplitDetectionSuppressor()
         self.cycle_count = 0
         self.jersey_last_sampled = {}
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -267,10 +270,14 @@ class InferenceWorker:
             boxes = extract_boxes(results)
             extract_ms = (time.perf_counter() - extract_start) * 1000
             self.cycle_count += 1
+            # Collapse one-body-two-boxes detections before anything keys an
+            # identity off them, or that player is tracked and counted twice.
+            boxes = self.splits.update(boxes, self.cycle_count)
             # Reconcile BoT-SORT's own transient track_id into a persistent player_id
             # (see PlayerIdentityManager) before anything downstream (team
-            # classification, confirm/grace display state) keys off it.
-            boxes = self.identity.update(boxes, self.cycle_count)
+            # classification, confirm/grace display state) keys off it. The team
+            # gate lets that reconciliation refuse a cross-team merge outright.
+            boxes = self.identity.update(boxes, self.cycle_count, TeamGate(self.classifier, frame))
 
             jersey_start = time.perf_counter()
             for i, (x1, y1, x2, y2, track_id) in enumerate(boxes):
@@ -402,6 +409,7 @@ class PlayerTracker:
             print()
             print(worker.stats.summary())
             print()
+            print(worker.splits.summary())
             print(worker.identity.summary())
             print()
             print(self.staleness.summary())

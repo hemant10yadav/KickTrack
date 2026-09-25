@@ -102,3 +102,140 @@ def test_lost_player_is_eventually_retired():
     # advance far past the lost-frame budget with no matching detections
     identity.update([], frame_id=1 + PlayerIdentityManager.MAX_LOST_FRAMES + 1)
     assert len(identity.players) == 0
+
+
+# --- Occlusion / ID-swap handling (docs/PLAN.md Plan 3.6) --------------------
+#
+# The tests above cover *fragmentation*: one player, new track_id after a gap.
+# The tests below cover the other failure mode -- two players converging, where
+# the risk is not losing a player but silently swapping two of them, which
+# would quietly attribute one player's distance/heatmap to the other.
+
+
+class FakeTeamGate:
+    """Stand-in for the real TeamGate: fixed team per player_id and per box x-center."""
+
+    def __init__(self, by_player=None, by_box_center=None):
+        self.by_player = by_player or {}
+        self.by_box_center = by_box_center or {}
+
+    def of_player(self, player_id):
+        return self.by_player.get(player_id)
+
+    def of_box(self, bbox):
+        return self.by_box_center.get((bbox[0] + bbox[2]) // 2)
+
+
+def test_crossing_players_keep_their_identities():
+    """Two players converge until the detector returns a single merged box, then
+    separate under brand-new track_ids. Each must come out with the identity it
+    went in with -- resolved from the motion each had *before* the merge, since
+    the merged box's own apparent motion belongs to neither of them."""
+    identity = PlayerIdentityManager()
+
+    # Approach: A moves right (+20px/cycle), B moves left (-20px/cycle), same row,
+    # until they are almost touching (A at 180-210, B at 220-250).
+    for step, frame_id in enumerate(range(1, 6)):
+        ax = 100 + step * 20
+        bx = 300 - step * 20
+        identity.update([_box(ax, 100, ax + 30, 160, 1), _box(bx, 100, bx + 30, 160, 2)], frame_id)
+    player_a = identity.tracker_to_player[1]
+    player_b = identity.tracker_to_player[2]
+    assert player_a != player_b
+
+    # Merge: the detector returns one box spanning both, under a single id.
+    for frame_id in (6, 7):
+        identity.update([_box(180, 100, 250, 160, 1)], frame_id)
+
+    # Separation: they emerge on the far sides of each other, under new ids.
+    # A (was moving right) is the right-hand box; B is the left-hand box.
+    results = identity.update(
+        [_box(250, 100, 280, 160, 7), _box(160, 100, 190, 160, 8)], frame_id=8
+    )
+    by_center = {(r[0] + r[2]) // 2: r[4] for r in results}
+
+    assert by_center[265] == player_a, "the right-hand box is the player who was moving right"
+    assert by_center[175] == player_b, "the left-hand box is the player who was moving left"
+
+
+def test_different_team_is_never_merged():
+    """A lost player and a nearby new detection wearing the *other* team's colors
+    cannot be the same person -- the merge must be refused outright."""
+    identity = PlayerIdentityManager()
+    gate = FakeTeamGate(by_player={1: 0}, by_box_center={115: 1})
+    identity.update([_box(100, 100, 130, 160, 1)], frame_id=1, team_gate=gate)
+
+    (r,) = identity.update([_box(100, 100, 130, 160, 2)], frame_id=2, team_gate=gate)
+
+    assert len(identity.players) == 2, "a cross-team merge must mint a new player instead"
+    assert not identity.switch_log
+    assert identity.team_blocked_merges == 1
+
+
+def test_same_team_nearby_detection_is_still_merged():
+    """Control for the test above: identical geometry, same team -> merged."""
+    identity = PlayerIdentityManager()
+    gate = FakeTeamGate(by_player={1: 0}, by_box_center={115: 0})
+    identity.update([_box(100, 100, 130, 160, 1)], frame_id=1, team_gate=gate)
+
+    (r,) = identity.update([_box(100, 100, 130, 160, 2)], frame_id=2, team_gate=gate)
+
+    assert len(identity.players) == 1
+    assert r[4] == 1
+
+
+def test_reappearances_are_assigned_jointly_not_greedily():
+    """Two players reappear in the same cycle. Taking each detection's own best
+    match in turn gives the first detection the player that the second one is a
+    far better fit for; the assignment has to be solved across all of them at
+    once."""
+    identity = PlayerIdentityManager()
+    identity.update([_box(85, 100, 115, 160, 1)], frame_id=1)  # player A, center 100
+    identity.update([_box(235, 100, 265, 160, 2)], frame_id=1)  # player B, center 250
+    player_a = identity.tracker_to_player[1]
+    player_b = identity.tracker_to_player[2]
+
+    # Both vanish, then reappear under new ids. Detection order matters to a
+    # greedy matcher: det@160 is nearer A (60px) than B (90px) and would claim
+    # A first, leaving det@100 -- a perfect match for A -- stuck with B.
+    results = identity.update(
+        [_box(145, 100, 175, 160, 9), _box(85, 100, 115, 160, 10)], frame_id=2
+    )
+    by_center = {(r[0] + r[2]) // 2: r[4] for r in results}
+
+    assert by_center[100] == player_a, "the exact-position detection must win player A"
+    assert by_center[160] == player_b
+
+
+def test_velocity_is_frozen_while_occluded():
+    """While a player's box is merged with another's, its apparent motion is an
+    artifact of the merge, not of the player. Velocity must hold at its last
+    clean value so post-occlusion prediction is still meaningful."""
+    identity = PlayerIdentityManager()
+    for step, frame_id in enumerate(range(1, 4)):
+        ax = 100 + step * 10
+        identity.update([_box(ax, 100, ax + 30, 160, 1), _box(500, 100, 530, 160, 2)], frame_id)
+    player_a = identity.tracker_to_player[1]
+    clean_vx = identity.players[player_a].vx
+    assert clean_vx == 10
+
+    # track 1's box now overlaps track 2's -- both are "occluded"
+    identity.update([_box(400, 100, 500, 160, 1), _box(480, 100, 510, 160, 2)], frame_id=4)
+
+    assert identity.players[player_a].vx == clean_vx, "velocity must not absorb the merge jump"
+    assert identity.players[player_a].occluded
+
+
+def test_occluded_players_are_reported_for_analytics():
+    """Positions sampled during an occlusion are unreliable, so downstream stats
+    need to know which players those are and drop those samples."""
+    identity = PlayerIdentityManager()
+    identity.update([_box(100, 100, 130, 160, 1), _box(500, 100, 530, 160, 2)], frame_id=1)
+    assert identity.occluded_player_ids == set()
+
+    identity.update([_box(100, 100, 130, 160, 1), _box(110, 100, 140, 160, 2)], frame_id=2)
+
+    assert identity.occluded_player_ids == {
+        identity.tracker_to_player[1],
+        identity.tracker_to_player[2],
+    }
