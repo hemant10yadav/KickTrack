@@ -1,10 +1,11 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 NUM_TEAM_CLUSTERS = 3  # 2 teams + referee/other
+GRASS_HSV_LOW, GRASS_HSV_HIGH = (35, 40, 40), (85, 255, 255)  # OpenCV HSV range of pitch green
 TEAM_FIT_AFTER_SAMPLES = 25  # jersey-color samples collected before clusters are fixed
 
 
@@ -25,10 +26,22 @@ def extract_jersey_color(frame, x1, y1, x2, y2):
         return None
 
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    green_mask = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
-    non_green = crop.reshape(-1, 3)[cv2.bitwise_not(green_mask).reshape(-1) > 0]
+    green_mask = cv2.inRange(hsv, GRASS_HSV_LOW, GRASS_HSV_HIGH)
+    non_green = crop[green_mask == 0]
     pixels = non_green if len(non_green) >= 10 else crop.reshape(-1, 3)
-    return np.median(pixels, axis=0)
+    # Lower median via partition: half the cost of np.median on these tiny
+    # crops, and this runs for every box on every worker cycle.
+    middle = len(pixels) // 2
+    color = np.partition(pixels, middle, axis=0)[middle].astype(float)
+    # A median that is itself pitch green means the crop missed the body (a
+    # wide box around a running player, a shadowed yellow kit half-masked as
+    # grass): that is no jersey at all, and must not be mistaken for one.
+    return None if is_grass_color(color) else color
+
+
+def is_grass_color(color) -> bool:
+    hsv = cv2.cvtColor(np.uint8([[np.clip(color, 0, 255)]]), cv2.COLOR_BGR2HSV)[0, 0]
+    return bool(np.all(hsv >= GRASS_HSV_LOW) and np.all(hsv <= GRASS_HSV_HIGH))
 
 
 def boxes_overlap(box_a, box_b, overlap_ratio_threshold=0.2, iou_threshold=0.15) -> bool:
@@ -46,6 +59,30 @@ def boxes_overlap(box_a, box_b, overlap_ratio_threshold=0.2, iou_threshold=0.15)
     overlap_ratio = intersection / min(area_a, area_b)
     iou = intersection / (area_a + area_b - intersection)
     return overlap_ratio > overlap_ratio_threshold or iou > iou_threshold
+
+
+def pairwise_overlap(boxes_a, boxes_b, overlap_ratio_threshold=0.2, iou_threshold=0.15):
+    """boxes_overlap for every pair at once: (len(a), len(b)) bool matrix from
+    two (n, 4) xyxy arrays. Same test, vectorized -- the per-cycle occlusion
+    bookkeeping asks it ~700 times, which in Python was the single largest cost
+    of the identity layer."""
+    a, b = np.asarray(boxes_a, dtype=float), np.asarray(boxes_b, dtype=float)
+    if len(a) == 0 or len(b) == 0:
+        return np.zeros((len(a), len(b)), dtype=bool)
+    ix = np.clip(
+        np.minimum(a[:, None, 2], b[None, :, 2]) - np.maximum(a[:, None, 0], b[None, :, 0]), 0, None
+    )
+    iy = np.clip(
+        np.minimum(a[:, None, 3], b[None, :, 3]) - np.maximum(a[:, None, 1], b[None, :, 1]), 0, None
+    )
+    intersection = ix * iy
+    area_a = np.clip(a[:, 2] - a[:, 0], 0, None) * np.clip(a[:, 3] - a[:, 1], 0, None)
+    area_b = np.clip(b[:, 2] - b[:, 0], 0, None) * np.clip(b[:, 3] - b[:, 1], 0, None)
+    smaller = np.maximum(1, np.minimum(area_a[:, None], area_b[None, :]))
+    union = np.maximum(1, area_a[:, None] + area_b[None, :] - intersection)
+    return (intersection > 0) & (
+        (intersection / smaller > overlap_ratio_threshold) | (intersection / union > iou_threshold)
+    )
 
 
 def _area(box) -> int:
@@ -239,33 +276,24 @@ class TeamClassifier:
         self.centers = centers
 
 
-class TeamGate:
-    """Team identity for one worker cycle, in the two shapes identity
-    reconciliation needs: the team already learned for a known player, and the
-    team of a box that has no identity yet (sampled straight from the frame).
+class JerseySampler:
+    """Raw jersey color of a box, sampled straight from this cycle's frame.
 
-    Two players in different jerseys can never be the same person, so this is
-    the cheapest hard constraint available against merging one player's track
-    into another's during a crossing -- the failure that silently moves one
-    player's distance and heatmap onto their opponent.
+    PlayerIdentityManager anchors each player's appearance to this, so it can
+    notice when a *live* track's box has quietly moved onto a different body.
+    Asked once per (detection, candidate) pair while matching, but the answer
+    depends only on the box -- each one is sampled once per cycle.
     """
 
-    def __init__(self, classifier: "TeamClassifier", frame):
-        self.classifier = classifier
+    def __init__(self, frame):
         self.frame = frame
-        # of_box is asked once per (detection, candidate) pair while matching, but
-        # the answer depends only on the box -- sample each one once per cycle.
-        self._sampled = {}
+        self._colors = {}
 
-    def of_player(self, player_id: int):
-        return self.classifier.team_for(player_id)
-
-    def of_box(self, bbox) -> int | None:
-        if bbox not in self._sampled:
+    def color_of(self, bbox):
+        if bbox not in self._colors:
             x1, y1, x2, y2 = bbox
-            color = extract_jersey_color(self.frame, x1, y1, x2, y2)
-            self._sampled[bbox] = self.classifier.team_for_color(color)
-        return self._sampled[bbox]
+            self._colors[bbox] = extract_jersey_color(self.frame, x1, y1, x2, y2)
+        return self._colors[bbox]
 
 
 class StateManager:
@@ -340,9 +368,16 @@ class PlayerState:
     confirm/grace display logic, and eventually speed/distance) keys off, so a
     tracker-side ID swap doesn't reset a player's accumulated state.
 
-    `clean_bbox`/`clean_frame` are the last position that was *not* contaminated
-    by an occlusion, and `vx`/`vy` the velocity measured from clean positions
-    only -- see PlayerIdentityManager for why the occluded ones can't be used.
+    `clean_bbox`/`clean_frame` are the last position that was *trusted* -- not
+    contaminated by an occlusion, and wearing this player's own jersey -- and
+    `vx`/`vy` the velocity measured from trusted positions only.
+
+    `appearance` is the player's jersey color (BGR, slow EMA of sightings that
+    agreed with it). `mismatch_streak` counts consecutive clean sightings that
+    looked more like some *other* known player's jersey than this one's -- the
+    tell that BoT-SORT's track has moved onto another body. `deviation_streak`
+    counts consecutive sightings that merely disagreed (shadow, a crowd
+    background bleeding into the crop) and `recent_colors` holds those samples.
     """
 
     player_id: int
@@ -352,10 +387,26 @@ class PlayerState:
     vy: float
     last_seen_frame: int
     status: str  # "active" | "lost"
-    team: int | None = None
+    first_frame: int = 0
     occluded: bool = False
     clean_bbox: tuple[int, int, int, int] | None = None
     clean_frame: int | None = None
+    appearance: np.ndarray | None = None
+    mismatch_streak: int = 0
+    deviation_streak: int = 0
+    recent_colors: list = field(default_factory=list)
+
+    def predicted_center(self, frame_id: int, horizon: int) -> tuple[float, float]:
+        """Constant-velocity prediction from the last trusted sighting, with the
+        velocity applied for at most `horizon` frames -- players turn and stop,
+        so a long linear extrapolation is worse than none."""
+        px1, py1, px2, py2 = self.clean_bbox or self.bbox
+        gap = min(horizon, max(0, frame_id - (self.clean_frame or self.last_seen_frame)))
+        return (px1 + px2) / 2 + self.vx * gap, (py1 + py2) / 2 + self.vy * gap
+
+    def clean_height(self) -> int:
+        px1, py1, px2, py2 = self.clean_bbox or self.bbox
+        return max(1, py2 - py1)
 
 
 class PlayerIdentityManager:
@@ -368,45 +419,74 @@ class PlayerIdentityManager:
     player under a new ID) are scored against recently-lost players by predicted
     position -- last known velocity extrapolated over the frame gap -- normalized
     by the player's own bbox height, since a given pixel error means a lot for a
-    tiny distant player and nothing for a large close one. A bbox size-ratio
-    sanity gate and a team-color gate guard against merging two different,
-    merely nearby, players.
+    tiny distant player and nothing for a large close one -- plus jersey-color
+    distance to the player's appearance. A bbox size-ratio sanity gate and a
+    jersey gate guard against merging two different, merely nearby, players.
 
     Three things make that slow path survive players converging, which is when a
     wrong merge is both most likely and most damaging (a swapped identity
     silently moves one player's distance and heatmap onto another's):
 
-    * **Team gate.** Two players in different jerseys are never the same person,
-      so a cross-team merge is refused outright regardless of how well the
-      geometry lines up. Free, since jersey color is already sampled for team
-      classification.
+    * **Jersey gate.** A box that looks clearly more like some other known
+      player's jersey than this one's cannot be this player. Relative on
+      purpose: absolute color thresholds fail on noisier footage (match_4:
+      shadows and crowd backgrounds bleed into the crop, and a yellow kit is
+      half-masked as grass), where a box can drift far from its own player's
+      color without resembling anyone else's. Free, since jersey color is
+      already sampled for team classification.
 
-    * **Joint assignment, not greedy.** All unmapped detections in a cycle are
-      matched to all lost candidates at once (Hungarian, via scipy), so the
-      result doesn't depend on detection order and two detections can't compete
-      for the same player. Taking each detection's own nearest match in turn
-      lets the first one claim a player that a later detection fits far better,
-      which is exactly the arrangement a crossing produces.
+    * **Joint assignment, not greedy.** All of a cycle's rows are matched to all
+      candidates at once (Hungarian, via scipy), so the result doesn't depend on
+      detection order and two detections can't compete for the same player.
 
     * **Occlusion-aware state.** While a player's box overlaps another's -- or
-      has swallowed one whose track just vanished into it -- its position is
-      partly the *other* player's. Velocity is frozen at its last clean value
+      has swallowed one that vanished into it and is still lost -- its position
+      is partly the *other* player's. Velocity is frozen at its last clean value
       and matching predicts forward from the last clean position, so the players
       that emerge from a merge are resolved by the motion they carried into it
       rather than by the merged box's meaningless drift. Occluded players are
       reported in `occluded_player_ids` so downstream analytics can drop those
       samples instead of trusting a contaminated position.
 
-    The values below are a starting point (deliberately conservative -- start
-    strict on merges, loosen only against measured false-splits), not tuned
-    against real match footage yet.
+    All of that only ever ran for *unmapped* tracks. The swaps actually seen on
+    match_5.mp4 (docs/PLAN.md Plan 2.8) never produce one: the detector returns a
+    single box covering two bodies, BoT-SORT keeps its track_id on that box, and
+    when the box shrinks back it is on the *other* body -- the goalkeeper's track
+    walked off with a defender, a blue player's track walked off with a white
+    one. Nothing went lost, so nothing was reconciled. The defense is
+    **appearance-anchored identity**: every player carries the jersey color it
+    was seen in, every clean single-body sighting is checked against it, and a
+    track whose box has looked like someone else's jersey for MISMATCH_CYCLES in
+    a row is put back into the same joint assignment alongside the unmapped
+    tracks -- against the players it might really be (recently lost ones, other
+    suspect tracks' players), with "keep the current owner" as the fallback. A
+    track that has just been minted (YOUNG_CYCLES) is re-examined the same way
+    whenever something is in flux, because the abandoned body usually gets a
+    fresh track a few cycles *before* the stolen one is caught, and that fresh
+    identity should yield to the established one.
+
+    Thresholds measured on match_5.mp4 (BGR euclidean, torso median): same-body
+    frame-to-frame color noise p99 ~20-35 for on-pitch players, blue vs white
+    kits ~75 apart, goalkeeper vs white ~190. match_4.mp4 is far noisier (p95
+    40-90 for many players), which is what forced the gates to be relative.
     """
 
     MAX_LOST_FRAMES = 30  # ~1.25s at 24fps
     MAX_NORM_DIST = 3.0  # (predicted-position error) / bbox_height
-    SIZE_RATIO_RANGE = (0.5, 2.0)
+    SIZE_RATIO_RANGE = (0.4, 2.5)  # a box that swallowed a second body can be ~2x tall
+    VELOCITY_HORIZON = 10  # frames of constant-velocity extrapolation before it's ignored
+    APPEARANCE_ALPHA = 0.9  # EMA weight on the existing appearance
+    COLOR_MISMATCH = 40.0  # box vs own appearance beyond this: not the jersey we know
+    OTHER_JERSEY_RATIO = 0.5  # ...and someone else's jersey this much nearer: it is theirs
+    COLOR_SCALE = 40.0  # BGR distance per unit of assignment cost (capped at one unit)
+    MISMATCH_CYCLES = 3  # consecutive clean sightings in another jersey before suspect
+    ACCEPT_DEVIATION_AFTER = 30  # unclaimed for this long: it was a lighting change, adopt it
+    YOUNG_CYCLES = 20  # a freshly minted identity is provisional for this long
+    MAX_COST = 3.0  # position + color cost beyond which an unmapped track is not a match
+    MAX_TRANSFER_COST = 2.0  # stricter, for taking a track away from its current owner
+    MAX_JUDGED_HEIGHT_RATIO = 1.3  # a box this much taller than the player holds two bodies
+    MERGED_PAIR_RATIO = 1.4  # ...or this much wider/taller than either of two bodies it covers
     _NO_MATCH = 1e6  # cost standing in for "gate failed"; never an accepted pairing
-    _TEAM_BLOCKED = 2e6  # _NO_MATCH, but attributable to the team gate when counting
 
     def __init__(self):
         self.players: dict[int, PlayerState] = {}
@@ -414,22 +494,24 @@ class PlayerIdentityManager:
         self.occluded_player_ids: set[int] = set()
         self._next_id = 1
         self.switch_log = []  # instrumentation: every track_id reconciliation
+        self.swap_log = []  # instrumentation: every live track moved to another player
         # instrumentation: ordered player_ids each BoT-SORT track has belonged to.
-        # A track that changes owner is an identity swap in progress, and one that
-        # returns to an owner it already left cannot be anything else -- this is the
-        # measurement switch_log can't give, since it counts merges without saying
-        # whether they were right.
         self.track_owners: dict[int, list[int]] = {}
-        self.team_blocked_merges = 0
+        self.jersey_blocked_merges = 0
         self.occluded_cycles = 0
+        self.mismatch_cycles = 0  # clean sightings that looked like another player's jersey
+        self.adopted_appearances = 0  # deviations nobody claimed, accepted as lighting
+        self._appearance_ids = np.empty(0, dtype=int)  # per-cycle index, see _index_appearances
+        self._appearances = np.empty((0, 3))
 
     @property
     def total_players_minted(self) -> int:
         """Count of persistent player_ids ever created (active, lost, or retired)."""
         return self._next_id - 1
 
-    def update(self, detections: list, frame_id: int, team_gate=None) -> list:
+    def update(self, detections: list, frame_id: int, sampler=None) -> list:
         """detections: (x1, y1, x2, y2, track_id) tuples from extract_boxes.
+        sampler: this cycle's JerseySampler (or None to match on geometry only).
 
         Returns the same shape with track_id replaced by a persistent
         player_id. Untracked detections (track_id < 0) pass through as -1.
@@ -439,32 +521,62 @@ class PlayerIdentityManager:
         # Mark vanished-this-frame players lost *before* reconciling new/unmapped
         # track_ids, so a same-cycle reacquisition (the 95 -> 159 case) sees the
         # just-vanished player as a candidate immediately, not one frame late.
-        just_lost = []
+        just_lost = set()
         for player in self.players.values():
             if player.status == "active" and player.tracker_id not in present_tracker_ids:
                 player.status = "lost"
-                just_lost.append(player)
+                just_lost.add(player.player_id)
 
-        contamination = self._occlusion_flags(detections, just_lost)
+        contamination = self._occlusion_flags(detections, frame_id)
+        self._index_appearances()
+        # A lost player whose last position a live box still covers is not gone,
+        # just merged into that box: keep them pending, and *inside* that box as
+        # it moves, so they can be matched where the merge ends rather than
+        # where it began, however long it lasts and however far it travels. Not
+        # on the cycle they vanish, though: their own last motion is still the
+        # best guess of where they are, and a crossing is resolved by it.
+        for (x1, y1, x2, y2, _), (_, swallowed) in zip(detections, contamination, strict=True):
+            for player_id in swallowed - just_lost:
+                player = self.players[player_id]
+                player.last_seen_frame = frame_id - 1
+                player.bbox = player.clean_bbox = (x1, y1, x2, y2)
+                player.clean_frame = frame_id - 1
+                player.vx = player.vy = 0.0
 
         results = [None] * len(detections)
-        unmapped = []
+        rows = []  # detections whose owner is undecided this cycle
+        young = []  # provisional identities, re-examined only when something is in flux
         for i, (x1, y1, x2, y2, tracker_id) in enumerate(detections):
             if tracker_id < 0:
                 results[i] = (x1, y1, x2, y2, -1)
                 continue
             player_id = self.tracker_to_player.get(tracker_id)
             if player_id is None:
-                unmapped.append(i)
+                rows.append(i)
                 continue
-            occluded = self._is_occluded(contamination[i], player_id)
-            self._observe(player_id, tracker_id, (x1, y1, x2, y2), frame_id, occluded, team_gate)
+            self._observe(
+                player_id, tracker_id, (x1, y1, x2, y2), frame_id, contamination[i], sampler
+            )
             results[i] = (x1, y1, x2, y2, player_id)
+            player = self.players[player_id]
+            if self._is_suspect(player):
+                rows.append(i)
+            elif self._is_young(player, frame_id) and self._is_single_body(
+                (x1, y1, x2, y2), player, contamination[i]
+            ):
+                young.append(i)
+        # A young identity only yields when there is an established one it could
+        # be: a track caught wearing someone else's jersey, or a player who has
+        # just vanished (the usual order is that the abandoned body gets its
+        # fresh track a few cycles before the stolen one is caught).
+        if young and (just_lost or any(results[i] is not None for i in rows)):
+            rows.extend(young)
 
-        for i, player_id in self._reconcile_batch(detections, unmapped, frame_id, team_gate):
+        for i, player_id in self._reconcile_batch(detections, rows, frame_id, sampler):
             x1, y1, x2, y2, tracker_id = detections[i]
-            occluded = self._is_occluded(contamination[i], player_id)
-            self._observe(player_id, tracker_id, (x1, y1, x2, y2), frame_id, occluded, team_gate)
+            self._observe(
+                player_id, tracker_id, (x1, y1, x2, y2), frame_id, contamination[i], sampler
+            )
             results[i] = (x1, y1, x2, y2, player_id)
 
         self._retire_stale(frame_id)
@@ -474,27 +586,42 @@ class PlayerIdentityManager:
         self.occluded_cycles += len(self.occluded_player_ids)
         return results
 
-    def _occlusion_flags(self, detections: list, just_lost: list) -> list:
+    def _occlusion_flags(self, detections: list, frame_id: int) -> list:
         """Per detection: which other players contaminate this box right now,
         as (overlaps a live detection, {player_ids swallowed by it}).
 
         Two ways that happens. The box still overlaps another live detection --
         two players contesting a ball, each box containing some of the other.
         Or the detector collapsed both players into one box, in which case there
-        is no second detection to overlap; the tell is that a player's track
-        vanished this cycle into a box that covers where it just was.
+        is no second detection to overlap; the tell is a lost player whose last
+        position the box covers. That holds for as long as the player stays
+        lost (not just the cycle they vanished): the merged box is someone
+        else's for the whole merge, and its motion must not be trusted until
+        the swallowed player is found again or expires.
         """
-        contamination = []
-        for i, (x1, y1, x2, y2, _) in enumerate(detections):
-            box = (x1, y1, x2, y2)
-            overlaps_live = any(
-                boxes_overlap(box, (ox1, oy1, ox2, oy2))
-                for j, (ox1, oy1, ox2, oy2, _) in enumerate(detections)
-                if j != i
-            )
-            swallowed = {p.player_id for p in just_lost if boxes_overlap(box, p.bbox)}
-            contamination.append((overlaps_live, swallowed))
-        return contamination
+        if not detections:
+            return []
+        boxes = np.array([d[:4] for d in detections], dtype=float)
+        live = pairwise_overlap(boxes, boxes)
+        np.fill_diagonal(live, False)
+        overlaps_live = live.any(axis=1)
+
+        lost = [
+            p
+            for p in self.players.values()
+            if p.status == "lost" and frame_id - p.last_seen_frame <= self.MAX_LOST_FRAMES
+        ]
+        swallowed = np.zeros((len(detections), len(lost)), dtype=bool)
+        if lost:
+            swallowed = pairwise_overlap(boxes, [p.bbox for p in lost])
+            # a box cannot have swallowed a body several times its own size
+            heights = np.maximum(1, boxes[:, 3] - boxes[:, 1])
+            ratio = heights[:, None] / np.array([p.clean_height() for p in lost])[None, :]
+            swallowed &= (ratio >= self.SIZE_RATIO_RANGE[0]) & (ratio <= self.SIZE_RATIO_RANGE[1])
+        return [
+            (bool(overlaps_live[i]), {lost[j].player_id for j in np.flatnonzero(swallowed[i])})
+            for i in range(len(detections))
+        ]
 
     @staticmethod
     def _is_occluded(contamination, player_id: int) -> bool:
@@ -504,12 +631,49 @@ class PlayerIdentityManager:
         overlaps_live, swallowed = contamination
         return overlaps_live or bool(swallowed - {player_id})
 
-    def _reconcile_batch(self, detections: list, unmapped: list, frame_id: int, team_gate) -> list:
-        """Assign every unmapped detection in this cycle to a recently-lost
-        player, or mint a new player_id where nothing fits. Solved as one
-        assignment problem so the outcome doesn't depend on detection order and
-        no two detections can claim the same player."""
-        if not unmapped:
+    def _is_single_body(self, bbox, player: PlayerState, contamination: tuple) -> bool:
+        """A box that overlaps another detection, or is big enough to hold a
+        swallowed player as well, has no position or color of its own to be
+        judged by."""
+        overlaps_live, swallowed = contamination
+        return not overlaps_live and not self._holds_both(bbox, player, swallowed)
+
+    def _holds_both(self, bbox, owner: PlayerState, swallowed: set) -> bool:
+        """True when `bbox` is big enough to be `owner` and a swallowed lost
+        player side by side or stacked -- two bodies merged into one detection.
+        Its color is then a blend and says nothing about who owns the track.
+        A single-body-sized box over a lost player's last position is the
+        opposite case: one body, and the color says which one."""
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        ox1, oy1, ox2, oy2 = owner.clean_bbox or owner.bbox
+        for player_id in swallowed - {owner.player_id}:
+            other = self.players.get(player_id)
+            if other is None:
+                continue
+            qx1, qy1, qx2, qy2 = other.clean_bbox or other.bbox
+            wide = w >= self.MERGED_PAIR_RATIO * max(ox2 - ox1, qx2 - qx1)
+            tall = h >= self.MERGED_PAIR_RATIO * max(oy2 - oy1, qy2 - qy1)
+            if wide or tall:
+                return True
+        return False
+
+    def _is_suspect(self, player: PlayerState) -> bool:
+        return player.mismatch_streak >= self.MISMATCH_CYCLES
+
+    def _is_young(self, player: PlayerState, frame_id: int) -> bool:
+        return frame_id - player.first_frame <= self.YOUNG_CYCLES
+
+    def _reconcile_batch(self, detections: list, rows: list, frame_id: int, sampler) -> list:
+        """Decide the owner of every undecided detection in this cycle: an
+        unmapped track, a suspect track (box no longer wearing its player's
+        jersey), or a provisional young one. Candidates are the recently-lost
+        players plus the suspects' own current players, so a body swap between
+        two live tracks resolves as one exchange. Solved as one assignment so the
+        outcome doesn't depend on detection order and no two rows can claim the
+        same player. Returns (index, player_id) for every row whose owner is now
+        set or changed; a suspect/young row nothing fits keeps its owner, an
+        unmapped row nothing fits mints."""
+        if not rows:
             return []
 
         candidates = [
@@ -517,82 +681,177 @@ class PlayerIdentityManager:
             for p in self.players.values()
             if p.status == "lost" and 0 < frame_id - p.last_seen_frame <= self.MAX_LOST_FRAMES
         ]
+        current = {i: self.tracker_to_player.get(detections[i][4]) for i in rows}
+        for i in rows:
+            player = self.players.get(current[i])
+            if player is not None and self._is_suspect(player):
+                candidates.append(player)
+
         assignments = {}
         if candidates:
             costs = np.array(
                 [
                     [
-                        self._match_cost(detections[i], candidate, frame_id, team_gate)
+                        self._match_cost(detections[i], candidate, frame_id, sampler)
                         for candidate in candidates
                     ]
-                    for i in unmapped
+                    for i in rows
                 ]
             )
-            # Count a refusal once per detection, not once per candidate it was
-            # scored against -- a detection rejected against ten candidates is
-            # one merge refused, not ten.
-            self.team_blocked_merges += int(
-                sum(
-                    1
-                    for row in costs
-                    if (row == self._TEAM_BLOCKED).any() and (row < self._NO_MATCH).sum() == 0
-                )
-            )
-            rows, cols = linear_sum_assignment(costs)
-            for row, col in zip(rows, cols, strict=True):
-                if costs[row][col] >= self._NO_MATCH:
+            row_idx, col_idx = linear_sum_assignment(costs)
+            for r, c in zip(row_idx, col_idx, strict=True):
+                cost = float(costs[r][c])
+                limit = self.MAX_COST if current[rows[r]] is None else self.MAX_TRANSFER_COST
+                if cost > limit:
                     continue
-                assignments[unmapped[row]] = (candidates[col], costs[row][col])
+                assignments[rows[r]] = (candidates[c], cost)
+            self._drop_unaccounted_transfers(assignments, current)
 
+        claimed = {player.player_id for player, _ in assignments.values()}
         resolved = []
-        for i in unmapped:
+        for i in rows:
             tracker_id = detections[i][4]
             matched = assignments.get(i)
             if matched is None:
-                resolved.append((i, self._mint(tracker_id)))
-                continue
+                if current[i] is None:
+                    resolved.append((i, self._mint(tracker_id)))
+                continue  # a mapped row nothing else fits keeps its owner
             player, cost = matched
+            if player.player_id == current[i]:
+                continue
+            self._transfer(tracker_id, current[i], player, frame_id, cost, claimed)
+            resolved.append((i, player.player_id))
+        return resolved
+
+    def _drop_unaccounted_transfers(self, assignments: dict, current: dict) -> None:
+        """An established owner only gives its track up when its own body is
+        accounted for: some other row of this same assignment takes that owner.
+        A box that swallowed a second body can read as the other jersey for as
+        long as they overlap (match_4: a white player hidden behind a yellow
+        one), and nothing then says which body the track will follow when they
+        part. When the displaced owner's jersey shows up on another box -- the
+        stolen track's old body, now detected on its own -- the exchange is
+        consistent and safe. A provisional young owner needs no such account;
+        yielding is what it is for."""
+        while True:
+            claimed = {player.player_id for player, _ in assignments.values()}
+            unaccounted = [
+                i
+                for i, (player, _) in assignments.items()
+                if current[i] is not None
+                and player.player_id != current[i]
+                and self._is_suspect(self.players[current[i]])
+                and current[i] not in claimed
+            ]
+            if not unaccounted:
+                return
+            for i in unaccounted:
+                del assignments[i]
+
+    def _transfer(self, tracker_id, from_player_id, player, frame_id, cost, claimed) -> None:
+        """Hand `tracker_id` to `player`. Its previous owner (if any) goes lost --
+        unless another row of this same assignment claimed it -- or is retired
+        outright when it was only ever a provisional young identity, so the
+        display never keeps a number that was minted for a body someone else
+        already owned."""
+        # Only unmap the player's old track if it still points at them: after a
+        # swap it may be another player's live track by now.
+        if self.tracker_to_player.get(player.tracker_id) == player.player_id:
+            self.tracker_to_player.pop(player.tracker_id, None)
+        self.tracker_to_player[tracker_id] = player.player_id
+        if from_player_id is None:
             self.switch_log.append(
                 {
                     "frame": frame_id,
                     "player_id": player.player_id,
                     "old_tracker_id": player.tracker_id,
                     "new_tracker_id": tracker_id,
-                    "norm_dist": round(float(cost), 2),
+                    "cost": round(cost, 2),
                 }
             )
-            self.tracker_to_player.pop(player.tracker_id, None)
-            self.tracker_to_player[tracker_id] = player.player_id
-            resolved.append((i, player.player_id))
-        return resolved
+            return
+        previous = self.players.get(from_player_id)
+        self.swap_log.append(
+            {
+                "frame": frame_id,
+                "tracker_id": tracker_id,
+                "from_player_id": from_player_id,
+                "to_player_id": player.player_id,
+                "cost": round(cost, 2),
+            }
+        )
+        if previous is None or from_player_id in claimed:
+            return
+        if self._is_young(previous, frame_id) and not self._is_suspect(previous):
+            del self.players[from_player_id]
+            return
+        # It was last truly seen where it was last wearing its own jersey, not
+        # wherever the stolen track has dragged its box since.
+        previous.bbox = previous.clean_bbox or previous.bbox
+        previous.status = "lost"
+        previous.last_seen_frame = frame_id
 
-    def _match_cost(self, detection, player: PlayerState, frame_id: int, team_gate) -> float:
-        """Normalized predicted-position error, or _NO_MATCH if any gate rejects
-        the pairing outright."""
-        x1, y1, x2, y2, _ = detection
-        px1, py1, px2, py2 = player.clean_bbox or player.bbox
-        p_height = max(1, py2 - py1)
+    def _match_cost(self, detection, player: PlayerState, frame_id: int, sampler) -> float:
+        """Normalized predicted-position error plus jersey-color distance, or
+        _NO_MATCH if any gate rejects the pairing outright."""
+        x1, y1, x2, y2, tracker_id = detection
+        p_height = player.clean_height()
 
         size_ratio = max(1, y2 - y1) / p_height
         if not (self.SIZE_RATIO_RANGE[0] <= size_ratio <= self.SIZE_RATIO_RANGE[1]):
             return self._NO_MATCH
 
-        if team_gate is not None and player.team is not None:
-            team = team_gate.of_box((x1, y1, x2, y2))
-            if team is not None and team != player.team:
-                return self._TEAM_BLOCKED
+        color_cost = 0.0
+        color = self._row_color((x1, y1, x2, y2), tracker_id, sampler)
+        if color is not None and player.appearance is not None:
+            color_dist = float(np.linalg.norm(color - player.appearance))
+            if self._wears_another_jersey(color, color_dist, player.player_id):
+                self.jersey_blocked_merges += 1
+                return self._NO_MATCH
+            # Bounded: past one unit the jersey gate has already had its say, and a
+            # merely odd-colored box must still be able to match on position.
+            color_cost = min(1.0, color_dist / self.COLOR_SCALE)
 
-        # Predict from the last *clean* sighting: once a player's box has merged
-        # with someone else's, both its position and the time since it was last
-        # trustworthy are measured from before the merge.
-        gap = frame_id - (player.clean_frame or player.last_seen_frame)
-        if gap <= 0 or gap > self.MAX_LOST_FRAMES:
+        if frame_id - player.last_seen_frame > self.MAX_LOST_FRAMES:
             return self._NO_MATCH
-        pred_cx = (px1 + px2) / 2 + player.vx * gap
-        pred_cy = (py1 + py2) / 2 + player.vy * gap
+        pred_cx, pred_cy = player.predicted_center(frame_id, self.VELOCITY_HORIZON)
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
         norm_dist = ((cx - pred_cx) ** 2 + (cy - pred_cy) ** 2) ** 0.5 / p_height
-        return norm_dist if norm_dist <= self.MAX_NORM_DIST else self._NO_MATCH
+        if norm_dist > self.MAX_NORM_DIST:
+            return self._NO_MATCH
+        return norm_dist + color_cost
+
+    def _index_appearances(self) -> None:
+        """Once per cycle: every known appearance as one matrix, so judging a box
+        against all players is a single vectorized op rather than a Python loop
+        (measured: the loop cost ~1ms per cycle at 25 boxes x 50 players, which
+        on a 50fps clip is the difference between dropping frames or not)."""
+        known = [(pid, p.appearance) for pid, p in self.players.items() if p.appearance is not None]
+        self._appearance_ids = np.array([pid for pid, _ in known], dtype=int)
+        self._appearances = (
+            np.array([a for _, a in known], dtype=float) if known else np.empty((0, 3))
+        )
+
+    def _wears_another_jersey(self, color, own_dist: float, player_id: int) -> bool:
+        """True when `color` is not the jersey we know for `player_id` *and*
+        clearly resembles some other known player's instead. Noise alone (a
+        shadow, a crowd background) moves a color away from its owner without
+        moving it onto anyone else."""
+        if own_dist <= self.COLOR_MISMATCH or len(self._appearances) == 0:
+            return False
+        distances = np.linalg.norm(self._appearances - color, axis=1)
+        distances[self._appearance_ids == player_id] = np.inf
+        return bool(distances.min() < own_dist * self.OTHER_JERSEY_RATIO)
+
+    def _row_color(self, bbox, tracker_id, sampler):
+        """The color to judge a row by: a suspect track has several disagreeing
+        samples, and their median is steadier than any single frame."""
+        player = self.players.get(self.tracker_to_player.get(tracker_id))
+        if player is not None and player.recent_colors:
+            return np.median(np.array(player.recent_colors), axis=0)
+        if sampler is None:
+            return None
+        return sampler.color_of(bbox)
 
     def _mint(self, tracker_id: int) -> int:
         new_id = self._next_id
@@ -606,18 +865,60 @@ class PlayerIdentityManager:
         tracker_id: int,
         bbox: tuple,
         frame_id: int,
-        occluded: bool,
-        team_gate=None,
+        contamination: tuple,
+        sampler=None,
     ) -> None:
         existing = self.players.get(player_id)
-        vx, vy = 0.0, 0.0
-        clean_bbox, clean_frame = (None, None) if occluded else (bbox, frame_id)
-        team = None
+        overlaps_live, _ = contamination
+        occluded = self._is_occluded(contamination, player_id)
+        # Does this box still wear the player's jersey? A box overlapping another
+        # live detection is nobody's color and is not judged, and neither is one
+        # much taller than the body we know: the detector has merged two bodies
+        # into it and its color is a blend of both. A single-body box that
+        # merely sits where a lost player was *is* judged: if it now wears that
+        # jersey and not its own, that is the swap signature, not noise.
+        judged = not overlaps_live and sampler is not None
+        if judged and existing is not None:
+            judged = (bbox[3] - bbox[1]) <= self.MAX_JUDGED_HEIGHT_RATIO * existing.clean_height()
+            judged = judged and self._is_single_body(bbox, existing, contamination)
+        color = sampler.color_of(bbox) if judged else None
+
+        appearance = existing.appearance if existing is not None else None
+        mismatch_streak, deviation_streak, recent_colors = 0, 0, []
         if existing is not None:
-            team = existing.team
-            if occluded:
-                # The box is partly someone else's: neither its position nor the
-                # jump to it says anything about this player's own motion.
+            mismatch_streak, deviation_streak = existing.mismatch_streak, existing.deviation_streak
+            recent_colors = existing.recent_colors
+        consistent = color is not None and appearance is not None
+        if consistent:
+            own_dist = float(np.linalg.norm(color - appearance))
+            consistent = own_dist <= self.COLOR_MISMATCH
+            if consistent:
+                mismatch_streak, deviation_streak, recent_colors = 0, 0, []
+            else:
+                deviation_streak += 1
+                recent_colors = (recent_colors + [color])[-self.MISMATCH_CYCLES :]
+                if self._wears_another_jersey(color, own_dist, player_id):
+                    mismatch_streak += 1
+                    self.mismatch_cycles += 1
+                else:
+                    mismatch_streak = 0
+        if deviation_streak > self.ACCEPT_DEVIATION_AFTER:
+            # Nobody claimed this body in all that time: the jersey did not
+            # change, the light on it did. Adopt the new look and move on.
+            appearance = np.median(np.array(recent_colors), axis=0)
+            mismatch_streak, deviation_streak, recent_colors = 0, 0, []
+            consistent = True
+            self.adopted_appearances += 1
+        # Position is trusted unless the box is contaminated or is plainly on
+        # someone else; a merely odd-colored box is still this body, in odd light.
+        trusted = not occluded and mismatch_streak == 0
+
+        vx, vy = 0.0, 0.0
+        clean_bbox, clean_frame = (bbox, frame_id) if trusted else (None, None)
+        first_frame = frame_id
+        if existing is not None:
+            first_frame = existing.first_frame
+            if not trusted:
                 vx, vy = existing.vx, existing.vy
                 clean_bbox, clean_frame = existing.clean_bbox, existing.clean_frame
             elif existing.clean_frame is not None:
@@ -626,9 +927,12 @@ class PlayerIdentityManager:
                 pcy = (existing.clean_bbox[1] + existing.clean_bbox[3]) / 2
                 cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
                 vx, vy = (cx - pcx) / gap, (cy - pcy) / gap
-        if team_gate is not None:
-            known = team_gate.of_player(player_id)
-            team = known if known is not None else team
+        if color is not None and not occluded and (appearance is None or consistent):
+            appearance = (
+                color
+                if appearance is None
+                else self.APPEARANCE_ALPHA * appearance + (1 - self.APPEARANCE_ALPHA) * color
+            )
 
         owners = self.track_owners.setdefault(tracker_id, [])
         if not owners or owners[-1] != player_id:
@@ -642,10 +946,14 @@ class PlayerIdentityManager:
             vy=vy,
             last_seen_frame=frame_id,
             status="active",
-            team=team,
+            first_frame=first_frame,
             occluded=occluded,
             clean_bbox=clean_bbox or bbox,
             clean_frame=clean_frame if clean_frame is not None else frame_id,
+            appearance=appearance,
+            mismatch_streak=mismatch_streak,
+            deviation_streak=deviation_streak,
+            recent_colors=recent_colors,
         )
 
     def _retire_stale(self, frame_id: int) -> None:
@@ -659,25 +967,32 @@ class PlayerIdentityManager:
 
     @property
     def contested_tracks(self) -> dict[int, list[int]]:
-        """Tracks that changed hands between player_ids -- the direct swap count."""
+        """Tracks that changed hands between player_ids. Every such change is a
+        deliberate correction (see swap_log); BoT-SORT's own silent swaps leave
+        the track's owner unchanged, which is exactly the problem."""
         return {t: owners for t, owners in self.track_owners.items() if len(owners) > 1}
 
     def summary(self) -> str:
-        contested = self.contested_tracks
         lines = [
             f"Persistent player IDs minted: {self.total_players_minted}",
             f"track_id -> player_id reconciliations (switches absorbed): {len(self.switch_log)}",
-            f"Reconciliations refused outright on a team-color mismatch: "
-            f"{self.team_blocked_merges}",
+            f"Pairings refused because the box wears another player's jersey: "
+            f"{self.jersey_blocked_merges}",
             f"Player-cycles spent occluded (position unreliable): {self.occluded_cycles}",
-            f"Tracks that changed owner (identity swaps): {len(contested)}"
-            + (f" {contested}" if contested else ""),
+            f"Clean sightings wearing another player's jersey: {self.mismatch_cycles} "
+            f"(unclaimed deviations adopted as lighting: {self.adopted_appearances})",
+            f"Live tracks moved to another player (body swaps corrected): {len(self.swap_log)}",
         ]
+        for event in self.swap_log[:20]:
+            lines.append(
+                f"  frame {event['frame']}: track {event['tracker_id']} player "
+                f"{event['from_player_id']} -> {event['to_player_id']} (cost={event['cost']})"
+            )
         for event in self.switch_log[:20]:
             lines.append(
                 f"  frame {event['frame']}: track {event['old_tracker_id']} -> "
                 f"{event['new_tracker_id']} kept as player {event['player_id']} "
-                f"(norm_dist={event['norm_dist']})"
+                f"(cost={event['cost']})"
             )
         if len(self.switch_log) > 20:
             lines.append(f"  ... and {len(self.switch_log) - 20} more")

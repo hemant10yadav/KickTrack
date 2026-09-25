@@ -33,6 +33,12 @@ MAX_PLAYER_IDS = {
     "match_5": 65,
 }
 
+MAX_SWAP_CORRECTIONS = {
+    "match_3": 5,
+    "match_4": 60,
+    "match_5": 25,
+}
+
 FIXTURE_VIDEOS = [
     Path("tests/videos/match_3.mp4"),
     Path("tests/videos/match_4.mp4"),
@@ -83,8 +89,8 @@ def test_player_id_churn_does_not_regress(video_path):
     if not Path(MODEL_NAME).exists():
         pytest.skip(f"CoreML model not found: {MODEL_NAME} (export it first, see CLAUDE.md)")
 
-    worker, _ = _run(video_path)
-    unique_player_ids = worker.identity.total_players_minted
+    _, tracker = _run(video_path)
+    unique_player_ids = tracker.resolver.identity.total_players_minted
 
     max_ids = MAX_PLAYER_IDS[video_path.stem]
     assert unique_player_ids <= max_ids, (
@@ -94,35 +100,27 @@ def test_player_id_churn_does_not_regress(video_path):
     )
 
 
-# match_3 is excluded: it still shows 2 owner changes, but from a different cause
-# than the crossings this test guards (docs/PLAN.md Plan 2.6, "reconciliation
-# cascade") -- no players converge in that clip at all. Add it back once that is
-# fixed, so the ceiling here stays a crossing-swap regression guard meanwhile.
-SWAP_FIXTURE_VIDEOS = [p for p in FIXTURE_VIDEOS if p.stem != "match_3"]
-
-
 @pytest.mark.slow
-@pytest.mark.parametrize("video_path", SWAP_FIXTURE_VIDEOS, ids=lambda p: p.stem)
-def test_no_tracker_id_changes_owner(video_path):
-    """A BoT-SORT track that belongs to one player_id and later to another is an
-    identity swap, whatever the geometry said at the time -- and a swap is worse
-    than a lost track, because it moves one player's distance and heatmap onto
-    another's without anything looking broken.
-
-    Measured on match_5.mp4 before the Plan 2.6 fixes: 5 tracks changed owner,
-    two of them passing through three different players each, and track 5's
-    owner sequence was [5, 2, 5, 47] -- it left a player and came back to them.
-    After: zero, on every fixture clip, in both realtime and drop-free runs.
+@pytest.mark.parametrize("video_path", FIXTURE_VIDEOS, ids=lambda p: p.stem)
+def test_body_swap_corrections_stay_bounded(video_path):
+    """Every owner change of a BoT-SORT track is now a deliberate correction of
+    a swap the tracker made silently (docs/PLAN.md Plan 2.8): the track's box
+    stopped wearing its player's jersey and another body was found wearing it.
+    The hand-checked swaps themselves are pinned in tests/test_identity_replay.py
+    (drop-free, deterministic); this only guards against the correction
+    machinery running away on real, drop-prone footage. Measured when Plan 2.8
+    landed: 10 on match_5, 22 on match_4 (drop-free), 0 on match_3.
     """
     if not video_path.exists():
         pytest.skip(f"fixture video not found: {video_path}")
     if not Path(MODEL_NAME).exists():
         pytest.skip(f"CoreML model not found: {MODEL_NAME} (export it first, see CLAUDE.md)")
 
-    worker, _ = _run(video_path)
-    contested = worker.identity.contested_tracks
+    _, tracker = _run(video_path)
+    corrections = tracker.resolver.identity.swap_log
 
-    assert not contested, (
-        f"{video_path}: {len(contested)} BoT-SORT track(s) changed player_id owner "
-        f"mid-clip (track -> owners in order): {contested}"
+    assert len(corrections) <= MAX_SWAP_CORRECTIONS[video_path.stem], (
+        f"{video_path}: {len(corrections)} live tracks were moved to another player, "
+        f"above the {MAX_SWAP_CORRECTIONS[video_path.stem]} ceiling -- the jersey gates "
+        f"in PlayerIdentityManager may have loosened: {corrections[:10]}"
     )
