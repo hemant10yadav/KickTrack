@@ -140,25 +140,61 @@ Take a fixed-camera football video and show a marker on each player that moves w
         per-track motion-consistency check (a discontinuity in one track mirrored
         by the inverse in another), and measuring it needs hand-labeled crossing
         events — the synthetic tests can't tell us the real rate.
-  - [ ] **Open (pre-existing, not an identity bug): duplicate boxes on one
-        player.** The match_5 swap traces back to YOLO emitting two boxes on one
-        body -- at f1443, `[1221,664,1242,715]` and `[1221,664,1256,715]`, the
-        second a narrow sliver beside the real box. Both runs get it, since
-        detection is identical. What differs is what the identity layer does with
-        the spare box: main reconciled it onto player 2, an established identity
-        from elsewhere, so player 2 teleported onto a body player 47 already
-        owned (and the two disagreed on team, 2 vs 0 -- visible in the frame
-        dumps). The fix refuses that merge and mints a local id instead, so the
-        two boxes are two fresh ids on one body with agreeing teams. Correct
-        behavior for the identity layer, but the duplicate detection itself would
-        still double-count that player in Plan 3 stats. It belongs upstream, in
-        NMS / detection dedup, not here.
+  - [X] **Duplicate boxes on one player — fixed in Plan 2.7 below.**
   - [ ] **Not yet measured on real footage.** The counters above show the
         machinery firing, not that it fires *correctly*: `switch_log` counts
         reconciliations absorbed and is blind to swaps. A swap-specific benchmark
         (hand-labeled crossings on match_4.mp4, asserting post-crossing identity)
         is the prerequisite for tuning `MAX_NORM_DIST`/`SIZE_RATIO_RANGE` against
         anything better than intuition.
+
+- [X] **Plan 2.7: One Body, Two Boxes**
+
+  Found while inspecting the match_5 swap frame-by-frame: the trigger was not a
+  crossing at all. YOLO returns both a box around a running player (wide, because
+  an extended leg stretches it) and a second box around just their torso —
+  verified by eye at 8x zoom on f1441-1447, one body, two rectangles. BoT-SORT
+  gives the second one its own track_id, so one player reaches the pipeline as
+  two: two markers, two team votes, and in Plan 3 two sets of distance/heatmap
+  numbers for one person.
+
+  - [X] **Geometric test, not an IoU threshold.** A split is one box horizontally
+        inside the other (intersection >= 0.9 of the smaller) while both share a
+        top AND a bottom edge within 5% of the smaller box's height. Two different
+        people cannot share a head line and a feet line to within a few percent,
+        so it does not fire on a player occluded behind another — measured on
+        match_5, 114 contained pairs share both edges, ~106 share only the feet
+        line, and the latter are left alone. Plain NMS cannot separate these: the
+        split pairs' IoU runs 0.34-0.84 (median 0.62), straight through the range
+        where real overlapping players live.
+  - [X] **Age decides which track survives, not size.** The established track was
+        the *smaller* box in 42 of those 114 pairs, so keeping the bigger box
+        would pick wrong more than a third of the time. Dropping the newer of the
+        pair suppresses the short-lived phantoms (track 57 for 30 of its 94
+        cycles, track 67 for 16 of 24) and barely touches real tracks (2 cycles
+        out of 1595).
+  - [X] **Alias the phantom track, never delete its box.** Deleting was measured
+        to be far worse than the problem: the track vanishes, the player is marked
+        lost, and next cycle it returns unmapped and gets reconciled — on match_5
+        that took reconciliations 1 -> 28 and reintroduced 5 identity swaps. So
+        `SplitDetectionSuppressor` rewrites the phantom's track_id to the track it
+        belongs to instead. One stable track, no identity minted for the split,
+        and the alias still resolves on the later cycles where the phantom is the
+        only box on that player. An alias is revoked if the two tracks are ever
+        seen apart, since that proves they were two real detections.
+  - [X] Measured on match_5.mp4 (realtime, A/B in the same session): persistent
+        player IDs 61 -> 51-53, tracks changing owner 0 in both, reconciliations
+        unchanged at 2, 103 split detections collapsed across 25 tracks. No
+        latency cost — worker total averaged 20.2ms with it and 20.4ms without,
+        inside run-to-run noise. Frame-drop counts swung 24-90 across four runs
+        regardless of the setting, so they say nothing about this change.
+  - [X] Tests: `tests/test_split_detections.py` (9 synthetic cases, including the
+        real f1443 geometry, the occluded-player-behind case that must survive,
+        the phantom-seen-alone case that deleting got wrong, and alias revocation).
+  - [ ] **Not covered: the wide box is still the surviving geometry sometimes.**
+        When the leg-extended box is the established track, the player's bbox
+        centre is pulled sideways by the leg. Harmless for identity, but Plan 3
+        should take position from the box bottom-centre rather than its centroid.
 
 - [ ] **Plan 3: Player & Match Analytics**
 

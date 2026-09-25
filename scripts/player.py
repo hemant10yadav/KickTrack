@@ -38,19 +38,132 @@ def boxes_overlap(box_a, box_b, overlap_ratio_threshold=0.2, iou_threshold=0.15)
     swallowed by a bigger one) and as IoU (catches two similarly-sized boxes
     overlapping less than fully).
     """
-    ax1, ay1, ax2, ay2 = box_a
-    bx1, by1, bx2, by2 = box_b
-    iw = max(0, min(ax2, bx2) - max(ax1, bx1))
-    ih = max(0, min(ay2, by2) - max(ay1, by1))
-    intersection = iw * ih
+    intersection = _intersection(box_a, box_b)
     if intersection == 0:
         return False
 
-    area_a = (ax2 - ax1) * (ay2 - ay1)
-    area_b = (bx2 - bx1) * (by2 - by1)
+    area_a, area_b = _area(box_a), _area(box_b)
     overlap_ratio = intersection / min(area_a, area_b)
     iou = intersection / (area_a + area_b - intersection)
     return overlap_ratio > overlap_ratio_threshold or iou > iou_threshold
+
+
+def _area(box) -> int:
+    return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+
+
+def _intersection(box_a, box_b) -> int:
+    iw = max(0, min(box_a[2], box_b[2]) - max(box_a[0], box_b[0]))
+    ih = max(0, min(box_a[3], box_b[3]) - max(box_a[1], box_b[1]))
+    return iw * ih
+
+
+class SplitDetectionSuppressor:
+    """Collapses two boxes on one body back into a single detection.
+
+    YOLO sometimes returns both a box around a whole running player (wide, because
+    an extended leg stretches it) and a second box around just their torso. They
+    are separate detections, so BoT-SORT gives the second one its own track_id and
+    one player arrives downstream as two -- two markers, two team votes, and in
+    Plan 3 two sets of distance/heatmap numbers for one person.
+
+    A split is recognised geometrically: one box horizontally inside the other
+    while both share a top AND a bottom edge. Two different people cannot share a
+    head line and a feet line to within a few percent of their height, so this
+    does not fire on a genuinely occluded player standing behind another -- those
+    share a feet line but not a head line (measured on match_5: 114 pairs share
+    both edges, ~106 share only the feet line, and the latter are left alone).
+
+    The phantom track is **aliased onto the real one, not deleted**. Simply
+    dropping its box was measured to be much worse than the problem: the track
+    vanishes, PlayerIdentityManager marks that player lost, and the next cycle it
+    reappears unmapped and gets reconciled -- on match_5 that took reconciliations
+    from 1 to 28 and reintroduced 5 identity swaps. Rewriting the phantom's
+    track_id to the surviving one instead keeps a single stable track, so the
+    split contributes no identity at all, and the alias still resolves correctly
+    on the later cycles where the phantom is the only box on that player.
+
+    Which track survives is decided by age, not size. Size is not evidence: the
+    established track was the *smaller* box in 42 of those 114 pairs.
+    """
+
+    CONTAINMENT = 0.9  # intersection as a fraction of the smaller box
+    EDGE_TOLERANCE = 0.05  # top/bottom agreement, as a fraction of the smaller box's height
+
+    def __init__(self):
+        self.first_seen: dict[int, int] = {}
+        self.alias: dict[int, int] = {}  # phantom track_id -> the track it is part of
+        self.suppressed_detections = 0
+        self.suppressed_tracks: dict[int, int] = {}
+
+    def update(self, detections: list, frame_id: int) -> list:
+        """Returns detections with split boxes collapsed and phantom track_ids
+        rewritten to the track they belong to. Untracked boxes (track_id < 0) pass
+        through untouched -- with no track there is no age to compare, and nothing
+        downstream keys an identity off them."""
+        for *_, track_id in detections:
+            if track_id >= 0:
+                self.first_seen.setdefault(track_id, frame_id)
+
+        present = {tid: box for *box, tid in detections if tid >= 0}
+        splits = {
+            frozenset((a, b))
+            for a in present
+            for b in present
+            if a < b and self._is_split(present[a], present[b])
+        }
+        for pair in splits:
+            a, b = sorted(pair, key=lambda t: (self.first_seen[t], -_area(present[t])))
+            self.alias[b] = a
+        # A pair that is both present and no longer a split has genuinely come
+        # apart -- two real detections after all, so the alias must not persist.
+        for phantom, canonical in list(self.alias.items()):
+            if (
+                phantom in present
+                and canonical in present
+                and frozenset((phantom, canonical)) not in splits
+            ):
+                del self.alias[phantom]
+
+        kept, seen = [], set()
+        for x1, y1, x2, y2, track_id in detections:
+            if track_id < 0:
+                kept.append((x1, y1, x2, y2, track_id))
+                continue
+            canonical = self._resolve(track_id)
+            if canonical in seen:
+                self.suppressed_detections += 1
+                self.suppressed_tracks[track_id] = self.suppressed_tracks.get(track_id, 0) + 1
+                continue
+            seen.add(canonical)
+            kept.append((x1, y1, x2, y2, canonical))
+        return kept
+
+    def _resolve(self, track_id: int) -> int:
+        seen = set()
+        while track_id in self.alias and track_id not in seen:
+            seen.add(track_id)
+            track_id = self.alias[track_id]
+        return track_id
+
+    def _is_split(self, box_a, box_b) -> bool:
+        overlap = _intersection(box_a, box_b)
+        if not overlap:
+            return False
+        smaller, larger = sorted((box_a, box_b), key=_area)
+        if overlap / max(1, _area(smaller)) < self.CONTAINMENT:
+            return False
+        height = max(1, smaller[3] - smaller[1])
+        return (
+            abs(smaller[1] - larger[1]) / height <= self.EDGE_TOLERANCE
+            and abs(smaller[3] - larger[3]) / height <= self.EDGE_TOLERANCE
+        )
+
+    def summary(self) -> str:
+        return (
+            f"Split detections collapsed (one body, two boxes): "
+            f"{self.suppressed_detections} across {len(self.suppressed_tracks)} track(s)"
+        )
 
 
 class TeamClassifier:
