@@ -378,9 +378,92 @@ Take a fixed-camera football video and show a marker on each player that moves w
 
 - [ ] **Plan 3: Player & Match Analytics**
 
-  - [ ] `PlayerState`: per-track position (pitch-relative, once calibration exists),
-        velocity, team, distance covered, speed — built on top of the existing
-        tracking + team classification pipeline
-  - [ ] Heatmaps per player (and per team)
+  - [X] Per-player pitch-relative position, distance covered, speed (Plan 3.1)
+  - [X] Heatmaps per player (and per team) (Plan 3.1)
   - [ ] Possession detection (nearest player to ball, possession changes over time)
   - [ ] (Longer-term, not yet scoped in detail) formations/team shape, passing networks
+
+- [X] **Plan 3.1: Heatmaps and Distance Covered**
+
+  `scripts/analytics.py` (`MatchAnalytics`, `PlayerTrace`, `PitchProjector`),
+  fed by `PlayerTracker` once per new worker result with the confirmed boxes,
+  the identity layer's occluded set and the current homography; written out by
+  `--analytics-dir DIR` as `stats.json` plus a heatmap PNG per player and per
+  team. Everything is in *video* time (frame id / fps), from the confirmed boxes,
+  never the extrapolated/smoothed ones drawn on screen.
+
+  - [X] **Feet, gated.** A player's position is the box's bottom-centre through
+        the inverse homography. A sample is dropped (and counted) when there is
+        no homography yet, when the identity layer flags the box occluded
+        (contaminated by another body), or when it lands more than 3m outside
+        the lines. match_5: 8.2k / 2.4k / 1.6k of ~34k samples.
+  - [X] **Distance from 0.5s bucket means, chained within 1s.** Per-frame steps
+        cannot be summed: the box bottom jitters 1-2px and swings with the
+        running stride, and the median per-result step of a player is 6.5cm even
+        when the calibration is still (3 m/s of fake motion at 50fps). Positions
+        are averaged per 0.5s bucket and distance is the path between bucket
+        means; a bucket only chains to the previous one within 1s, so time out of
+        frame adds nothing. Measured on a logged run of match_5: 0.2s and 0.5s
+        windows agree within 6% once the chain gap is not shorter than the window
+        (a 0.5s gap with a 0.5s window silently halved everything -- the first
+        bug found), so what survives 0.5s is real motion. Steps slower than 0.5
+        m/s count as standing (residual drift of a stationary player is a few
+        cm per bucket); steps faster than 12 m/s are identity or calibration
+        errors and are dropped. Top speed is over two consecutive buckets (~1s).
+  - [X] **Common-mode shifts are cancelled, not summed.** When the median move
+        of all players between two results is >= 0.2m (no team averages 10 m/s
+        in one direction), the mapping moved, not the players. The median shift
+        is subtracted from the one step that straddles it; heat positions are
+        left as measured. Measured on match_5: 91 such results of 1090. Breaking
+        every player's motion chain there instead (the first attempt) discarded
+        most of the clip: 45m instead of 90m for the top runner.
+  - [X] **Finding: the keyframe hand-over double-snaps.** The big common shifts
+        come in pairs 25 frames apart at every keyframe (~115 frames): a fresh
+        keyframe homography arrives ~0.5s after its frame (calibration latency),
+        `HomographyWorker.reset` restarts propagation from that *stale* frame,
+        so everything snaps to a 0.5s-old camera pose and then catches up on
+        the next propagate. Snap sizes 0.3-1m normally, 4m on a fast pan (frame
+        1238). Cancelled here; the real fix is upstream -- compose the new
+        keyframe homography with the propagation accumulated since its frame
+        instead of resetting to it -- and is the next calibration task.
+  - [X] **Sanity of the numbers.** match_5 (35s attacking phase, players in
+        frame ~28s): 70-91m per outfield player, 2.5-3.3 m/s average, top
+        8-10 m/s. match_4 (150s, 25fps): 220-380m for players tracked ~140s,
+        1.6-2.7 m/s average, top 7-10 m/s. Averages are consistent with active
+        play; top speeds sit at the human ceiling and are still slightly
+        inflated by pan lag below the 0.2m gate. Heatmaps checked by eye:
+        match_5 player 4's heat is the 60m run from centre-right to the left
+        corner visible in his raw trajectory; match_4's player 17 spreads across
+        the middle third like the central midfielder he is.
+  - [X] Tests: `tests/test_analytics.py`, 14 synthetic cases through a known
+        affine homography (projection, straight run, standing jitter, out-of-frame
+        gap, impossible speed, gating counts, one result sampled once, heatmap
+        mass, common shift cancelled while a runner keeps his distance, output
+        files).
+  - [ ] **Known limits.** Distance is only measured while a player is in frame
+        (`tracked_s` says how long that was) and while the calibration is
+        stable. Team ids are the classifier's clusters (2 kits + one for
+        referees/staff), not named teams. No ball, so no possession, passes or
+        shots yet -- those are the next Plan 3 steps and need ball detection
+        first.
+  - [X] **Live view.** `PitchMinimap` (scripts/display.py) draws a 315x204 top-down
+        pitch bottom-right with a dot per player at their latest gated pitch
+        position, team-coloured and labelled with the player id; each marker on
+        the video carries its running distance ("42m") above the ID label. Cost
+        measured at 0.19ms (minimap) + 0.03ms (captions) per displayed frame.
+        Exposed a Plan 1 threshold: `TeamClassifier` waited for 25 distinct
+        tracks before fitting, which the phantom-happy yolov8 tracker reached in
+        seconds and the YOLO26 + identity-layer pipeline (~40 ids per clip) did
+        not reach until late -- match_5 was still all-grey 24s in. Now 16.
+  - [ ] **Finding: k=3 team clustering collapses the two kits on match_5.**
+        With the keeper (orange) and touchline stewards (orange bibs) in the
+        sample set, the three clusters come out as {sky blue + white}, {orange},
+        {dark officials}: the two kits are the closest pair of colours (~75 BGR
+        apart vs ~190 to orange), so k-means merges them, and every outfield
+        marker and minimap dot renders in the merged cluster's grey. match_4
+        (white vs yellow) clusters fine. Fix belongs in `TeamClassifier`: fit
+        on on-pitch people only (calibration now says who is off the pitch),
+        or k=4 with the two largest clusters as the teams and a merge rule for
+        clusters closer than the kit separation -- measure on both clips first.
+  - [ ] **Next:** the team clustering above; fix the keyframe hand-over, then
+        measure top speeds again.

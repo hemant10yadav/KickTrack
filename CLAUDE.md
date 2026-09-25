@@ -183,7 +183,16 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   for every frame of `match_5.mp4`; `tests/test_identity_replay.py` replays it
   through the identity layer in ~2s with no model or video (the fast way to
   check any identity change against real footage before a realtime run)
-- `scripts/display.py` — everything "what gets shown on screen": `MarkerRenderer`,
+- `scripts/analytics.py` — everything "what do we measure from where players
+  were": `PitchProjector` (pixels → pitch metres through the inverse homography),
+  `PlayerTrace` (distance / speed from 0.5s bucket means, heat), `MatchAnalytics`
+  (per-result sampling with occlusion/calibration gates, common-mode shift
+  cancelling, `stats.json` + heatmap PNGs via `--analytics-dir`). See
+  `docs/PLAN.md` Plan 3.1 for why per-frame steps are never summed and why
+  everyone-moves-together is a calibration event, not motion.
+- `scripts/display.py` — everything "what gets shown on screen": `MarkerRenderer`
+  (pins, ID labels, running-distance captions), `PitchMinimap` (live top-down
+  positions), `PitchOverlayRenderer`,
   `MotionExtrapolator`, `DisplaySmoother`, `FadeController`, `FramePacer`,
   `StalenessTracker`/`WorkerStats`/`DisplayStats`
 - `scripts/botsort_custom.yaml` — tracker tuning

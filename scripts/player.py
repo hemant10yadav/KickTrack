@@ -6,7 +6,13 @@ from scipy.optimize import linear_sum_assignment
 
 NUM_TEAM_CLUSTERS = 3  # 2 teams + referee/other
 GRASS_HSV_LOW, GRASS_HSV_HIGH = (35, 40, 40), (85, 255, 255)  # OpenCV HSV range of pitch green
-TEAM_FIT_AFTER_SAMPLES = 25  # jersey-color samples collected before clusters are fixed
+# Distinct tracks (each with a few samples) seen before the team clusters are
+# fit and frozen. Was 25: with the yolov8 tracker that arrived within seconds
+# because it minted phantom ids freely; YOLO26 + the identity layer (Plan 2.8/2.9)
+# mint ~40 ids in a whole 35s clip, so 25 distinct tracks came late enough that
+# match_5 was still uncoloured 24s in. Two teams plus officials is ~23 people;
+# 16 is reached in the first seconds and still spans both kits.
+TEAM_FIT_AFTER_SAMPLES = 16
 
 
 def extract_jersey_color(frame, x1, y1, x2, y2):
