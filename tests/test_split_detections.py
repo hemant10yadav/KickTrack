@@ -98,3 +98,51 @@ def test_alias_is_revoked_when_the_boxes_come_apart():
     kept = s.update([_box(1221, 664, 1242, 715, 5), _box(1500, 664, 1535, 715, 57)], frame_id=3)
 
     assert sorted(b[4] for b in kept) == [5, 57]
+
+
+# --- Containers (docs/PLAN.md Plan 2.9) ----------------------------------------
+#
+# YOLO26 returns, for two overlapping players, a box for each *and* a box around
+# both. The union is not a third player.
+
+
+def test_container_around_two_bodies_is_dropped():
+    """The real f588 geometry on match_5 with yolo26s: keeper box, defender box
+    below him, and one tall box spanning both."""
+    s = SplitDetectionSuppressor()
+    kept = s.update(
+        [
+            _box(1614, 390, 1643, 486, 9),  # container: keeper + defender
+            _box(1616, 392, 1642, 440, 40),  # keeper
+            _box(1617, 438, 1643, 487, 41),  # defender
+        ],
+        frame_id=1,
+    )
+
+    assert sorted(b[4] for b in kept) == [40, 41]
+    assert s.suppressed_containers == 1
+
+
+def test_one_player_behind_another_is_not_a_container():
+    """A box holding a single shorter box is a player occluded behind another --
+    the Plan 2.7 case that must survive -- not a union of two."""
+    s = SplitDetectionSuppressor()
+    kept = s.update([_box(100, 100, 130, 200, 1), _box(104, 150, 126, 200, 2)], frame_id=1)
+    assert sorted(b[4] for b in kept) == [1, 2]
+    assert s.suppressed_containers == 0
+
+
+def test_container_is_dropped_not_aliased():
+    """Dropping, not aliasing: the container belongs to neither body, so its
+    track must not be rewritten onto one of them."""
+    s = SplitDetectionSuppressor()
+    s.update([_box(1614, 390, 1643, 486, 9)], frame_id=1)
+    s.update(
+        [
+            _box(1614, 390, 1643, 486, 9),
+            _box(1616, 392, 1642, 440, 40),
+            _box(1617, 438, 1643, 487, 41),
+        ],
+        frame_id=2,
+    )
+    assert 9 not in s.alias and 40 not in s.alias and 41 not in s.alias

@@ -307,6 +307,75 @@ Take a fixed-camera football video and show a marker on each player that moves w
         that is flagged occluded, not resolved — there is nothing to resolve it
         with until the detector separates them.
 
+- [X] **Plan 2.9: A Detector That Keeps Two Boxes on Two Bodies**
+
+  Plan 2.8 corrects body swaps after the fact; every one of them began with the
+  detector returning a single box over two overlapping players. This plan asked
+  whether that can be fixed upstream, and measured instead of guessing.
+
+  - [X] **The detector was not the whole story.** Raw v8s detections on the three
+        match_5 merge episodes (no tracker): keeper+defender 16/19 frames with a
+        box per body, blue22+white8 34/34, white17+blue19 24/73. The *tracked*
+        output had 3/19, 29/34 and 1/73. The gap is BoT-SORT's `new_track_thresh`
+        (0.5, raised in Plan 2.5 against churn): the second body's box sits at
+        0.17-0.47 confidence, so no track ever starts for it, and the existing
+        track stays on the tall box that covers both.
+  - [X] **Lowering the threshold is not the answer.** At 0.35 the merges separate
+        earlier (keeper 11/19, hardest pair 23/73) but raw BoT-SORT ids go 63 ->
+        144, minted ids 52 -> 81, and the blue/white probe breaks (the white
+        player keeps getting fresh ids). At 0.25: 177 raw ids, 93 minted, two
+        probes broken. Same conclusion as Plan 2.5, now on the identity layer's
+        stronger footing.
+  - [X] **yolov8m separates no better** (keeper 10/19 raw) at 18.3 vs 11.9ms
+        predict-only. Size is not the lever.
+  - [X] **YOLO26s is.** NMS-free head, exported at the same 640x1152. Raw:
+        19/19, 34/34, 24/73. Tracked, with `botsort_custom.yaml` unchanged:
+        19/19, 34/34 (every frame two boxes, no third), 24/73. Full match_5:
+        raw BoT-SORT ids 76 (v8s 63), minted 46-48 (v8s 50-53), reconciliations
+        3 (14), all ten identity probes correct. YOLO11s separates similarly
+        (19/19, 34/34, 20/73) but mints 58 ids and breaks the blue/white probe.
+  - [X] **Recall verified visually, not by count.** Raw detections of v8s and
+        26s drawn on match_5 f600/f1200 and match_4 f300/f1500: every on-pitch
+        player boxed by v8s is boxed by 26s; the count differences (28 vs 29,
+        26 vs 28, 28 vs 26, 31 vs 32) are v8s's low-confidence duplicate boxes on
+        bodies it already had, and sideline people.
+  - [X] **Latency: +0.5-0.7ms per cycle.** Controlled, same 200 fixture frames,
+        back to back: predict-only 13.0 vs 12.5ms, through `track()` 19.2 vs
+        18.5ms (p95 21.4 vs 20.5). Realtime on the full clip, alternating runs
+        with the machine at load average ~4: 20.2 vs 19.8ms, 26 vs 23 of 1750
+        frames dropped. On a quiet machine v8s ran at 18.8ms with 0 drops
+        (Plan 2.8), so 26s should sit ~19.4ms: under the 20ms budget with less
+        headroom. `test_frame_drop_rate_does_not_regress[match_5]` could not be
+        validated at the time (Chrome pushed the load average to 6-8 and v8s
+        itself failed it at 21.7-22.7ms) -- re-run it on a quiet machine. Side
+        finding: BoT-SORT + sparse-optical-flow GMC costs ~6ms of every cycle on
+        top of inference, for either model; that is the next latency lever.
+  - [X] **Container boxes.** 26s returns, for two overlapping players, a box
+        each *and* a box around both, on 35/1439 realtime frames (v8s: 6). Three
+        detections for two people; the union carried a third marker (and, at
+        f588-592, the keeper's own established track). `SplitDetectionSuppressor`
+        now drops a box holding two clearly shorter boxes; the track it carried
+        is reconciled onto the right body by the identity layer from that body's
+        own box. A box holding one shorter box (a player behind another) is
+        untouched. Realtime match_5 with 26s + this rule: 32 containers dropped
+        (4 borderline ones remain), 42 ids minted (v8s 50-53), 7
+        reconciliations, all ten probes correct. Three synthetic tests in
+        `tests/test_split_detections.py`.
+  - [X] **Export gotcha.** coremltools 9.0 cannot convert YOLO11/26 under the
+        project's numpy 2.5 (`int()` on a 1-element array, then a const of Vars);
+        ultralytics itself warns it wants numpy<=2.3.5. Exporting inside
+        `uv run --with "numpy==2.3.5"` works and leaves the project env and
+        lockfile untouched. The v8 exports never hit those ops.
+  - [ ] **Still merged: two bodies directly in line.** The white17+blue19 pair
+        stays one box for ~46 frames with every model tried (one player almost
+        fully behind the other). That is a detector limit at this resolution; the
+        identity layer's swallowed-player handling (Plan 2.8) covers it after
+        they part.
+  - [ ] **Not tried: a football-specific fine-tune** (e.g. the Roboflow
+        football-players-detection set). Worth it only if in-line merges turn
+        out to matter for Plan 3 numbers; those frames are already flagged
+        occluded and excluded from position samples.
+
 - [ ] **Plan 3: Player & Match Analytics**
 
   - [ ] `PlayerState`: per-track position (pitch-relative, once calibration exists),

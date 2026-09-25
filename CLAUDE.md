@@ -11,7 +11,7 @@ classification by jersey color, and the tracking pipeline is now latency-optimiz
 on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone checklist.
 
 ## Tech stack
-- **CV/Tracking**: Python, Ultralytics YOLO (`yolov8m.mlpackage`, CoreML), BoT-SORT tracker
+- **CV/Tracking**: Python, Ultralytics YOLO (`yolo26s.mlpackage`, CoreML), BoT-SORT tracker
 - **Package management**: `uv` (not pip/venv directly) — see `pyproject.toml`, lockfile is `uv.lock`
 - **Backend (scaffolded, not yet the active focus)**: FastAPI, `app/main.py`
 - **Hardware target**: Apple Silicon (M3 Pro) — inference runs on the Neural Engine via
@@ -81,6 +81,24 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   `INFERENCE_IMGSZ` must stay in sync with whatever shape the model was last
   exported at. Export command:
   `model.export(format="coreml", imgsz=(640, 1152), half=True)`.
+
+- **YOLO26s, not yolov8s/v8m** (`docs/PLAN.md` Plan 2.9): every body swap in
+  Plan 2.8 started with one detection box over two overlapping players. Measured
+  on the three match_5 merge episodes, v8s often *does* return the second body,
+  but at a confidence below BoT-SORT's `new_track_thresh` (0.5), so no track ever
+  starts; lowering that threshold trades merges for churn (raw ids 63 -> 144),
+  and v8m separates no better. YOLO26s (NMS-free head, same 640x1152 export)
+  keeps two tracked boxes on 19/19 keeper+defender frames (v8s 3/19), 34/34
+  blue+white frames (29/34) and 24/73 of the hardest pair (1/73), mints fewer
+  ids, passes every hand-checked identity probe, and has equal visual recall on
+  spot frames of match_4/match_5, for ~+0.4ms per cycle. It also returns a
+  *container* box around two overlapping players alongside their own boxes on
+  ~2% of frames; `SplitDetectionSuppressor` drops those. Export needs the numpy
+  version ultralytics pins (coremltools 9.0 breaks under the project's numpy
+  2.5), without touching the project env:
+  `uv run --with "numpy==2.3.5" python -c "from ultralytics import YOLO; YOLO('yolo26s.pt').export(format='coreml', imgsz=(640, 1152), half=True)"`
+  (`yolo26s.pt` comes from the `v8.4.0` release of `ultralytics/assets`; use
+  `aria2c` on this network, the built-in downloader is very slow).
   (Int8 quantization would cut latency further but needs a new `scikit-learn`
   dependency for ultralytics' CoreML k-means quantization path — not added
   without checking first, see "Working conventions" below.)
@@ -169,7 +187,7 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   `MotionExtrapolator`, `DisplaySmoother`, `FadeController`, `FramePacer`,
   `StalenessTracker`/`WorkerStats`/`DisplayStats`
 - `scripts/botsort_custom.yaml` — tracker tuning
-- `yolov8m.mlpackage` — the CoreML-exported model actually used at runtime (gitignored,
+- `yolo26s.mlpackage` — the CoreML-exported model actually used at runtime (gitignored,
   like other `.pt`/model weight files — regenerate with the export command above)
 - `data/videos/` — test footage (`match_1.mp4`, `match_2.mp4`, `match_3.mp4`)
 - `docs/PLAN.md` — milestone checklist, updated as work progresses

@@ -122,16 +122,27 @@ class SplitDetectionSuppressor:
 
     Which track survives is decided by age, not size. Size is not evidence: the
     established track was the *smaller* box in 42 of those 114 pairs.
+
+    The opposite phantom is a **container**: one box around two overlapping
+    players *alongside* a box for each of them (YOLO26 returns all three on
+    ~2% of match_5 frames, v8s rarely). Two bodies plus their union is three
+    detections for two people. The container is dropped outright rather than
+    aliased: it belongs to neither body, and whichever track it carried is
+    reconciled onto the right body by PlayerIdentityManager from that body's
+    own box (position + jersey), which is exactly the case that layer exists for.
     """
 
     CONTAINMENT = 0.9  # intersection as a fraction of the smaller box
     EDGE_TOLERANCE = 0.05  # top/bottom agreement, as a fraction of the smaller box's height
+    HELD_INSIDE = 0.7  # a body counts as held by a container when this much of it is inside
+    HELD_MAX_HEIGHT = 0.85  # ...and it is clearly shorter than the container (not a split)
 
     def __init__(self):
         self.first_seen: dict[int, int] = {}
         self.alias: dict[int, int] = {}  # phantom track_id -> the track it is part of
         self.suppressed_detections = 0
         self.suppressed_tracks: dict[int, int] = {}
+        self.suppressed_containers = 0
 
     def update(self, detections: list, frame_id: int) -> list:
         """Returns detections with split boxes collapsed and phantom track_ids
@@ -174,7 +185,25 @@ class SplitDetectionSuppressor:
                 continue
             seen.add(canonical)
             kept.append((x1, y1, x2, y2, canonical))
-        return kept
+        containers = [box for box in kept if self._holds_two(box, kept)]
+        self.suppressed_containers += len(containers)
+        return [box for box in kept if box not in containers]
+
+    def _holds_two(self, box, boxes) -> bool:
+        """True when `box` holds at least two other, clearly shorter boxes: a
+        union of two bodies, not a third body. A single held box is a player
+        standing behind another and is left alone."""
+        x1, y1, x2, y2, _ = box
+        height = max(1, y2 - y1)
+        held = 0
+        for ox1, oy1, ox2, oy2, _ in boxes:
+            if (ox1, oy1, ox2, oy2) == (x1, y1, x2, y2):
+                continue
+            if (oy2 - oy1) >= self.HELD_MAX_HEIGHT * height:
+                continue
+            inside = _intersection(box, (ox1, oy1, ox2, oy2)) / max(1, _area((ox1, oy1, ox2, oy2)))
+            held += inside >= self.HELD_INSIDE
+        return held >= 2
 
     def _resolve(self, track_id: int) -> int:
         seen = set()
@@ -199,7 +228,8 @@ class SplitDetectionSuppressor:
     def summary(self) -> str:
         return (
             f"Split detections collapsed (one body, two boxes): "
-            f"{self.suppressed_detections} across {len(self.suppressed_tracks)} track(s)"
+            f"{self.suppressed_detections} across {len(self.suppressed_tracks)} track(s); "
+            f"container boxes dropped (two bodies, three boxes): {self.suppressed_containers}"
         )
 
 
