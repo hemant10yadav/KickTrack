@@ -40,15 +40,23 @@ STREAM_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")  # e.g. rtmp://, 
 
 PERSON_CLASS_ID = 0  # COCO class id for "person"
 TRACKER_CONFIG = str(Path(__file__).parent / "botsort_custom.yaml")
-MODEL_NAME = "yolov8s.mlpackage"
-# Switched from yolov8m: at the same 640x1152 rect imgsz, v8s cuts inference from
-# ~24ms to ~18ms avg on match_5.mp4 (50fps, 20ms budget) -- enough to clear the
-# budget outright instead of just narrowing the shortfall, eliminating match_5's
-# frame drops entirely (was 33% before the device="mps" fix, ~19-27% after it,
-# 0% with v8s). Verified visually (not just box-count) across match_4/match_5 spot
-# frames: every on-pitch player caught by v8m was also caught by v8s; box-count
-# differences were sideline/crowd false positives, same pattern already seen with
-# the rect-imgsz change above -- never a missed player.
+MODEL_NAME = "yolo26s.mlpackage"
+# Switched from yolov8s (docs/PLAN.md Plan 2.9): the swaps of Plan 2.8 all began
+# with the detector returning one box over two overlapping bodies, and for two of
+# the three match_5 episodes v8s *did* also return the second body -- at a
+# confidence BoT-SORT's new_track_thresh (0.5) never starts a track for.
+# Lowering that threshold trades merges for churn (raw ids 63 -> 144 on match_5),
+# and yolov8m separates no better. YOLO26s (NMS-free head) keeps two *tracked*
+# boxes on 19/19 keeper+defender frames (v8s: 3/19), 34/34 blue+white frames
+# (29/34) and 24/73 of the hardest pair (1/73) with the tracker config unchanged,
+# mints fewer ids (46-48 vs 50-53) and passes every hand-checked identity probe.
+# Visual recall on spot frames of match_4/match_5 is equal (every on-pitch player
+# v8s boxes, 26s boxes; v8s's extra boxes were low-confidence duplicates).
+# Cost: ~+0.4ms/cycle (predict-only 12.4 vs 11.9ms; realtime worker 20.2 vs
+# 19.8ms on a loaded machine, 26 vs 23 frames dropped) -- inside run-to-run noise.
+# Earlier history, still true of the size choice: v8s over v8m at this imgsz cut
+# inference ~24 -> ~18ms and cleared match_5's 20ms budget; every on-pitch
+# player caught by v8m was also caught by v8s (verified visually).
 # (height, width): matches the 16:9 aspect ratio of the actual footage instead of
 # padding to a square, and is smaller than the original 1280 square export.
 # Verified visually (not just by box-count) on both a 1080p 50fps clip
