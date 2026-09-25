@@ -4,6 +4,7 @@ import time
 import cv2
 import numpy as np
 
+from scripts.analytics import PITCH_LENGTH_M, PITCH_WIDTH_M, render_pitch
 from scripts.calibration import PITCH_LINES
 from scripts.player import TeamClassifier
 
@@ -42,7 +43,9 @@ class MarkerRenderer:
         self.classifier = classifier
         self.anchor_positions = {}  # track_id -> (tip_x, tip_y) floats
 
-    def draw(self, frame, boxes, alphas=None):
+    def draw(self, frame, boxes, alphas=None, captions=None):
+        """captions: optional track_id -> short text drawn under the ID label
+        (the running distance covered, in the live view)."""
         current_ids = set()
         for x1, y1, x2, y2, track_id in boxes:
             if track_id < 0:
@@ -55,7 +58,8 @@ class MarkerRenderer:
             tip = self._smoothed_tip(track_id, x1, y1, x2, y2)
             bbox_height = y2 - y1
             self._draw_marker(frame, tip, bbox_height, color, alpha)
-            self._draw_label(frame, x1, tip, bbox_height, track_id, color)
+            caption = None if captions is None else captions.get(track_id)
+            self._draw_label(frame, x1, tip, bbox_height, track_id, color, caption)
         self._prune_anchors(current_ids)
 
     def _color_for(self, track_id):
@@ -125,23 +129,99 @@ class MarkerRenderer:
         )
         cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0, dst=roi)
 
-    def _draw_label(self, frame, x1, tip, bbox_height, track_id, color):
+    def _draw_label(self, frame, x1, tip, bbox_height, track_id, color, caption=None):
         half_width = int(
             np.clip(
                 bbox_height * self.HALF_WIDTH_FROM_HEIGHT, self.MIN_HALF_WIDTH, self.MAX_HALF_WIDTH
             )
         )
         pin_height = int(half_width * self.PIN_HEIGHT_RATIO)
+        baseline = max(0, tip[1] - pin_height - 6)
         cv2.putText(
             frame,
             f"ID {track_id}",
-            (x1, max(0, tip[1] - pin_height - 6)),
+            (x1, baseline),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             color,
             2,
             lineType=cv2.LINE_AA,
         )
+        if caption:
+            # Above the ID so the pin keeps its clear gap to the player's head;
+            # white so it reads on every kit colour.
+            cv2.putText(
+                frame,
+                caption,
+                (x1, max(0, baseline - 16)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (255, 255, 255),
+                1,
+                lineType=cv2.LINE_AA,
+            )
+
+
+class PitchMinimap:
+    """A small top-down pitch in a corner of the live frame with a dot per
+    player at their calibrated pitch position (from MatchAnalytics'
+    latest_positions -- the same gated samples the heatmaps are built from),
+    coloured by team and labelled with the player's id so a dot can be matched
+    to the marker on the video. The pitch itself is rendered once and blended
+    in per frame; only the dots are drawn per frame.
+    """
+
+    SCALE = 3  # px per metre: 315x204 for a 105x68 pitch
+    MARGIN = 12
+    ALPHA = 0.85
+    DOT_RADIUS = 4
+
+    def __init__(self):
+        self.pitch = render_pitch(self.SCALE)
+
+    def draw(self, frame, positions: dict, team_of, team_color) -> None:
+        """positions: player_id -> (x_m, y_m); team_of(id) -> team or None;
+        team_color(team) -> BGR or None."""
+        h, w = frame.shape[:2]
+        ph, pw = self.pitch.shape[:2]
+        if ph + 2 * self.MARGIN > h or pw + 2 * self.MARGIN > w:
+            return
+        panel = self.pitch.copy()
+        for player_id, (x, y) in positions.items():
+            px = int((x + PITCH_LENGTH_M / 2) * self.SCALE)
+            py = int((y + PITCH_WIDTH_M / 2) * self.SCALE)
+            if not (0 <= px < pw and 0 <= py < ph):
+                continue
+            team = team_of(player_id)
+            color = team_color(team) if team is not None else None
+            color = UNCLASSIFIED_COLOR if color is None else color
+            cv2.circle(panel, (px, py), self.DOT_RADIUS + 1, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+            cv2.circle(panel, (px, py), self.DOT_RADIUS, color, -1, lineType=cv2.LINE_AA)
+            cv2.putText(
+                panel,
+                str(player_id),
+                (px + self.DOT_RADIUS + 1, py + 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.32,
+                (255, 255, 255),
+                1,
+                lineType=cv2.LINE_AA,
+            )
+        if not positions:
+            cv2.putText(
+                panel,
+                "no calibrated positions",
+                (8, 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+                lineType=cv2.LINE_AA,
+            )
+        y0, x0 = h - self.MARGIN - ph, w - self.MARGIN - pw
+        region = frame[y0 : y0 + ph, x0 : x0 + pw]
+        cv2.addWeighted(panel, self.ALPHA, region, 1 - self.ALPHA, 0, dst=region)
+        cv2.rectangle(frame, (x0 - 1, y0 - 1), (x0 + pw, y0 + ph), (255, 255, 255), 1)
 
 
 class PitchOverlayRenderer:

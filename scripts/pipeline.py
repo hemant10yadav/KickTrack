@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from scripts.analytics import MatchAnalytics
 from scripts.calibration import (
     CalibrationWorker,
     HomographyPropagator,
@@ -23,6 +24,7 @@ from scripts.display import (
     FramePacer,
     MarkerRenderer,
     MotionExtrapolator,
+    PitchMinimap,
     PitchOverlayRenderer,
     StalenessTracker,
 )
@@ -426,17 +428,21 @@ class PlayerTracker:
         show_window: bool = True,
         output_path: str | None = None,
         realtime: bool = True,
+        analytics_dir: str | None = None,
     ):
         self.video_source = video_source
         self.model = model
         self.show_window = show_window
         self.output_path = output_path
         self.realtime = realtime
+        self.analytics_dir = analytics_dir
+        self.analytics = None  # MatchAnalytics, created once the video's fps is known
         self.writer = None
         self.classifier = TeamClassifier()
         self.resolver = IdentityResolver(self.classifier)
         self.renderer = MarkerRenderer(self.classifier)
         self.pitch_overlay = PitchOverlayRenderer()
+        self.minimap = PitchMinimap()
         self.extrapolator = MotionExtrapolator()
         self.smoother = DisplaySmoother()
         self.fader = FadeController()
@@ -454,6 +460,7 @@ class PlayerTracker:
     def run(self):
         cap = self._open_capture()
         pacer = FramePacer(fps=cap.get(cv2.CAP_PROP_FPS) or 25)
+        self.analytics = MatchAnalytics(fps=1000 / pacer.frame_budget_ms)
         if self.output_path:
             self.writer = self._open_writer(cap, pacer.frame_budget_ms)
         self._warmup()
@@ -487,6 +494,12 @@ class PlayerTracker:
             print(self.staleness.summary())
             print()
             print(self.display_stats.summary())
+            print()
+            self.analytics.finish()
+            print(self.analytics.summary())
+            if self.analytics_dir:
+                self.analytics.write(self.analytics_dir, team_color=self._team_color)
+                print(f"Analytics written to {self.analytics_dir}/")
             print()
             if self.latest_calibration is not None:
                 print(
@@ -537,6 +550,17 @@ class PlayerTracker:
         self.homography_worker.submit(frame, self.frame_count)
         self.current_homography, _ = self.homography_worker.get_latest()
 
+    def _distance_captions(self, boxes) -> dict:
+        captions = {}
+        for *_, track_id in boxes:
+            distance = self.analytics.distance_of(track_id)
+            if distance is not None:
+                captions[track_id] = f"{distance:.0f}m"
+        return captions
+
+    def _team_color(self, team: int):
+        return self.classifier.team_color(team) if self.classifier.centers is not None else None
+
     def _open_writer(self, cap: cv2.VideoCapture, frame_budget_ms: float) -> cv2.VideoWriter:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -569,6 +593,16 @@ class PlayerTracker:
                 calibration_worker.submit(frame.copy(), self.frame_count)
             result = self.resolver.resolve(worker.get_result())
             self._update_calibration(calibration_worker, frame)
+            # Once per new worker result (record() ignores repeats), in video
+            # time, from the confirmed boxes -- not the extrapolated/smoothed
+            # ones drawn on screen, which are display estimates.
+            self.analytics.record(
+                result.frame_id,
+                result.boxes,
+                self.resolver.identity.occluded_player_ids,
+                self.current_homography,
+                self.classifier.team_for,
+            )
             t2 = time.perf_counter()
             now = time.perf_counter()
             self.staleness.record(self.frame_count, result.frame_id, result.captured_at)
@@ -577,7 +611,10 @@ class PlayerTracker:
             boxes = self.smoother.smooth(boxes)
             alphas = self.fader.update(boxes, result.coasting_progress)
             self.pitch_overlay.draw(frame, self.current_homography)
-            self.renderer.draw(frame, boxes, alphas)
+            self.renderer.draw(frame, boxes, alphas, captions=self._distance_captions(boxes))
+            self.minimap.draw(
+                frame, self.analytics.latest_positions, self.classifier.team_for, self._team_color
+            )
             t3 = time.perf_counter()
             if self.show_window:
                 self.fps_overlay.draw(frame, native_fps=1000 / pacer.frame_budget_ms)

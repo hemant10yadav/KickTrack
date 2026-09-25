@@ -51,6 +51,12 @@ def parse_args():
         "--show is also passed.",
     )
     parser.add_argument(
+        "--analytics-dir",
+        default=None,
+        help="Write per-player/team heatmap PNGs and stats.json (distance covered, "
+        "top speed, time tracked) to this directory at the end of the run.",
+    )
+    parser.add_argument(
         "--show",
         action="store_true",
         help="Display a live window. Implied when --output is not given.",
@@ -77,6 +83,7 @@ def main():
         show_window=show_window,
         output_path=args.output,
         realtime=show_window,
+        analytics_dir=args.analytics_dir,
     ).run()
 
 
