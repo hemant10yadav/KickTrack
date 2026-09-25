@@ -133,13 +133,9 @@ Take a fixed-camera football video and show a marker on each player that moves w
         the same geometry merged when teams match; an ordering that defeats greedy
         matching; velocity freeze; occluded-player reporting). `test_tracking_quality.py`
         churn ceilings unchanged on match_3/4/5.
-  - [ ] **Not yet covered: a swap where both tracks stay alive.** Everything above
-        acts on reconciliation, which only runs for unmapped track_ids. If BoT-SORT
-        keeps both tracks through the crossing and simply exchanges the bodies, no
-        reconciliation happens and nothing here fires. Detecting that needs a
-        per-track motion-consistency check (a discontinuity in one track mirrored
-        by the inverse in another), and measuring it needs hand-labeled crossing
-        events — the synthetic tests can't tell us the real rate.
+  - [X] **A swap where both tracks stay alive — fixed in Plan 2.8 below.** Everything
+        above acts on reconciliation, which only runs for unmapped track_ids; the
+        swaps actually on match_5 never produce one.
   - [X] **Duplicate boxes on one player — fixed in Plan 2.7 below.**
   - [ ] **Not yet measured on real footage.** The counters above show the
         machinery firing, not that it fires *correctly*: `switch_log` counts
@@ -195,6 +191,121 @@ Take a fixed-camera football video and show a marker on each player that moves w
         When the leg-extended box is the established track, the player's bbox
         centre is pulled sideways by the leg. Harmless for identity, but Plan 3
         should take position from the box bottom-centre rather than its centroid.
+
+- [X] **Plan 2.8: Body Swaps on Live Tracks (appearance-anchored identity)**
+
+  The user reported the goalkeeper's ID walking off with a player who came near
+  him on match_5.mp4, and outfield IDs swapping when players came together.
+  A drop-free per-frame dump of the pipeline (raw BoT-SORT boxes + jersey color
+  per box) found both, frame-exact, and neither is a crossing in the Plan 2.6
+  sense: the detector returned **one box covering two bodies**, BoT-SORT kept its
+  `track_id` on that box, and when the box shrank back it was on the *other*
+  body. No track went lost, so nothing in Plan 2.6 could fire.
+
+  - f586-595: one tall box spans the orange goalkeeper and a white defender
+    standing in front of him; f596 the box (still track 10) shrinks onto the
+    defender; f600 the goalkeeper gets a brand-new track 40 -> new player id.
+  - f1607-1636: blue player 22 and white player 8 run together; f1629 track 22's
+    box is on the white body; f1633 the blue body gets track 69 -> new id; f1637
+    track 8 dies. Net: the blue player's whole history now belongs to the white
+    one.
+  - f172: a third pair (17 white, 19 blue) whose tracks BoT-SORT exchanged with
+    *both* alive — the case Plan 2.6 listed as not covered.
+
+  - [X] **Anchor every identity to a jersey color.** `PlayerState.appearance` is a
+        slow EMA (0.9) of the torso color on trusted sightings. `JerseySampler`
+        (replacing `TeamGate`) samples each box once per cycle; cost measured at
+        ~0.4ms per cycle for all boxes, worker total unchanged (20.7ms avg on
+        match_5).
+  - [X] **Relative jersey test, not an absolute threshold.** A sighting is a
+        *mismatch* only when it is >40 BGR units from its own player *and* some
+        other known player's appearance is at least 2x nearer (`_wears_another_jersey`).
+        match_5 same-body noise is p99 ~20-35 with kits ~75 apart (blue/white)
+        and ~190 (goalkeeper/white), but match_4 is far noisier (p95 40-90:
+        shadows, crowd behind the crop, and a yellow kit that the grass mask
+        half-eats). An absolute threshold there minted 212 ids instead of 155 and
+        made 106 spurious "corrections"; the relative test brought it to 150/22.
+        A color that is itself pitch green (`is_grass_color`) is no jersey at all
+        and is dropped by `extract_jersey_color`.
+  - [X] **Suspect tracks re-enter the joint assignment.** After 3 consecutive
+        judged mismatches a live track becomes a row next to the unmapped ones,
+        with its own player and the recently-lost players as candidates, so a
+        both-alive exchange resolves as one Hungarian solution. Cost is
+        normalized position + a capped color term; a transfer away from an
+        established owner needs cost <= 2.0 (unmapped: 3.0).
+  - [X] **Young identities yield.** The abandoned body usually gets a fresh
+        track a few cycles *before* the stolen one is caught (t69 at f1633 vs.
+        t22 suspect at f1640), so an identity minted within the last 20 cycles is
+        re-examined whenever a suspect or a just-lost player exists, and is
+        retired if an established player fits its box.
+  - [X] **An established owner only yields when its body is accounted for.**
+        A box that swallowed a second body can read as the other jersey for as
+        long as they overlap (match_4: white hidden behind yellow), and nothing
+        says which body the track follows when they part — acting then produced
+        oscillating transfers and one permanent swap. A suspect transfer is
+        therefore only accepted if the displaced owner is claimed by another row
+        of the *same* assignment (`_drop_unaccounted_transfers`): the stolen
+        track's old body, now detected on its own. That makes the fix
+        evidence-driven — never earlier than the moment the second body shows up.
+  - [X] **Color is only judged on single-body boxes.** Not while overlapping
+        another live detection, not when >1.3x taller than the player, and not
+        when wide/tall enough (1.4x) to hold the owner plus a swallowed lost
+        player. A merged box's color is a blend and says nothing about ownership.
+  - [X] **A swallowed player stays pending and rides inside the box.** Before,
+        the "swallowed" flag only lasted the cycle a track vanished, so a merged
+        box was treated as clean from the second frame on, and the swallowed
+        player expired after 30 cycles even though the box holding them was still
+        there (the 17/19 merge lasted ~70 frames and moved 80px). Now a lost
+        player covered by a live box keeps `last_seen_frame` fresh and its
+        position follows that box, so it is matched where the merge ends.
+        Merged boxes are flagged occluded for their whole duration
+        (`occluded_player_ids`), which is what Plan 3 analytics should key off.
+  - [X] **Identity resolution moved off the inference thread.** The first
+        version ran all of this inside `InferenceWorker`, and the ~0.7ms it
+        added per cycle (jersey sampling ~0.25ms, occlusion bookkeeping, the
+        assignment) was enough to matter: on the 10s match_5 fixture inference
+        alone averages 19.9ms of the 20ms budget, and worker drops went 24/502
+        (4.8%, already at the 5% ceiling) -> 38/502 (7.7%). Two things fixed
+        it. The pairwise-overlap bookkeeping was vectorized (`pairwise_overlap`,
+        one numpy op instead of ~700 Python `boxes_overlap` calls; that loop was
+        72% of the identity layer's time) and the torso median uses
+        `np.partition` (half the cost of `np.median` on tiny crops). Then the
+        whole step — split suppression, identity, jersey sampling, confirm/grace
+        state — became `IdentityResolver`, run on the *display* thread once per
+        new worker result: that thread idles ~13ms per frame, and the worker
+        now does only inference + box extraction. Full match_5 realtime: worker
+        drops 90 -> **0**, worker total 21.1 -> 18.8ms avg; resolution costs the
+        display loop ~2ms per new result (3 of 1750 frames over the 20ms display budget). The 10s
+        fixture: 13-20/502 drops, under the baseline's 24.
+  - [X] **Measured.** Drop-free replay of match_5: goalkeeper keeps id 10 at
+        f300/650/1000; blue/white keep 22/8 at f1600 and f1660; 17/19 come apart
+        as 17/19 at f1748. 52 ids minted (was 53), 13 corrections. Realtime CLI
+        run (paced, 0 frames dropped): same probes all correct, 52 ids, 14
+        corrections. match_4 (drop-free): 150 ids (was 155), 22 corrections —
+        spot-checked strips (f132, f410, f1571) are right or restore an earlier
+        silent swap. match_3: unchanged, 0 corrections. Full slow suite (fps,
+        drop rate, id ceilings, correction ceilings on all three clips) passes.
+  - [X] Tests: `tests/test_identity_replay.py` replays a recorded fixture
+        (`tests/fixtures/match_5_tracks.jsonl.gz`, 380KB: raw boxes + colors for
+        all 1750 frames) through the real split/identity/team code with no YOLO
+        or video, and pins the three hand-checked pairs above — fast and
+        deterministic, unlike the realtime slow tests. `tests/test_player_identity.py`
+        gained jersey-gate cases (another player's jersey refused, same jersey
+        merged, odd lighting alone still merged). `test_no_tracker_id_changes_owner`
+        is gone: a track changing owner is now by construction a logged
+        correction, replaced by a bounded-corrections ceiling per clip.
+  - [ ] **Known limit: unclaimed deviations are adopted after 30 cycles.** A
+        track whose color disagrees with its player for 30 judged cycles with no
+        candidate to claim the old body adopts the new color as a lighting
+        change (`ACCEPT_DEVIATION_AFTER`). On match_4 this legitimized at least
+        one swap the machinery never got evidence for (a yellow player's id ending
+        on a white body around f1571). Raising it risks freezing on real lighting
+        changes; the right fix is an appearance descriptor less sensitive to
+        shadow (chromaticity rather than BGR), measured on match_4.
+  - [ ] **Known limit: a merged box carries one id.** While two bodies share
+        one detection the box is shown under whichever id owned it going in;
+        that is flagged occluded, not resolved — there is nothing to resolve it
+        with until the detector separates them.
 
 - [ ] **Plan 3: Player & Match Analytics**
 

@@ -27,11 +27,11 @@ from scripts.display import (
     StalenessTracker,
 )
 from scripts.player import (
+    JerseySampler,
     PlayerIdentityManager,
     SplitDetectionSuppressor,
     StateManager,
     TeamClassifier,
-    TeamGate,
     boxes_overlap,
     extract_jersey_color,
 )
@@ -131,6 +131,17 @@ def extract_boxes(results):
 
 
 @dataclass
+class RawDetections:
+    """What the inference thread publishes: this cycle's BoT-SORT boxes and the
+    frame they came from (identity resolution samples jersey colors off it)."""
+
+    boxes: list
+    frame: np.ndarray | None
+    frame_id: int | None
+    captured_at: float | None
+
+
+@dataclass
 class InferenceResult:
     boxes: list
     frame_id: int
@@ -142,9 +153,8 @@ class InferenceResult:
 
 class WorkerStats:
     """Breaks down where worker time actually goes: pure YOLO+tracker inference vs.
-    total per-frame processing (inference + jersey color extraction + team
-    classification), plus how many submitted frames the latest-frame buffer ended up
-    dropping before the worker could get to them.
+    box extraction vs. whatever is left, plus how many submitted frames the
+    latest-frame buffer ended up dropping before the worker could get to them.
     """
 
     def __init__(self):
@@ -152,24 +162,18 @@ class WorkerStats:
         self.frames_skipped = 0
         self.inference_ms = []
         self.extract_ms = []
-        self.jersey_ms = []
         self.residual_ms = []
         self.total_ms = []
-        self.boxes_seen = 0
-        self.jersey_extractions = 0
 
     def record_submit(self, was_pending_overwritten: bool):
         self.frames_submitted += 1
         if was_pending_overwritten:
             self.frames_skipped += 1
 
-    def record_processed(
-        self, inference_ms: float, extract_ms: float, jersey_ms: float, total_ms: float
-    ):
+    def record_processed(self, inference_ms: float, extract_ms: float, total_ms: float):
         self.inference_ms.append(inference_ms)
         self.extract_ms.append(extract_ms)
-        self.jersey_ms.append(jersey_ms)
-        self.residual_ms.append(total_ms - inference_ms - extract_ms - jersey_ms)
+        self.residual_ms.append(total_ms - inference_ms - extract_ms)
         self.total_ms.append(total_ms)
 
     def summary(self) -> str:
@@ -180,26 +184,21 @@ class WorkerStats:
             f"Frames processed by worker: {frames_processed}",
         ]
         if frames_processed:
-
-            def stat(name, values):
-                arr = np.array(values)
-                return f"{name}: avg={arr.mean():.1f} min={arr.min():.1f} max={arr.max():.1f}"
-
             inf = np.array(self.inference_ms)
             lines.append(
                 f"YOLO+tracker inference latency (ms): avg={inf.mean():.1f} "
                 f"min={inf.min():.1f} max={inf.max():.1f}"
             )
             lines.append(f"Effective inference FPS: {1000 / inf.mean():.1f}")
-            lines.append(stat("extract_boxes (ms)", self.extract_ms))
-            lines.append(stat("jersey extraction loop (ms)", self.jersey_ms))
-            lines.append(stat("residual/unaccounted (ms)", self.residual_ms))
-            lines.append(stat("Worker total latency (ms)", self.total_ms))
-            lines.append(
-                f"Jersey extractions: {self.jersey_extractions}/{self.boxes_seen} boxes seen "
-                f"({100 * self.jersey_extractions / max(1, self.boxes_seen):.1f}%)"
-            )
+            lines.append(_stat("extract_boxes (ms)", self.extract_ms))
+            lines.append(_stat("residual/unaccounted (ms)", self.residual_ms))
+            lines.append(_stat("Worker total latency (ms)", self.total_ms))
         return "\n".join(lines)
+
+
+def _stat(name, values):
+    arr = np.array(values)
+    return f"{name}: avg={arr.mean():.1f} min={arr.min():.1f} max={arr.max():.1f}"
 
 
 class InferenceWorker:
@@ -212,28 +211,21 @@ class InferenceWorker:
     how many milliseconds) old the boxes it's currently displaying are, and also
     extrapolate player motion forward using the two most recent results (see
     MotionExtrapolator).
+
+    This thread does *only* inference and box extraction. Everything that turns
+    raw BoT-SORT boxes into players (IdentityResolver) runs on the consumer's
+    thread: on the 10s match_5 fixture inference alone averages 19.9ms of a 20ms
+    budget, and the ~0.7ms of identity work pushed the drop rate from 4.8% to
+    7.7% here, while the display thread idles ~13ms per frame.
     """
 
-    def __init__(self, model: YOLO, classifier: TeamClassifier):
+    def __init__(self, model: YOLO):
         self.model = model
-        self.classifier = classifier
         self.lock = threading.Lock()
         self.pending = None  # (frame, frame_id, captured_at)
-        self.latest = InferenceResult(
-            boxes=[],
-            frame_id=None,
-            captured_at=None,
-            previous_boxes=[],
-            previous_captured_at=None,
-            coasting_progress={},
-        )
+        self.latest = RawDetections(boxes=[], frame=None, frame_id=None, captured_at=None)
         self.running = True
         self.stats = WorkerStats()
-        self.state = StateManager()
-        self.identity = PlayerIdentityManager()
-        self.splits = SplitDetectionSuppressor()
-        self.cycle_count = 0
-        self.jersey_last_sampled = {}
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -249,7 +241,7 @@ class InferenceWorker:
             self.stats.record_submit(was_pending_overwritten=self.pending is not None)
             self.pending = (frame, frame_id, time.perf_counter())
 
-    def get_result(self) -> InferenceResult:
+    def get_result(self) -> RawDetections:
         with self.lock:
             return self.latest
 
@@ -269,54 +261,123 @@ class InferenceWorker:
             extract_start = time.perf_counter()
             boxes = extract_boxes(results)
             extract_ms = (time.perf_counter() - extract_start) * 1000
-            self.cycle_count += 1
-            # Collapse one-body-two-boxes detections before anything keys an
-            # identity off them, or that player is tracked and counted twice.
-            boxes = self.splits.update(boxes, self.cycle_count)
-            # Reconcile BoT-SORT's own transient track_id into a persistent player_id
-            # (see PlayerIdentityManager) before anything downstream (team
-            # classification, confirm/grace display state) keys off it. The team
-            # gate lets that reconciliation refuse a cross-team merge outright.
-            boxes = self.identity.update(boxes, self.cycle_count, TeamGate(self.classifier, frame))
-
-            jersey_start = time.perf_counter()
-            for i, (x1, y1, x2, y2, track_id) in enumerate(boxes):
-                self.stats.boxes_seen += 1
-                if track_id < 0:
-                    continue
-                if not self._should_sample_jersey(track_id):
-                    continue
-                if self._overlaps_another(boxes, i):
-                    continue
-                self.stats.jersey_extractions += 1
-                color = extract_jersey_color(frame, x1, y1, x2, y2)
-                self.classifier.observe(track_id, color)
-            jersey_ms = (time.perf_counter() - jersey_start) * 1000
 
             total_ms = (time.perf_counter() - total_start) * 1000
-            self.stats.record_processed(inference_ms, extract_ms, jersey_ms, total_ms)
-
-            confirmed_boxes = self.state.update(boxes)
-            coasting_progress = {
-                track_id: min(1.0, miss_count / self.state.GRACE_CYCLES)
-                for track_id, miss_count in self.state.miss_counts.items()
-                if miss_count > 0
-            }
+            self.stats.record_processed(inference_ms, extract_ms, total_ms)
 
             with self.lock:
-                self.latest = InferenceResult(
-                    boxes=confirmed_boxes,
-                    frame_id=frame_id,
-                    captured_at=captured_at,
-                    previous_boxes=self.latest.boxes,
-                    previous_captured_at=self.latest.captured_at,
-                    coasting_progress=coasting_progress,
+                self.latest = RawDetections(
+                    boxes=boxes, frame=frame, frame_id=frame_id, captured_at=captured_at
                 )
 
     def _take_pending(self):
         with self.lock:
             pending, self.pending = self.pending, None
             return pending
+
+
+class ResolverStats:
+    """Where IdentityResolver's time goes per worker cycle: split suppression +
+    identity reconciliation vs. the jersey-color sampling loop."""
+
+    def __init__(self):
+        self.identity_ms = []
+        self.jersey_ms = []
+        self.boxes_seen = 0
+        self.jersey_extractions = 0
+
+    def record(self, identity_ms: float, jersey_ms: float):
+        self.identity_ms.append(identity_ms)
+        self.jersey_ms.append(jersey_ms)
+
+    def summary(self) -> str:
+        if not self.identity_ms:
+            return "Identity resolution: no worker result was ever resolved"
+        return "\n".join(
+            [
+                _stat("split suppression + identity (ms)", self.identity_ms),
+                _stat("jersey extraction loop (ms)", self.jersey_ms),
+                f"Jersey extractions: {self.jersey_extractions}/{self.boxes_seen} boxes seen "
+                f"({100 * self.jersey_extractions / max(1, self.boxes_seen):.1f}%)",
+            ]
+        )
+
+
+class IdentityResolver:
+    """Turns one cycle of raw BoT-SORT boxes into confirmed, persistently
+    identified players: split-detection suppression, track_id -> player_id
+    reconciliation (PlayerIdentityManager), jersey sampling for team
+    classification, and confirm/grace visibility state. Runs once per *new*
+    worker result, on whichever thread consumes results -- the display loop --
+    so none of it competes with inference for the worker's frame budget.
+    """
+
+    def __init__(self, classifier: TeamClassifier):
+        self.classifier = classifier
+        self.state = StateManager()
+        self.identity = PlayerIdentityManager()
+        self.splits = SplitDetectionSuppressor()
+        self.stats = ResolverStats()
+        self.cycle_count = 0
+        self.jersey_last_sampled = {}
+        self.latest = InferenceResult(
+            boxes=[],
+            frame_id=None,
+            captured_at=None,
+            previous_boxes=[],
+            previous_captured_at=None,
+            coasting_progress={},
+        )
+
+    def resolve(self, raw: RawDetections) -> InferenceResult:
+        """Returns the resolved result for `raw`; a result already resolved (the
+        worker has not produced a new one since) is returned as is."""
+        if raw.frame_id is None or raw.frame_id == self.latest.frame_id:
+            return self.latest
+        frame = raw.frame
+        self.cycle_count += 1
+
+        identity_start = time.perf_counter()
+        # Collapse one-body-two-boxes detections before anything keys an
+        # identity off them, or that player is tracked and counted twice.
+        boxes = self.splits.update(raw.boxes, self.cycle_count)
+        # Reconcile BoT-SORT's own transient track_id into a persistent player_id
+        # (see PlayerIdentityManager) before anything downstream (team
+        # classification, confirm/grace display state) keys off it. The jersey
+        # sampler lets it anchor each identity to the color it was seen in.
+        boxes = self.identity.update(boxes, self.cycle_count, JerseySampler(frame))
+        identity_ms = (time.perf_counter() - identity_start) * 1000
+
+        jersey_start = time.perf_counter()
+        for i, (x1, y1, x2, y2, track_id) in enumerate(boxes):
+            self.stats.boxes_seen += 1
+            if track_id < 0:
+                continue
+            if not self._should_sample_jersey(track_id):
+                continue
+            if self._overlaps_another(boxes, i):
+                continue
+            self.stats.jersey_extractions += 1
+            color = extract_jersey_color(frame, x1, y1, x2, y2)
+            self.classifier.observe(track_id, color)
+        jersey_ms = (time.perf_counter() - jersey_start) * 1000
+        self.stats.record(identity_ms, jersey_ms)
+
+        confirmed_boxes = self.state.update(boxes)
+        coasting_progress = {
+            track_id: min(1.0, miss_count / self.state.GRACE_CYCLES)
+            for track_id, miss_count in self.state.miss_counts.items()
+            if miss_count > 0
+        }
+        self.latest = InferenceResult(
+            boxes=confirmed_boxes,
+            frame_id=raw.frame_id,
+            captured_at=raw.captured_at,
+            previous_boxes=self.latest.boxes,
+            previous_captured_at=self.latest.captured_at,
+            coasting_progress=coasting_progress,
+        )
+        return self.latest
 
     def _overlaps_another(self, boxes, index) -> bool:
         x1, y1, x2, y2, _ = boxes[index]
@@ -343,7 +404,8 @@ class PlayerTracker:
 
     Detection/tracking runs on a background thread (see InferenceWorker) so
     display always paces at the video's real frame rate, independent of how
-    long a single inference call takes.
+    long a single inference call takes. Each new worker result is turned into
+    identified players here, on the display thread (see IdentityResolver).
     """
 
     WINDOW_NAME = "Football Tracker"
@@ -364,6 +426,7 @@ class PlayerTracker:
         self.realtime = realtime
         self.writer = None
         self.classifier = TeamClassifier()
+        self.resolver = IdentityResolver(self.classifier)
         self.renderer = MarkerRenderer(self.classifier)
         self.pitch_overlay = PitchOverlayRenderer()
         self.extrapolator = MotionExtrapolator()
@@ -387,7 +450,7 @@ class PlayerTracker:
             self.writer = self._open_writer(cap, pacer.frame_budget_ms)
         self._warmup()
 
-        worker = InferenceWorker(self.model, self.classifier).start()
+        worker = InferenceWorker(self.model).start()
         calibration_worker = CalibrationWorker(PitchCalibrator).start()
         self.homography_worker.start()
         self.play_start = time.perf_counter()
@@ -409,8 +472,9 @@ class PlayerTracker:
             print()
             print(worker.stats.summary())
             print()
-            print(worker.splits.summary())
-            print(worker.identity.summary())
+            print(self.resolver.stats.summary())
+            print(self.resolver.splits.summary())
+            print(self.resolver.identity.summary())
             print()
             print(self.staleness.summary())
             print()
@@ -478,6 +542,9 @@ class PlayerTracker:
         calibration_worker: CalibrationWorker,
         pacer: FramePacer,
     ):
+        # The display thread has ~13ms of slack per frame at 50fps (see
+        # DisplayStats), so resolving identities here costs playback nothing,
+        # whereas on the worker it came straight out of the inference budget.
         while True:
             iteration_start = time.perf_counter()
             self.fps_overlay.tick(iteration_start)
@@ -492,7 +559,7 @@ class PlayerTracker:
             worker.submit(frame.copy(), self.frame_count)
             if calibration_worker.is_keyframe(self.frame_count):
                 calibration_worker.submit(frame.copy(), self.frame_count)
-            result = worker.get_result()
+            result = self.resolver.resolve(worker.get_result())
             self._update_calibration(calibration_worker, frame)
             t2 = time.perf_counter()
             now = time.perf_counter()

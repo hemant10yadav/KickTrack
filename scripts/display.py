@@ -349,8 +349,9 @@ class StalenessTracker:
 
 class DisplayStats:
     """Times each segment of the main display loop (frame read, submitting to the
-    worker, drawing markers, cv2.imshow, and the pacer's wait) so we can see exactly
-    where main-thread time goes, rather than assuming it's all in one place.
+    worker plus resolving its latest result into identified players, drawing
+    markers, cv2.imshow, and the pacer's wait) so we can see exactly where
+    main-thread time goes, rather than assuming it's all in one place.
     """
 
     def __init__(self):
@@ -383,7 +384,7 @@ class DisplayStats:
 
         lines = [
             stat("read (ms)", self.read_ms),
-            stat("submit (ms)", self.submit_ms),
+            stat("submit + resolve identities (ms)", self.submit_ms),
             stat("draw (extrapolate+render) (ms)", self.draw_ms),
             stat("imshow (ms)", self.imshow_ms),
             stat("wait (ms)", self.wait_ms),

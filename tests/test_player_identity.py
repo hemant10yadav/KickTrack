@@ -7,6 +7,8 @@ box loses its BoT-SORT track for a single frame and reappears under a brand-new
 track_id a few pixels away (track 95 -> 159, see docs/PLAN.md Plan 3.5).
 """
 
+import numpy as np
+
 from scripts.player import PlayerIdentityManager
 
 
@@ -112,18 +114,20 @@ def test_lost_player_is_eventually_retired():
 # would quietly attribute one player's distance/heatmap to the other.
 
 
-class FakeTeamGate:
-    """Stand-in for the real TeamGate: fixed team per player_id and per box x-center."""
+class FakeSampler:
+    """Stand-in for the real JerseySampler: a fixed raw jersey color per box x-center."""
 
-    def __init__(self, by_player=None, by_box_center=None):
-        self.by_player = by_player or {}
-        self.by_box_center = by_box_center or {}
+    def __init__(self, color_by_box_center=None):
+        self.color_by_box_center = color_by_box_center or {}
 
-    def of_player(self, player_id):
-        return self.by_player.get(player_id)
+    def color_of(self, bbox):
+        color = self.color_by_box_center.get((bbox[0] + bbox[2]) // 2)
+        return None if color is None else np.array(color, dtype=float)
 
-    def of_box(self, bbox):
-        return self.by_box_center.get((bbox[0] + bbox[2]) // 2)
+
+WHITE = (230, 238, 238)
+BLUE = (216, 204, 165)  # match_5's sky-blue kit, ~75 BGR units from white
+ORANGE = (84, 130, 228)  # match_5's goalkeeper, ~190 from white
 
 
 def test_crossing_players_keep_their_identities():
@@ -158,30 +162,54 @@ def test_crossing_players_keep_their_identities():
     assert by_center[175] == player_b, "the left-hand box is the player who was moving left"
 
 
-def test_different_team_is_never_merged():
-    """A lost player and a nearby new detection wearing the *other* team's colors
-    cannot be the same person -- the merge must be refused outright."""
+def test_another_players_jersey_is_never_merged():
+    """A lost player and a nearby new detection wearing a jersey that clearly
+    belongs to some *other* known player cannot be the same person -- the
+    merge must be refused outright."""
     identity = PlayerIdentityManager()
-    gate = FakeTeamGate(by_player={1: 0}, by_box_center={115: 1})
-    identity.update([_box(100, 100, 130, 160, 1)], frame_id=1, team_gate=gate)
+    sampler = FakeSampler({115: BLUE, 515: WHITE})
+    identity.update([_box(100, 100, 130, 160, 1), _box(500, 100, 530, 160, 2)], 1, sampler)
 
-    (r,) = identity.update([_box(100, 100, 130, 160, 2)], frame_id=2, team_gate=gate)
+    # track 1 (blue) vanishes; a white box appears exactly where it was
+    sampler = FakeSampler({115: WHITE, 515: WHITE})
+    results = identity.update(
+        [_box(100, 100, 130, 160, 3), _box(500, 100, 530, 160, 2)], 2, sampler
+    )
 
-    assert len(identity.players) == 2, "a cross-team merge must mint a new player instead"
-    assert not identity.switch_log
-    assert identity.team_blocked_merges == 1
+    assert len(identity.players) == 3, "a cross-jersey merge must mint a new player instead"
+    assert results[0][4] != 1
+    assert identity.jersey_blocked_merges >= 1
 
 
-def test_same_team_nearby_detection_is_still_merged():
-    """Control for the test above: identical geometry, same team -> merged."""
+def test_same_jersey_nearby_detection_is_still_merged():
+    """Control for the test above: identical geometry, same jersey -> merged."""
     identity = PlayerIdentityManager()
-    gate = FakeTeamGate(by_player={1: 0}, by_box_center={115: 0})
-    identity.update([_box(100, 100, 130, 160, 1)], frame_id=1, team_gate=gate)
+    sampler = FakeSampler({115: BLUE, 515: WHITE})
+    identity.update([_box(100, 100, 130, 160, 1), _box(500, 100, 530, 160, 2)], 1, sampler)
 
-    (r,) = identity.update([_box(100, 100, 130, 160, 2)], frame_id=2, team_gate=gate)
+    results = identity.update(
+        [_box(100, 100, 130, 160, 3), _box(500, 100, 530, 160, 2)], 2, sampler
+    )
 
-    assert len(identity.players) == 1
-    assert r[4] == 1
+    assert len(identity.players) == 2
+    assert results[0][4] == 1
+
+
+def test_odd_lighting_alone_does_not_block_a_merge():
+    """A color far from the player's own jersey but resembling nobody else's is
+    noise (shadow, crowd behind the crop), not evidence of another person --
+    match_4-style footage produces this constantly and must still reconcile."""
+    identity = PlayerIdentityManager()
+    sampler = FakeSampler({115: BLUE, 515: WHITE})
+    identity.update([_box(100, 100, 130, 160, 1), _box(500, 100, 530, 160, 2)], 1, sampler)
+
+    sampler = FakeSampler({115: (120, 120, 120), 515: WHITE})  # grey: like no kit here
+    results = identity.update(
+        [_box(100, 100, 130, 160, 3), _box(500, 100, 530, 160, 2)], 2, sampler
+    )
+
+    assert results[0][4] == 1
+    assert len(identity.players) == 2
 
 
 def test_reappearances_are_assigned_jointly_not_greedily():

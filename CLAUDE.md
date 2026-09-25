@@ -42,7 +42,13 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   `scripts/track_players.py`) runs YOLO continuously on the latest available frame and
   drops stale ones. The main thread only reads/displays/paces — never blocks on AI —
   so playback stays smooth at the cost of markers lagging the true position by ~1
-  inference cycle (imperceptible for player movement speeds).
+  inference cycle (imperceptible for player movement speeds). The worker does
+  *only* inference + box extraction: turning raw boxes into players
+  (`IdentityResolver` in `scripts/pipeline.py`: split suppression, identity,
+  jersey sampling, confirm/grace state) runs on the display thread once per new
+  result, because on a 50fps clip inference alone fills the 20ms budget and even
+  ~0.7ms of extra worker-side work measurably raised the frame-drop rate
+  (`docs/PLAN.md` Plan 2.8), while the display thread idles ~13ms per frame.
 
 - **`uv` package management, `pyproject.toml` pinned to macOS** (`tool.uv.environments`
   restricted to `sys_platform == 'darwin'`) — avoids cross-platform dependency
@@ -91,15 +97,34 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   equally on clean 25fps footage with no async frame-dropping at all — not
   caused by the imgsz work above. Fixed at two levels (see `docs/PLAN.md` Plan
   2.5 for the full numbers): `botsort_custom.yaml` thresholds tuned to reduce
-  churn at the source, plus `PlayerIdentityManager` in `track_players.py` as an
-  app-level safety net that reconciles a freshly-appearing `track_id` against
-  recently-lost players (predicted position + bbox-size gate) before anything
-  downstream (team classification, display confirm/grace state) keys off it.
-  Ruled out: async frame-dropping itself (a synchronous, drop-free feed churned
-  *worse*), GMC (only a partial contributor), appearance ReID (only a partial
-  fix, added cost and an auto-downloaded model). Covered by
-  `tests/test_player_identity.py` (fast/synthetic) and
-  `tests/test_tracking_quality.py` (slow, real-footage regression ceilings).
+  churn at the source, plus `PlayerIdentityManager` in `scripts/player.py` as
+  an app-level safety net that reconciles a freshly-appearing `track_id`
+  against recently-lost players (predicted position + bbox-size gate) before
+  anything downstream (team classification, display confirm/grace state) keys
+  off it. Ruled out: async frame-dropping itself (a synchronous, drop-free feed
+  churned *worse*), GMC (only a partial contributor), appearance ReID (only a
+  partial fix, added cost and an auto-downloaded model).
+
+- **Identity is anchored to jersey color, because BoT-SORT swaps bodies without
+  ever losing a track** (`docs/PLAN.md` Plan 2.8): the swaps seen on `match_5`
+  (goalkeeper's id walking off with a defender, a blue player's id ending on a
+  white one) all came from the detector returning one box over two bodies —
+  BoT-SORT keeps its `track_id` on that box and it shrinks back onto the *other*
+  body. No lost track, so reconciliation never runs. `PlayerIdentityManager`
+  therefore carries an appearance per player, judges every clean single-body
+  sighting against it with a *relative* test (far from its own player *and*
+  clearly nearer some other known player's jersey — absolute thresholds fail on
+  noisier footage like `match_4`), and puts a suspect live track back into the
+  same joint assignment as the unmapped ones. An established owner only gives
+  its track up when another row of that assignment takes the owner (its old
+  body detected on its own) — acting on a merged box's blended color earlier
+  than that was measured to oscillate and to lock in a wrong swap. Verify any
+  change here three ways: the drop-free replay test
+  (`tests/test_identity_replay.py`, recorded fixture, fast), the realtime CLI
+  (paced, drops frames — a fix that only holds in `--output` mode is not a fix),
+  and frame strips around every logged correction (`swap_log`), never counters
+  alone. A per-frame dump of raw boxes + colors is the fastest way to iterate:
+  the whole identity layer can be re-run on it in seconds without YOLO.
 
 - **Async inference worker keeps latest + previous result, not just latest**: enables
   `MotionExtrapolator` to estimate each track's velocity and shift its displayed
@@ -129,10 +154,17 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
 ## File layout
 - `scripts/track_players.py` — thin CLI entrypoint (`parse_args`, `main`)
 - `scripts/pipeline.py` — video source resolution, raw YOLO/BoT-SORT detection,
-  the background `InferenceWorker`, and the top-level `PlayerTracker` orchestrator
+  the background `InferenceWorker`, the display-thread `IdentityResolver` that
+  turns its raw boxes into identified players, and the top-level `PlayerTracker`
+  orchestrator
 - `scripts/player.py` — everything "what is a player": `TeamClassifier` (jersey
   color → team), `StateManager` (confirm/grace visibility), `PlayerIdentityManager`
-  (persistent `player_id` across BoT-SORT `track_id` churn)
+  (persistent `player_id` across BoT-SORT `track_id` churn *and* across the body
+  swaps BoT-SORT makes without losing a track), `SplitDetectionSuppressor`
+- `tests/fixtures/match_5_tracks.jsonl.gz` — recorded raw boxes + jersey colors
+  for every frame of `match_5.mp4`; `tests/test_identity_replay.py` replays it
+  through the identity layer in ~2s with no model or video (the fast way to
+  check any identity change against real footage before a realtime run)
 - `scripts/display.py` — everything "what gets shown on screen": `MarkerRenderer`,
   `MotionExtrapolator`, `DisplaySmoother`, `FadeController`, `FramePacer`,
   `StalenessTracker`/`WorkerStats`/`DisplayStats`
