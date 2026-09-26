@@ -1,12 +1,18 @@
 import math
+import queue
+import shutil
+import subprocess
+import sys
+import threading
 import time
+from collections import deque
 
 import cv2
 import numpy as np
 
 from scripts.analytics import PITCH_LENGTH_M, PITCH_WIDTH_M, render_pitch
 from scripts.calibration import PITCH_LINES
-from scripts.player import TeamClassifier
+from scripts.player import OTHER_TEAM, TeamClassifier
 
 UNCLASSIFIED_COLOR = (180, 180, 180)  # gray, shown before a track has enough samples
 
@@ -179,9 +185,12 @@ class PitchMinimap:
     def __init__(self):
         self.pitch = render_pitch(self.SCALE)
 
-    def draw(self, frame, positions: dict, team_of, team_color) -> None:
+    BALL_COLOR = (0, 255, 255)
+
+    def draw(self, frame, positions: dict, team_of, team_color, ball=None, holder=None) -> None:
         """positions: player_id -> (x_m, y_m); team_of(id) -> team or None;
-        team_color(team) -> BGR or None."""
+        team_color(team) -> BGR or None; ball: BallState or None; holder: the
+        player_id in possession, ringed."""
         h, w = frame.shape[:2]
         ph, pw = self.pitch.shape[:2]
         if ph + 2 * self.MARGIN > h or pw + 2 * self.MARGIN > w:
@@ -195,6 +204,10 @@ class PitchMinimap:
             team = team_of(player_id)
             color = team_color(team) if team is not None else None
             color = UNCLASSIFIED_COLOR if color is None else color
+            if player_id == holder:
+                cv2.circle(
+                    panel, (px, py), self.DOT_RADIUS + 4, self.BALL_COLOR, 2, lineType=cv2.LINE_AA
+                )
             cv2.circle(panel, (px, py), self.DOT_RADIUS + 1, (0, 0, 0), -1, lineType=cv2.LINE_AA)
             cv2.circle(panel, (px, py), self.DOT_RADIUS, color, -1, lineType=cv2.LINE_AA)
             cv2.putText(
@@ -207,6 +220,12 @@ class PitchMinimap:
                 1,
                 lineType=cv2.LINE_AA,
             )
+        if ball is not None:
+            bx = int((ball.x + PITCH_LENGTH_M / 2) * self.SCALE)
+            by = int((ball.y + PITCH_WIDTH_M / 2) * self.SCALE)
+            if 0 <= bx < pw and 0 <= by < ph:
+                cv2.circle(panel, (bx, by), 3, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+                cv2.circle(panel, (bx, by), 2, self.BALL_COLOR, -1, lineType=cv2.LINE_AA)
         if not positions:
             cv2.putText(
                 panel,
@@ -261,46 +280,195 @@ class PitchOverlayRenderer:
         return px, py
 
 
-class MotionExtrapolator:
-    """Shifts each player's last known box forward in time using the velocity
-    estimated between the two most recent AI results, so the displayed marker keeps
-    moving smoothly between inference updates instead of freezing at a stale position.
+class BallRenderer:
+    """The tracked ball on the video (a ring at its pitch position, hollow and
+    dimmer while coasting through a gap), a ring around the player in
+    possession, and the team pass counts in the top-right corner."""
 
-    A max shift cap guards against runaway extrapolation from a noisy velocity
-    estimate (e.g. an ID that just switched, or a very short dt between results).
+    BALL_COLOR = (0, 255, 255)
+    PANEL_MARGIN = 12
+
+    def draw(self, frame, ball_analytics, homography, positions: dict, team_name=str) -> None:
+        """team_name(team) -> the label shown on the panel ("white", "yellow")."""
+        if homography is not None:
+            ball = ball_analytics.ball
+            if ball is not None:
+                point = self._project(homography, ball.x, ball.y, frame.shape)
+                if point is not None:
+                    seen = ball.coasting_s == 0
+                    cv2.circle(frame, point, 9, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+                    cv2.circle(
+                        frame, point, 9, self.BALL_COLOR, 2 if seen else 1, lineType=cv2.LINE_AA
+                    )
+            holder = ball_analytics.holder
+            if holder is not None and holder in positions:
+                x, y = positions[holder]
+                point = self._project(homography, x, y, frame.shape)
+                if point is not None:
+                    cv2.ellipse(
+                        frame, point, (22, 9), 0, 0, 360, self.BALL_COLOR, 2, lineType=cv2.LINE_AA
+                    )
+        self._draw_panel(frame, ball_analytics, team_name)
+
+    PANEL_WIDTH = 260
+
+    def _draw_panel(self, frame, ball_analytics, team_name) -> None:
+        """Completed passes per team, by jersey colour name. The breakdown
+        (short/long/lost) stays in the terminal summary and passes.json."""
+        totals = ball_analytics.passes.team_totals()
+        lines = [
+            f"{team_name(team)} passes: {row['completed']}"
+            for team, row in sorted(totals.items(), key=lambda kv: str(kv[0]))
+            if team is not None and team != OTHER_TEAM
+        ]
+        if not lines:
+            lines = ["no passes yet"]
+        w = frame.shape[1]
+        x0, y0 = w - self.PANEL_MARGIN - self.PANEL_WIDTH, self.PANEL_MARGIN
+        height = 26 * len(lines) + 10
+        overlay = frame[y0 : y0 + height, x0 : x0 + self.PANEL_WIDTH]
+        cv2.addWeighted(np.zeros_like(overlay), 0.55, overlay, 0.45, 0, dst=overlay)
+        for i, text in enumerate(lines):
+            cv2.putText(
+                frame,
+                text,
+                (x0 + 8, y0 + 26 * (i + 1)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+                lineType=cv2.LINE_AA,
+            )
+
+    @staticmethod
+    def _project(homography, x, y, shape):
+        point = homography @ np.array([x, y, 1.0])
+        if abs(point[2]) < 1e-6:
+            return None
+        px, py = point[0] / point[2], point[1] / point[2]
+        h, w = shape[:2]
+        if not (-50 <= px <= w + 50 and -50 <= py <= h + 50):
+            return None
+        return int(px), int(py)
+
+
+class ResultTimeline:
+    """Places each player's box on the exact frame being displayed, from the
+    last few resolved AI results, in video time (frame ids).
+
+    A frame that has AI results on both sides -- which PlaybackDelay arranges
+    by holding frames back -- gets its boxes interpolated between them, so the
+    marker sits on the player in that very frame. A frame newer than every
+    result (no delay, or the worker fell behind) gets them extrapolated from
+    the two newest results, clamped, so markers keep moving between inference
+    cycles instead of freezing -- what MotionExtrapolator did from wall-clock
+    time, which was only right while playback was paced.
     """
+
+    HISTORY = 16  # results kept: ~0.3-0.6s at 25-50 results/s, well past any sane delay
 
     def __init__(self, max_shift_px=120):
         self.max_shift_px = max_shift_px
+        self.results = deque(maxlen=self.HISTORY)
+        self.synced_frames = 0
+        self.extrapolated_frames = 0
 
-    def extrapolate(self, result: "InferenceResult", now: float):  # noqa: F821 -- pipeline.InferenceResult; string to avoid a circular import (pipeline.py imports this module)
-        if result.captured_at is None or result.previous_captured_at is None:
-            return result.boxes
+    def add(self, result: "InferenceResult") -> None:  # noqa: F821 -- pipeline.InferenceResult; string to avoid a circular import (pipeline.py imports this module)
+        if result.frame_id is None:
+            return
+        if self.results and result.frame_id <= self.results[-1].frame_id:
+            return  # already added (the worker has no newer result yet)
+        self.results.append(result)
 
-        dt = result.captured_at - result.previous_captured_at
-        elapsed = now - result.captured_at
-        if dt <= 0 or elapsed <= 0:
-            return result.boxes
+    def boxes_at(self, frame_id: int):
+        """(boxes, coasting_progress, synced) for `frame_id`; synced is False
+        when the boxes were extrapolated ahead of every result."""
+        if not self.results:
+            return [], {}, False
+        before = next((r for r in reversed(self.results) if r.frame_id <= frame_id), None)
+        after = next((r for r in self.results if r.frame_id >= frame_id), None)
+        if after is not None:
+            self.synced_frames += 1
+            if before is None or before is after:
+                return after.boxes, after.coasting_progress, True
+            t = (frame_id - before.frame_id) / (after.frame_id - before.frame_id)
+            return self._interpolate(before, after, t), after.coasting_progress, True
 
-        previous_by_id = {
-            track_id: (x1, y1, x2, y2) for x1, y1, x2, y2, track_id in result.previous_boxes
-        }
+        self.extrapolated_frames += 1
+        latest = self.results[-1]
+        if len(self.results) < 2:
+            return latest.boxes, latest.coasting_progress, False
+        extrapolated = self._extrapolate(self.results[-2], latest, frame_id)
+        return extrapolated, latest.coasting_progress, False
 
-        extrapolated = []
-        for x1, y1, x2, y2, track_id in result.boxes:
-            previous = previous_by_id.get(track_id)
-            if previous is None:
-                extrapolated.append((x1, y1, x2, y2, track_id))
+    def summary(self) -> str:
+        total = self.synced_frames + self.extrapolated_frames
+        if not total:
+            return "Markers: no frames displayed with AI results"
+        return (
+            f"Markers on their own frame's detections (interpolated): "
+            f"{self.synced_frames}/{total}; extrapolated ahead of the newest result: "
+            f"{self.extrapolated_frames}/{total}"
+        )
+
+    @staticmethod
+    def _interpolate(before, after, t: float):
+        before_by_id = {box[4]: box for box in before.boxes}
+        boxes = []
+        for box in after.boxes:
+            start = before_by_id.get(box[4])
+            if start is None:
+                boxes.append(box)  # appeared since `before`: nothing to ease from
                 continue
+            boxes.append(
+                (
+                    *(int(round(s + (e - s) * t)) for s, e in zip(start[:4], box[:4], strict=True)),
+                    box[4],
+                )
+            )
+        return boxes
 
-            px1, py1, _, _ = previous
-            shift_x = self._clamp((x1 - px1) / dt * elapsed)
-            shift_y = self._clamp((y1 - py1) / dt * elapsed)
-            extrapolated.append((x1 + shift_x, y1 + shift_y, x2 + shift_x, y2 + shift_y, track_id))
-        return extrapolated
+    def _extrapolate(self, previous, latest, frame_id: int):
+        frames = latest.frame_id - previous.frame_id
+        ahead = frame_id - latest.frame_id
+        previous_by_id = {box[4]: box for box in previous.boxes}
+        boxes = []
+        for x1, y1, x2, y2, track_id in latest.boxes:
+            start = previous_by_id.get(track_id)
+            if start is None:
+                boxes.append((x1, y1, x2, y2, track_id))
+                continue
+            shift_x = self._clamp((x1 - start[0]) / frames * ahead)
+            shift_y = self._clamp((y1 - start[1]) / frames * ahead)
+            boxes.append((x1 + shift_x, y1 + shift_y, x2 + shift_x, y2 + shift_y, track_id))
+        return boxes
 
     def _clamp(self, shift: float) -> int:
         return int(max(-self.max_shift_px, min(self.max_shift_px, shift)))
+
+
+class PlaybackDelay:
+    """Holds each frame back a fixed number of frames before it is drawn and
+    shown, so by then the AI result for that frame (or one each side of it)
+    has usually arrived and ResultTimeline can put markers exactly where the
+    players are in it, instead of trailing them by an inference cycle. The
+    whole picture is late by the delay; nothing is dropped, and playback
+    still paces at the source rate. delay_frames=0 shows every frame as read.
+    """
+
+    def __init__(self, delay_frames: int):
+        self.delay_frames = max(0, delay_frames)
+        self.frames = deque()  # (frame, frame_id), oldest first
+
+    def push(self, frame, frame_id: int) -> None:
+        self.frames.append((frame, frame_id))
+
+    def pop(self, flush: bool = False):
+        """The next (frame, frame_id) to show, or None while still filling;
+        flush=True (the source has ended) empties the buffer regardless."""
+        if self.frames and (flush or len(self.frames) > self.delay_frames):
+            return self.frames.popleft()
+        return None
 
 
 class DisplaySmoother:
@@ -321,7 +489,10 @@ class DisplaySmoother:
     def __init__(self):
         self.positions = {}  # track_id -> (x1, y1, x2, y2) floats
 
-    def smooth(self, boxes):
+    def smooth(self, boxes, ease: bool = True):
+        """ease=False snaps every box to its target (still tracking it for the
+        next frame): boxes interpolated onto their own frame are already
+        exact, and easing them would only add back a frame of lag."""
         current_ids = set()
         smoothed = []
         for x1, y1, x2, y2, track_id in boxes:
@@ -332,7 +503,7 @@ class DisplaySmoother:
             current_ids.add(track_id)
             target = (float(x1), float(y1), float(x2), float(y2))
             previous = self.positions.get(track_id)
-            if previous is None or self._jumped(previous, target):
+            if not ease or previous is None or self._jumped(previous, target):
                 eased = target
             else:
                 eased = tuple(
@@ -578,3 +749,111 @@ class FramePacer:
             return cv2.waitKey(wait_ms) & 0xFF
         time.sleep(wait_ms / 1000)
         return -1
+
+
+class RawVideoPipe:
+    """Hands annotated frames to an ffmpeg-family child process as raw BGR
+    video on its stdin. A writer thread does the piping, so the display
+    thread only enqueues; the child does the expensive part in its own
+    process -- encoding, or putting pixels on screen.
+    """
+
+    QUEUE_FRAMES = 8
+
+    def __init__(self, command: list[str]):
+        if shutil.which(command[0]) is None:
+            sys.exit(f"{command[0]} not found on PATH (brew install ffmpeg)")
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE)
+        self.frames = queue.Queue(maxsize=self.QUEUE_FRAMES)
+        self.closed = False  # the child exited (e.g. its window was closed)
+        self.thread = threading.Thread(target=self._pipe, daemon=True)
+        self.thread.start()
+
+    @staticmethod
+    def raw_input_args(width: int, height: int, fps: float) -> list[str]:
+        return [
+            "-f", "rawvideo", "-pixel_format", "bgr24",
+            "-video_size", f"{width}x{height}", "-framerate", f"{fps:g}",
+            "-i", "-",
+        ]  # fmt: skip
+
+    def write(self, frame: np.ndarray) -> None:
+        """Blocks only if the child falls QUEUE_FRAMES behind, so a file is
+        never missing frames; the caller must not draw on `frame` afterwards."""
+        self.frames.put(frame)
+
+    def release(self) -> None:
+        self.frames.put(None)
+        self.thread.join()
+        try:
+            self.process.stdin.close()
+        except BrokenPipeError:
+            pass
+        self.process.wait()
+
+    def _pipe(self) -> None:
+        while (frame := self.frames.get()) is not None:
+            if self.closed:
+                continue  # keep draining so write() never blocks on a dead child
+            try:
+                self.process.stdin.write(memoryview(np.ascontiguousarray(frame)))
+            except BrokenPipeError:
+                self.closed = True
+
+
+class FfmpegOutput(RawVideoPipe):
+    """Encodes annotated frames with Apple's hardware H.264 encoder, to a
+    file or a live stream URL (rtmp://, srt://, udp://, rtsp://).
+    cv2.VideoWriter's mp4v took 10.6ms per 4K frame on the display thread;
+    here the encode runs on the media engine, in ffmpeg's process.
+    """
+
+    STREAM_FORMATS = {
+        "rtmp": "flv",
+        "rtmps": "flv",
+        "srt": "mpegts",
+        "udp": "mpegts",
+        "rtsp": "rtsp",
+    }
+    BITS_PER_PIXEL = 0.1  # ~10 Mbit/s at 1080p50
+
+    def __init__(self, target: str, width: int, height: int, fps: float):
+        bitrate = int(width * height * fps * self.BITS_PER_PIXEL)
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            *self.raw_input_args(width, height, fps),
+            "-c:v", "h264_videotoolbox", "-b:v", str(bitrate), "-pix_fmt", "yuv420p",
+            "-g", str(round(fps * 2)),  # a keyframe every 2s, so stream viewers can join
+        ]  # fmt: skip
+        scheme = target.split("://", 1)[0].lower() if "://" in target else None
+        if scheme in self.STREAM_FORMATS:
+            command += ["-f", self.STREAM_FORMATS[scheme]]
+        super().__init__([*command, target])
+
+
+class FfplayViewer(RawVideoPipe):
+    """Shows annotated frames in an ffplay window instead of cv2.imshow. On
+    macOS, cv2.waitKey costs ~14-18ms per call whatever the frame size (540p
+    to 1080p; 30ms at 4K) -- it waits on the window's repaint -- which caps
+    the display loop near 40fps on a 50fps source. ffplay draws on the GPU
+    in its own process, so the loop only enqueues the frame and paces with a
+    plain sleep. Closing the window (or q in it) ends playback.
+    """
+
+    def __init__(self, title: str, width: int, height: int, fps: float):
+        super().__init__(
+            [
+                "ffplay",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-window_title",
+                title,
+                "-autoexit",  # else it idles on after the last frame
+                "-fflags",
+                "nobuffer",
+                "-flags",
+                "low_delay",
+                *self.raw_input_args(width, height, fps),
+            ]  # fmt: skip
+        )

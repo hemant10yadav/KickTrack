@@ -4,7 +4,47 @@ import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-NUM_TEAM_CLUSTERS = 3  # 2 teams + referee/other
+# Colour groups on a pitch: two kits, the keepers, the officials. Fitting only
+# three (the original "2 teams + other") merged the two *kits* on match_5, where
+# the orange keeper and stewards formed the third group and sky blue / white were
+# the closest pair -- every outfield marker went grey (docs/PLAN.md Plan 3.1).
+NUM_TEAM_CLUSTERS = 4
+MIN_KIT_SEPARATION = 40.0  # clusters closer than this (BGR) are one kit under two lights
+OTHER_TEAM = 2  # team id for everyone who is not in one of the two biggest groups
+OTHER_TEAM_NAME = "others"
+
+
+def color_name(bgr) -> str:
+    """A plain jersey colour name for a BGR value, so a team can be called
+    "white" or "yellow" on screen instead of a cluster number. Decided in HSV:
+    little saturation is white / grey / black by brightness, otherwise the hue
+    band; a light, weakly saturated blue is "sky blue" (match_5's kit)."""
+    b, g, r = (float(v) for v in bgr)
+    hsv = cv2.cvtColor(np.uint8([[[int(b), int(g), int(r)]]]), cv2.COLOR_BGR2HSV)[0, 0]
+    hue, sat, val = int(hsv[0]) * 2, int(hsv[1]) / 255, int(hsv[2]) / 255  # hue in degrees
+    if sat < 0.18:
+        if val > 0.75:
+            return "white"
+        return "black" if val < 0.3 else "grey"
+    if sat < 0.35 and val > 0.7 and 175 <= hue <= 260:
+        return "sky blue"
+    if hue < 15 or hue >= 340:
+        return "red"
+    if hue < 40:
+        return "orange"
+    if hue < 70:
+        return "yellow"
+    if hue < 165:
+        return "green"
+    if hue < 205:
+        return "sky blue" if val > 0.7 else "teal"
+    if hue < 260:
+        return "blue"
+    if hue < 300:
+        return "purple"
+    return "pink"
+
+
 GRASS_HSV_LOW, GRASS_HSV_HIGH = (35, 40, 40), (85, 255, 255)  # OpenCV HSV range of pitch green
 # Distinct tracks (each with a few samples) seen before the team clusters are
 # fit and frozen. Was 25: with the yolov8 tracker that arrived within seconds
@@ -260,6 +300,7 @@ class TeamClassifier:
         self.min_observations_before_fit_eligible = min_observations_before_fit_eligible
         self.smoothing = smoothing
         self.centers = None
+        self.cluster_team = []  # cluster index -> team id, set when fit
         self.track_colors = {}
         self.observation_counts = {}
 
@@ -280,18 +321,33 @@ class TeamClassifier:
         return self.team_for_color(self.track_colors.get(track_id))
 
     def team_for_color(self, color):
-        """Nearest fixed cluster center for an already-sampled color. Separate
-        from team_for so a color sampled outside the per-track history (a
-        not-yet-identified box being reconciled) can be classified too."""
+        """Team of the nearest fixed cluster center for an already-sampled
+        color: 0 and 1 are the two most populated colour groups (the kits),
+        OTHER_TEAM is everyone else (keepers, officials, staff)."""
         if self.centers is None or color is None:
             return None
         distances = np.linalg.norm(self.centers - color, axis=1)
-        return int(np.argmin(distances))
+        return int(self.cluster_team[int(np.argmin(distances))])
+
+    def team_name(self, team_id: int | None) -> str:
+        """ "white", "yellow", ... from the team's fitted jersey colour; the
+        two teams get distinct names even when both kits read the same."""
+        if team_id is None:
+            return "unknown"
+        if team_id == OTHER_TEAM or self.centers is None:
+            return OTHER_TEAM_NAME
+        names = [color_name(self.team_color(team)) for team in (0, 1)]
+        if names[0] == names[1]:
+            names[team_id] = f"{names[team_id]} ({team_id + 1})"
+        return names[team_id]
 
     def team_color(self, team_id: int):
         """The team's actual average jersey color (BGR), for marker rendering."""
-        b, g, r = self.centers[team_id]
-        return (int(b), int(g), int(r))
+        for cluster, team in enumerate(self.cluster_team):
+            if team == team_id:
+                b, g, r = self.centers[cluster]
+                return (int(b), int(g), int(r))
+        return None
 
     def _try_fit(self):
         """Fit once we've seen enough *distinct* tracks with a stable color estimate
@@ -308,8 +364,38 @@ class TeamClassifier:
 
         data = np.array([self.track_colors[t] for t in eligible_tracks], dtype=np.float32)
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1.0)
-        _, _, centers = cv2.kmeans(data, self.k, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+        k = min(self.k, len(data))
+        _, labels, centers = cv2.kmeans(data, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+        counts = np.bincount(labels.ravel(), minlength=k).astype(float)
+        centers, counts = self._merge_same_kit(centers, counts)
+        # The two most populated groups are the teams; ties in count go to the
+        # lower index so the assignment is deterministic for a given fit.
+        order = np.argsort(-counts, kind="stable")
+        cluster_team = [OTHER_TEAM] * len(centers)
+        for team, cluster in enumerate(order[:2]):
+            cluster_team[int(cluster)] = team
         self.centers = centers
+        self.cluster_team = cluster_team
+
+    def _merge_same_kit(self, centers, counts):
+        """One kit under sun and shade can come out as two clusters ~20-30 BGR
+        apart; distinct kits are 60+ apart. Merge (count-weighted) until every
+        pair is at least MIN_KIT_SEPARATION apart."""
+        centers, counts = [c.astype(float) for c in centers], list(counts)
+        while len(centers) > 1:
+            pairs = [
+                (float(np.linalg.norm(centers[i] - centers[j])), i, j)
+                for i in range(len(centers))
+                for j in range(i + 1, len(centers))
+            ]
+            distance, i, j = min(pairs)
+            if distance >= MIN_KIT_SEPARATION:
+                break
+            total = counts[i] + counts[j]
+            centers[i] = (centers[i] * counts[i] + centers[j] * counts[j]) / total
+            counts[i] = total
+            del centers[j], counts[j]
+        return np.array(centers, dtype=np.float32), np.array(counts)
 
 
 class JerseySampler:

@@ -188,6 +188,9 @@ class PitchCalibrator:
         )
 
 
+CALIBRATOR_READY = "ready"  # the child's first message, once its model is warmed up
+
+
 def _calibration_process_main(
     calibrator_factory: Callable[[], object],
     input_queue: mp.Queue,
@@ -225,6 +228,7 @@ def _calibration_process_main(
     # model. The model always resizes its input to MODEL_INPUT_HW
     # internally, so warmup shape doesn't need to match any real frame.
     calibrator.calibrate(np.zeros((*MODEL_INPUT_HW, 3), dtype=np.uint8))
+    output_queue.put(CALIBRATOR_READY)
     while True:
         item = input_queue.get()
         if item is None:  # stop sentinel, see CalibrationWorker.stop()
@@ -282,15 +286,16 @@ class CalibrationWorker:
         self.latest: CalibrationResult | None = None
         self.latest_frame: np.ndarray | None = None
         self.last_calibrated_frame_id = None
+        # Set by the drain thread; see is_keyframe() for why both gate submits.
+        self.child_ready = False
+        self.in_flight = False
         self.running = True
         self.drain_thread = threading.Thread(target=self._drain, daemon=True)
         # Frames submitted as keyframes, keyed by frame_id, so get_keyframe()
         # can pair a result with its frame without the child process having
         # to send the (large) frame back too -- the parent already has it.
-        # Bounded to a handful of entries: only ever 0-1 submissions are ever
-        # in flight at once (single-slot input_queue), a few extra is just
-        # slack for the rare race between submit() and the drain picking up
-        # the previous result.
+        # Holds at most one entry: a frame is only submitted while none is
+        # in flight (see is_keyframe()).
         self._submitted_frames: dict[int, np.ndarray] = {}
 
     def start(self) -> CalibrationWorker:
@@ -334,25 +339,12 @@ class CalibrationWorker:
         # equivalent lower-resolution one. Not worth the accuracy risk for
         # a performance win -- send the untouched frame.
         original_shape = frame.shape[:2]  # (h, w)
-
-        # "Latest wins": drop any not-yet-picked-up pending frame before
-        # enqueuing this one, so the child process never falls behind
-        # processing frames that are no longer the current keyframe target.
-        # Whatever frame_id that displaces is guaranteed to never be
-        # processed (the child never dequeued it), so its cache entry can
-        # be dropped immediately rather than waiting around.
-        displaced_frame_id = None
-        try:
-            _, displaced_frame_id, _ = self.input_queue.get_nowait()
-        except queue.Empty:
-            pass
         try:
             self.input_queue.put_nowait((frame, frame_id, original_shape))
         except queue.Full:
             return
         with self.lock:
-            if displaced_frame_id is not None:
-                self._submitted_frames.pop(displaced_frame_id, None)
+            self.in_flight = True
             self._submitted_frames[frame_id] = frame
 
     def get_result(self) -> CalibrationResult | None:
@@ -375,6 +367,14 @@ class CalibrationWorker:
         PlayerTracker._play(), which used to copy every single frame for
         this worker even though ~29/30 of those copies were immediately
         discarded by submit()'s own internal check."""
+        # Only an idle child gets a frame. This used to hand one over on every
+        # due frame and pull the previous, still-unstarted one back out of the
+        # queue ("latest wins") -- unpickling a whole frame on the display
+        # thread, on every frame of a 0.3-1.8s calibration: ~26ms per 4K
+        # frame (~6ms at 1080p), 156 of the first 300 frames of a 4K match_5.
+        # An idle child starts on the frame at once, so it is just as fresh.
+        if not self.child_ready or self.in_flight:
+            return False
         if self.last_calibrated_frame_id is None:
             return True
         return frame_id - self.last_calibrated_frame_id >= self.keyframe_interval
@@ -388,10 +388,14 @@ class CalibrationWorker:
                 result = self.output_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
+            if isinstance(result, str) and result == CALIBRATOR_READY:
+                self.child_ready = True
+                continue
             with self.lock:
                 self.latest = result
                 self.latest_frame = self._submitted_frames.pop(result.frame_id, None)
                 self.last_calibrated_frame_id = result.frame_id
+                self.in_flight = False
 
 
 MIN_TRACKED_POINTS = (
@@ -405,9 +409,9 @@ MAX_TRACK_ERROR = (
 class HomographyPropagator:
     """Tracks the pitch homography frame-to-frame between full
     CalibrationWorker recalibrations, using sparse optical flow. Conceptually
-    mirrors MotionExtrapolator's role (scripts/display.py) of turning a
+    mirrors ResultTimeline's role (scripts/display.py) of turning a
     background worker's keyframe-rate results into a per-frame estimate --
-    but unlike MotionExtrapolator (cheap enough to run inline), this runs on
+    but unlike ResultTimeline (cheap enough to run inline), this runs on
     HomographyWorker's background thread (below), not the main thread
     directly: see HomographyWorker's docstring for why.
 

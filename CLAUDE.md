@@ -144,16 +144,25 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   alone. A per-frame dump of raw boxes + colors is the fastest way to iterate:
   the whole identity layer can be re-run on it in seconds without YOLO.
 
-- **Async inference worker keeps latest + previous result, not just latest**: enables
-  `MotionExtrapolator` to estimate each track's velocity and shift its displayed
-  position forward by however long it's been since the last AI result, so markers
-  keep moving smoothly between inference cycles instead of freezing at a stale
-  position. `StalenessTracker` and `WorkerStats`/`DisplayStats` (in
-  `scripts/track_players.py`) instrument exactly where time goes (inference vs.
-  box-extraction vs. jersey-color sampling vs. display-loop segments) — always
-  measure before optimizing here; two prior "obvious" fixes (jersey-extraction
-  throttling, a display busy-wait spin) turned out to be non-issues or unnecessary
-  once actually measured.
+- **Markers are placed on the frame being shown, from a short result history**
+  (`ResultTimeline` in `scripts/display.py`): the display holds each frame back
+  `--display-delay-ms` (default 100ms, `PlaybackDelay`) so AI results usually exist
+  on both sides of it and its boxes are interpolated onto that exact frame; a frame
+  newer than every result gets them extrapolated from the two newest, so markers
+  never freeze between inference cycles. Both run in video time (frame ids), not
+  wall-clock time. `StalenessTracker` and `WorkerStats`/`DisplayStats` instrument
+  exactly where time goes (inference vs. box-extraction vs. jersey-color sampling
+  vs. display-loop segments) — always measure before optimizing here; two prior
+  "obvious" fixes (jersey-extraction throttling, a display busy-wait spin) turned
+  out to be non-issues or unnecessary once actually measured.
+
+- **Frames are shrunk to `--display-width` (1920) right after decode**
+  (`FrameScaler`, `docs/PLAN.md` Plan 2.10): on a 4K source `cv2.waitKey` repaints the
+  window in ~30ms, over a 50fps clip's whole 20ms budget, while the resize costs
+  0.4ms and the detector sees 1152px wide either way. Only calibration keyframes get
+  the source frame; their homography is rescaled into working pixels. `--output`
+  goes through ffmpeg's `h264_videotoolbox` (`FfmpegOutput`) to a file or a live
+  stream URL (rtmp/srt/udp/rtsp); cv2's `mp4v` writer took 10.6ms per 4K frame.
 
 ## Known gotchas
 - **Safe-chain proxy** wraps `uv`/npm on this machine and can block package resolution
@@ -190,10 +199,17 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   cancelling, `stats.json` + heatmap PNGs via `--analytics-dir`). See
   `docs/PLAN.md` Plan 3.1 for why per-frame steps are never summed and why
   everyone-moves-together is a calibration event, not motion.
+- `scripts/ball.py` — everything "where is the ball and who has it":
+  `BallTracker` (one physically plausible track from noisy candidates),
+  `PossessionTracker`, `PassCounter` (team totals: completed / lost, short /
+  long), `BallAnalytics` (per-result driver, `passes.json`). See `docs/PLAN.md`
+  Plan 3.2 for why the ball is captured from the raw detections by a predictor
+  callback and why the tracker is not a Kalman filter.
 - `scripts/display.py` — everything "what gets shown on screen": `MarkerRenderer`
   (pins, ID labels, running-distance captions), `PitchMinimap` (live top-down
-  positions), `PitchOverlayRenderer`,
-  `MotionExtrapolator`, `DisplaySmoother`, `FadeController`, `FramePacer`,
+  positions and the ball), `BallRenderer` (ball ring, holder ring, pass panel),
+  `PitchOverlayRenderer`,
+  `ResultTimeline`, `PlaybackDelay`, `DisplaySmoother`, `FadeController`, `FramePacer`,
   `StalenessTracker`/`WorkerStats`/`DisplayStats`
 - `scripts/botsort_custom.yaml` — tracker tuning
 - `yolo26s.mlpackage` — the CoreML-exported model actually used at runtime (gitignored,

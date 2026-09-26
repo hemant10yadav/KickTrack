@@ -1,4 +1,5 @@
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -8,6 +9,8 @@ from scripts import pipeline
 from scripts.pipeline import PlayerTracker, is_stream_source, resolve_video_source
 
 DEFAULT_VIDEO = "data/videos/sample.mp4"
+DEFAULT_DISPLAY_DELAY_MS = 100
+DEFAULT_VIEWER = "ffplay" if shutil.which("ffplay") else "opencv"
 
 
 def parse_imgsz(raw: str) -> int | tuple[int, int]:
@@ -46,9 +49,34 @@ def parse_args():
     parser.add_argument(
         "--output",
         default=None,
-        help="Write annotated frames to this video file instead of (or alongside) "
-        "displaying them. Runs headless (no window, no real-time pacing) unless "
-        "--show is also passed.",
+        help="Write annotated frames to this video file, or stream them live to a URL "
+        "(rtmp://, srt://, udp://, rtsp://), H.264-encoded on the hardware encoder via "
+        "ffmpeg, instead of (or alongside) displaying them. A file runs headless (no "
+        "window, no real-time pacing) unless --show is also passed; a stream is always "
+        "paced at the source frame rate.",
+    )
+    parser.add_argument(
+        "--viewer",
+        choices=["ffplay", "opencv"],
+        default=DEFAULT_VIEWER,
+        help="What draws the live window: ffplay (GPU, its own process; holds the source "
+        "frame rate) or an OpenCV window, whose repaint costs ~14-18ms per frame on macOS "
+        f"and caps playback near 40fps (default: {DEFAULT_VIEWER})",
+    )
+    parser.add_argument(
+        "--display-width",
+        type=int,
+        default=pipeline.DISPLAY_WIDTH,
+        help=f"Shrink wider sources (e.g. 4K) to this width right after decode; detection, "
+        f"drawing, the window and --output all run at it (default: {pipeline.DISPLAY_WIDTH})",
+    )
+    parser.add_argument(
+        "--display-delay-ms",
+        type=float,
+        default=DEFAULT_DISPLAY_DELAY_MS,
+        help="Show each frame this much later than it is read, so its markers come from "
+        "detections of that same frame instead of trailing the players by an inference "
+        f"cycle. 0 shows frames as read (default: {DEFAULT_DISPLAY_DELAY_MS:g})",
     )
     parser.add_argument(
         "--analytics-dir",
@@ -77,13 +105,17 @@ def main():
 
     model = YOLO(pipeline.MODEL_NAME)
     show_window = args.show or args.output is None
+    streaming = args.output is not None and is_stream_source(args.output)
     PlayerTracker(
         video_source,
         model,
         show_window=show_window,
         output_path=args.output,
-        realtime=show_window,
+        realtime=show_window or streaming,
         analytics_dir=args.analytics_dir,
+        display_width=args.display_width,
+        display_delay_ms=args.display_delay_ms,
+        viewer=args.viewer,
     ).run()
 
 
