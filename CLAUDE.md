@@ -212,9 +212,13 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
 - `scripts/ball.py` — everything "where is the ball and who has it":
   `BallTracker` (one physically plausible track from noisy candidates),
   `PossessionTracker`, `PassCounter` (team totals: completed / lost, short /
-  long), `BallAnalytics` (per-result driver, `passes.json`). See `docs/PLAN.md`
-  Plan 3.2 for why the ball is captured from the raw detections by a predictor
-  callback and why the tracker is not a Kalman filter.
+  long; passes settle 2s late so the live count only goes up), `TeamHistory`
+  (which team a player was on around a pass), `BallAnalytics` (per-result
+  driver, keeper sides, `passes.json`). See `docs/PLAN.md` Plan 3.2 for why the
+  ball is captured from the raw detections by a predictor callback and why the
+  tracker is not a Kalman filter, and Plan 3.3 for why a pass's team is never
+  the team read at that instant. Verify pass changes against the match_5 hand
+  labels (`tests/test_pass_replay.py`) *and* fresh realtime runs of both clips.
 - `scripts/display.py` — everything "what gets shown on screen": `MarkerRenderer`
   (pins, ID labels, running-distance captions), `PitchMinimap` (live top-down
   positions and the ball), `BallRenderer` (ball ring, holder ring, pass panel),

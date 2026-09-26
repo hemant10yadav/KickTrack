@@ -638,6 +638,7 @@ class PlayerTracker:
             self.analytics.finish()
             print(self.analytics.summary())
             print()
+            self.ball.finish()
             print(self.ball.summary(team_name=self.classifier.team_name))
             if self.analytics_dir:
                 self.analytics.write(self.analytics_dir, team_color=self._team_color)
@@ -853,6 +854,7 @@ class PlayerTracker:
             homography,
             self.analytics.latest_positions,
             team_name=self.classifier.team_name,
+            team_color=self._team_color,
         )
         if self.show_window:
             self.fps_overlay.draw(frame, native_fps=1000 / pacer.frame_budget_ms)

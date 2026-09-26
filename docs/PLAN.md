@@ -499,7 +499,72 @@ Take a fixed-camera football video and show a marker on each player that moves w
   - [X] Per-player pitch-relative position, distance covered, speed (Plan 3.1)
   - [X] Heatmaps per player (and per team) (Plan 3.1)
   - [X] Possession detection and team pass counts (Plan 3.2)
+  - [X] Pass counter that holds up on real footage (Plan 3.3)
   - [ ] (Longer-term, not yet scoped in detail) formations/team shape, passing networks
+
+- [X] **Plan 3.3: A Pass Counter That Holds Up on Real Footage**
+
+  Checked by eye on both clips: ball-following zoomed crops of the annotated
+  realtime output (every 0.5 s, all of match_4, match_5's labelled moves),
+  and the hand labels of match_5 (`tests/test_pass_replay.py`). The Plan 3.2
+  counter booked keeper passes as lost, counted the referee, credited passes
+  to the wrong team, and invented passes while one player dribbled alone.
+  All fixes are in `PassCounter` / `TeamHistory` / `BallAnalytics`
+  (`scripts/ball.py`); the tracker and possession rules are unchanged.
+
+  - [X] **The panel.** Top-right, from the first frame to the last: "Passes
+        completed" and a row per team (kit swatch, "white team", count), 0
+        until a pass settles; before the teams are fitted they read "team
+        1" / "team 2". Counts only ever go up.
+  - [X] **Passes settle 2 s after they happen** (`SETTLE_S`) and are counted
+        with the teams read around them, then frozen. Measured: a player's
+        team read is wrong for seconds while he stands against someone else
+        (match_5's 6, sky blue for 3 s beside a dark-coated steward while
+        receiving), an id re-used for a new body carries the old kit until
+        the colour average catches up (match_4's 65: yellow to 93.8 s, a white
+        player from 98.3 s), and an id that swaps bodies in a tackle reads as
+        the other kit from then on (match_4's 1, white to 49 s, yellow
+        after). `TeamHistory` takes the majority from 10 s before to 2 s after
+        the pass, within the player's current stint on screen (an absence
+        over 1 s may be a new body), skipping the first 2.5 s back. The
+        passer is judged at his own possession, not the receiver's.
+  - [X] **Keepers.** They share `OTHER_TEAM` with the officials. A keeper
+        within 25 m of a goal line is put on the side whose visible outfield
+        players are on average deeper (defenders are goal-side): right at all
+        8 keeper moments checked on both clips, where the nearest-centroid
+        and deepest-player tests each failed some. Anyone else in
+        `OTHER_TEAM` (the referee) is left out of the pass chain.
+  - [X] **Set pieces.** A goal kick's keeper steps back for his run-up and
+        never holds the ball; the player within 4 m of where a ball track
+        begins (or is re-sighted after 0.3 s of coasting) is the passer when
+        there is no recent possession to chain from.
+  - [X] **Track jumps are not passes.** The ball track can hop onto a
+        look-alike 20 m+ away. Real passes implied at most 27 m/s from one
+        holder's feet to the next; jumps 35-48 m/s. So a pass over
+        1 m + 30 m/s x the gap is skipped, and so is one whose receiver had
+        the ball under 0.3 s after it arrived faster than 20 m/s (chained
+        jumps; real first-time touches arrived at 7-15 m/s).
+  - [X] **An opponent's brief touch between teammates** (under 0.3 s, the
+        teammate has it within 1.5 s) is a pass that still reached a teammate
+        -- match_5's pass through a City player's legs.
+  - [X] **Measured.** match_5 labels (9 completed Tottenham passes, City
+        losing the ball once): the recorded fixture books 8, the four fresh
+        realtime runs 6-7, with no false or wrong-team pass in any of them
+        (before: 5-6, with 2-4 false or wrong-team). The misses: the one-touch
+        15 -> 8 -> 10 counts once, and the back pass at 3.5 s whenever
+        calibration had not started yet. match_4 (no labels): every booked
+        pass from 7 s to 150 s checked on the crops -- white 11 completed, 3
+        lost; yellow 12 completed, 1 lost -- including 6 -> keeper, the
+        keeper's long ball, yellow's back pass to its own keeper at 108 s,
+        and the tackle scramble at 48-50 s.
+  - [X] Tests: `tests/test_ball.py` (+7: jump, referee, settling with teams
+        around the pass, team history across an id re-use and a swap, keeper
+        back pass, goal kick); `tests/test_pass_replay.py` (match_5 labels on
+        the recorded fixture, `tests/fixtures/match_5_ball.jsonl.gz`).
+  - [ ] **Known limits.** A one-touch pass inside a quick exchange is
+        usually merged into the next (possession needs 3 results), and a pass
+        is only as good as the ball track: a pass played while the ball is
+        unseen at both ends is missed.
 
 - [X] **Plan 3.2: Ball, Possession and Team Pass Counts**
 

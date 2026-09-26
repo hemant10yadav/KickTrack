@@ -7,7 +7,7 @@ ball candidates and players' positions on the pitch (metres) and their teams
 as the classifier had them at that moment. Team 0 is sky blue (Manchester
 City), team 1 white (Tottenham); 2 is keepers/officials.
 
-Hand labels (docs/PLAN.md Plan 3.4), from ball-centred frame strips every
+Hand labels (docs/PLAN.md Plan 3.3), from ball-centred frame strips every
 0.08-0.25s: City's pass is cut out by white 8 at ~1.5s; then Tottenham: 8 ->
 keeper (3.5s), goal kick -> 15 (15.5s), 15 -> 8 -> 10 (17.5-18.4s), 10 -> 23,
 23 -> 10 through two City players' legs (20.5s), 10 -> 2, 2 -> 6 down the
