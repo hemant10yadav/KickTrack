@@ -290,17 +290,22 @@ class PitchOverlayRenderer:
 class BallRenderer:
     """The tracked ball on the video (a ring at its pitch position, hollow and
     dimmer while coasting through a gap), a ring around the player in
-    possession, and the team pass counts in the top-right corner."""
+    possession, and the team pass counts in the top-right corner. The two
+    rings are drawn only with show_markers, the panel unless show_passes is off."""
 
     BALL_COLOR = (0, 255, 255)
     PANEL_MARGIN = 12
+
+    def __init__(self, show_markers: bool = False, show_passes: bool = True):
+        self.show_markers = show_markers
+        self.show_passes = show_passes
 
     def draw(
         self, frame, ball_analytics, homography, positions: dict, team_name=str, team_color=None
     ) -> None:
         """team_name(team) -> the label shown on the panel ("white", "yellow");
         team_color(team) -> its BGR kit colour, None until the teams are fitted."""
-        if homography is not None:
+        if self.show_markers and homography is not None:
             ball = ball_analytics.ball
             if ball is not None:
                 point = self._project(homography, ball.x, ball.y, frame.shape)
@@ -318,7 +323,8 @@ class BallRenderer:
                     cv2.ellipse(
                         frame, point, (22, 9), 0, 0, 360, self.BALL_COLOR, 2, lineType=cv2.LINE_AA
                     )
-        self._draw_panel(frame, ball_analytics, team_name, team_color or (lambda _team: None))
+        if self.show_passes:
+            self._draw_panel(frame, ball_analytics, team_name, team_color or (lambda _team: None))
 
     PANEL_WIDTH = 260
     PANEL_LINE_PX = 28
@@ -828,6 +834,11 @@ class FfmpegOutput(RawVideoPipe):
     file or a live stream URL (rtmp://, srt://, udp://, rtsp://).
     cv2.VideoWriter's mp4v took 10.6ms per 4K frame on the display thread;
     here the encode runs on the media engine, in ffmpeg's process.
+
+    `audio_source` (the input video file) has its audio track, if any, muxed
+    back in: every source frame is written, at the source fps, so the two
+    line up without resampling. -shortest trims the audio when playback is
+    quit early.
     """
 
     STREAM_FORMATS = {
@@ -839,11 +850,21 @@ class FfmpegOutput(RawVideoPipe):
     }
     BITS_PER_PIXEL = 0.1  # ~10 Mbit/s at 1080p50
 
-    def __init__(self, target: str, width: int, height: int, fps: float):
+    def __init__(
+        self, target: str, width: int, height: int, fps: float, audio_source: str | None = None
+    ):
         bitrate = int(width * height * fps * self.BITS_PER_PIXEL)
         command = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             *self.raw_input_args(width, height, fps),
+        ]  # fmt: skip
+        if audio_source is not None:
+            command += [
+                "-i", audio_source,
+                "-map", "0:v", "-map", "1:a?",  # "?": a silent source is fine
+                "-c:a", "aac", "-shortest",
+            ]  # fmt: skip
+        command += [
             "-c:v", "h264_videotoolbox", "-b:v", str(bitrate), "-pix_fmt", "yuv420p",
             "-g", str(round(fps * 2)),  # a keyframe every 2s, so stream viewers can join
         ]  # fmt: skip

@@ -1,0 +1,3 @@
+# Clips published by ./demo.sh --publish, one per line: <name in data/videos/> [from-to]
+#   match_6 0:40-1:10
+match_5

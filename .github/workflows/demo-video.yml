@@ -58,7 +58,7 @@ jobs:
         # cv2.VideoWriter's mp4v (MPEG-4 Part 2) fourcc isn't broadly playable in
         # browsers; re-encode to H.264 so the README-embedded <video> tag works.
         run: |
-          ffmpeg -y -i raw_demo.mp4 -vcodec libx264 -crf 26 -pix_fmt yuv420p demo.mp4
+          ffmpeg -y -i output/raw_demo.mp4 -vcodec libx264 -crf 26 -pix_fmt yuv420p demo.mp4
 
       - name: Publish release asset
         env:

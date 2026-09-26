@@ -162,6 +162,8 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   the source frame; their homography is rescaled into working pixels. `--output`
   goes through ffmpeg's `h264_videotoolbox` (`FfmpegOutput`) to a file or a live
   stream URL (rtmp/srt/udp/rtsp); cv2's `mp4v` writer took 10.6ms per 4K frame.
+  A file source's audio is muxed back in (every source frame is written, so it
+  stays in sync); a live source's audio is not carried over.
 
 - **Pitch homography between keyframes is propagated from an anchor frame, with
   corners spread over a grid** (`HomographyPropagator`, `docs/PLAN.md` Plan 2.11):
@@ -229,6 +231,11 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   like other `.pt`/model weight files — regenerate with the export command above)
 - `data/videos/` — test footage (`match_1.mp4`, `match_2.mp4`, `match_3.mp4`)
 - `docs/PLAN.md` — milestone checklist, updated as work progresses
+- `demo.sh` + `demos.txt` — portfolio demo videos (no markers, no pass panel, web
+  encoded, poster JPG) into gitignored `demos/`; `./demo.sh --publish` renders every
+  clip in `demos.txt` and force-pushes them as a single commit to the `gh-pages`
+  branch (GitHub Pages), so videos never enter `main`'s history. A trimmed clip
+  (`match_6@0:40-1:10`) is tracked from 10s earlier so calibration has locked on.
 
 ## Working conventions for this project
 - Update `docs/PLAN.md` checkboxes as steps complete; add new "Plan N" sections for

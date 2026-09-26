@@ -13,6 +13,11 @@ weights/pnlcalib/
 # regression suite live under tests/videos/ instead and are committed there.
 data/
 
+# Annotated videos written by --output, and by demo.sh (published from the
+# gh-pages branch, never committed to main)
+output/
+demos/
+
 # Ultralytics run artifacts (exports, predictions, etc.)
 runs/
 
