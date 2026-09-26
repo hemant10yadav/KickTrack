@@ -164,6 +164,16 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   goes through ffmpeg's `h264_videotoolbox` (`FfmpegOutput`) to a file or a live
   stream URL (rtmp/srt/udp/rtsp); cv2's `mp4v` writer took 10.6ms per 4K frame.
 
+- **Pitch homography between keyframes is propagated from an anchor frame, with
+  corners spread over a grid** (`HomographyPropagator`, `docs/PLAN.md` Plan 2.11):
+  frame-to-frame chaining drifted (a pan's 1-3px per frame sits inside RANSAC's
+  threshold, so static broadcast graphics pulled toward "no motion"), and the
+  strongest corners of a broadcast frame are its graphics. A keyframe is applied
+  on top of what propagation had for its frame, not restarted from it, and one
+  far from propagation is held back until the next confirms it. Check any change
+  here with a replay against full calibrations of every 10th frame, not by eye
+  alone.
+
 ## Known gotchas
 - **Safe-chain proxy** wraps `uv`/npm on this machine and can block package resolution
   with "minimum package age" errors, or throttle/break large downloads (e.g. model

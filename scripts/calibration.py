@@ -15,6 +15,7 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -406,6 +407,70 @@ MAX_TRACK_ERROR = (
 )
 
 
+# Anchored propagation (docs/PLAN.md Plan 2.11). Measured on match_5 against a
+# full calibration of every 10th frame (keyframe every 90 frames): chaining
+# frame-to-frame homographies at a 3px RANSAC threshold drifted 20px median,
+# 73px p90, 106px max by the next keyframe. A pan moves the picture 1-3px per
+# frame, inside that threshold, so points that do not move with the pitch
+# (the broadcast scoreboard, players) passed as inliers and pulled every step
+# toward "no motion". Estimating each frame's motion from an anchor up to
+# ANCHOR_FRAMES back at a 1px threshold: 6.7px median, 14px p90, 26px max --
+# the calibrations themselves differ ~10px from one to the next.
+ANCHOR_FRAMES = 10
+RANSAC_THRESHOLD_PX = 1.0
+# Corners are taken a few per cell of a grid, not the strongest N of the whole
+# frame: on match_4 those were nearly all on the broadcast's static graphics
+# (ticker text, scoreboard, logo), whose corners are far sharper than crowd or
+# grass, so 103 of 111 tracked points agreed on "no motion" while the camera
+# panned 30px (frames 1400-1410) and the overlay ran up to ~1200px off. Grid,
+# match_4: >50px frames 203 -> 4 of 849 checked; match_5 unchanged.
+# A blurred frame in a fast pan can leave too few points within 1px; retrying
+# at 3px (match_4 frames 1449-1555) instead of giving up let propagation keep
+# up rather than freeze until the next keyframe: max 828 -> 49px.
+RETRY_THRESHOLD_PX = 3.0
+CORNER_GRID = (8, 5)  # columns, rows
+CORNERS_PER_CELL = 5
+
+
+def landmark_distance(homography_a: np.ndarray, homography_b: np.ndarray, frame_shape) -> float:
+    """Median pixel distance between where two pitch -> image homographies put
+    a grid of pitch points, over the points `homography_b` puts in frame."""
+    h, w = frame_shape[:2]
+    xs, ys = np.meshgrid(np.linspace(-52.5, 52.5, 15), np.linspace(-34.0, 34.0, 11))
+    pitch = np.stack([xs.ravel(), ys.ravel(), np.ones(xs.size)])
+
+    def project(homography):
+        points = homography @ pitch
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return points[:2] / points[2]
+
+    a, b = project(homography_a), project(homography_b)
+    inside = (b[0] >= 0) & (b[0] < w) & (b[1] >= 0) & (b[1] < h)
+    if not inside.any():
+        return float("inf")
+    return float(np.median(np.linalg.norm(a[:, inside] - b[:, inside], axis=0)))
+
+
+def _grid_corners(gray: np.ndarray) -> np.ndarray | None:
+    """Up to CORNERS_PER_CELL corners from each CORNER_GRID cell (see
+    CORNER_GRID), found on the frame at half size -- 10.7 -> 3.2ms per anchor
+    at 1080p, drift unchanged; optical flow still tracks them at full size."""
+    gray = cv2.resize(gray, (gray.shape[1] // 2, gray.shape[0] // 2), interpolation=cv2.INTER_AREA)
+    h, w = gray.shape
+    columns, rows = CORNER_GRID
+    found = []
+    for row in range(rows):
+        for column in range(columns):
+            y0, x0 = row * h // rows, column * w // columns
+            cell = gray[y0 : (row + 1) * h // rows, x0 : (column + 1) * w // columns]
+            corners = cv2.goodFeaturesToTrack(
+                cell, maxCorners=CORNERS_PER_CELL, qualityLevel=0.01, minDistance=10
+            )
+            if corners is not None:
+                found.append(corners + np.array([x0, y0], dtype=np.float32))
+    return np.concatenate(found) * 2 if found else None
+
+
 class HomographyPropagator:
     """Tracks the pitch homography frame-to-frame between full
     CalibrationWorker recalibrations, using sparse optical flow. Conceptually
@@ -415,43 +480,67 @@ class HomographyPropagator:
     HomographyWorker's background thread (below), not the main thread
     directly: see HomographyWorker's docstring for why.
 
-    See docs/PITCH_CALIBRATION_SPEC.md Phase 2 for the drift measurement
-    that motivated this: match_4-style footage (more camera movement)
-    drifts ~125px on average over 30 frames if the homography is just held
-    stale rather than propagated (CalibrationWorker's keyframe_interval has
-    since grown to 90 for an unrelated reason -- CPU contention, see its
-    own docstring -- making propagation's job here even more important).
+    Each frame's camera motion is measured from an *anchor* frame up to
+    ANCHOR_FRAMES back, not from the previous frame: ten 1-frame hops of
+    1-3px each are where both the error accumulation and the bias toward
+    static screen overlays came from (see ANCHOR_FRAMES). Every
+    ANCHOR_FRAMES the current frame becomes the anchor, with fresh corners.
 
     If tracking ever fails (too few inlier points -- fast pan, occlusion,
-    a bad frame), propagate() returns None and keeps failing on the *same*
-    stale reference until the next full keyframe recalibration resets it,
+    a bad frame), propagate() returns None and keeps measuring against the
+    *same* anchor until it succeeds again or the next keyframe arrives,
     rather than guessing from a potentially-bad current frame. Callers
     should treat a None as "hold the last known-good homography, mark this
     frame low-confidence."
     """
 
-    def __init__(self, max_corners: int = 200, min_tracked_points: int = MIN_TRACKED_POINTS):
-        self.max_corners = max_corners
+    def __init__(self, min_tracked_points: int = MIN_TRACKED_POINTS):
         self.min_tracked_points = min_tracked_points
-        self.reference_gray: np.ndarray | None = None
-        self.reference_points: np.ndarray | None = None
+        self.anchor_gray: np.ndarray | None = None
+        self.anchor_points: np.ndarray | None = None
+        self.anchor_homography: np.ndarray | None = None
         self.homography: np.ndarray | None = None
+        self._last_tracked: np.ndarray | None = None  # anchor points' latest positions
+        self._frames_since_anchor = 0
 
     def reset(self, frame: np.ndarray, homography: np.ndarray):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        self.reference_gray = gray
-        self.reference_points = cv2.goodFeaturesToTrack(
-            gray, maxCorners=self.max_corners, qualityLevel=0.01, minDistance=10
-        )
+        self._anchor(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), homography)
         self.homography = homography
 
+    def rebase(self, correction: np.ndarray):
+        """Right-multiplies a pitch-side correction into every homography
+        held, so a new keyframe calibration takes effect from *now* instead
+        of restarting propagation from its (0.3-1.8s old) frame -- see
+        HomographyWorker._apply_keyframe."""
+        self.anchor_homography = self.anchor_homography @ correction
+        self.homography = self.homography @ correction
+
     def propagate(self, frame: np.ndarray) -> np.ndarray | None:
-        if self.homography is None or self.reference_points is None:
+        if self.homography is None or self.anchor_points is None:
             return None
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        tracked = self._track(gray)
+        if tracked is None:
+            return None
+
+        transform, self._last_tracked = tracked
+        self.homography = transform @ self.anchor_homography
+        self._frames_since_anchor += 1
+        if self._frames_since_anchor >= ANCHOR_FRAMES:
+            self._anchor(gray, self.homography)
+        return self.homography
+
+    def _track(self, gray: np.ndarray):
+        """(anchor -> gray transform, tracked points), or None."""
+        if self.anchor_points is None:
+            return None
         tracked_points, status, err = cv2.calcOpticalFlowPyrLK(
-            self.reference_gray, gray, self.reference_points, None
+            self.anchor_gray,
+            gray,
+            self.anchor_points,
+            self._last_tracked.copy(),  # start from where they were last seen
+            flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
         )
         # cv2 can report status=1 ("tracked") even when the target region has
         # no real content to track against (e.g. a blank/black frame) -- its
@@ -460,23 +549,20 @@ class HomographyPropagator:
         status_mask = status.reshape(-1).astype(bool) & (err.reshape(-1) < MAX_TRACK_ERROR)
         if status_mask.sum() < self.min_tracked_points:
             return None
+        for threshold in (RANSAC_THRESHOLD_PX, RETRY_THRESHOLD_PX):
+            transform, inliers = cv2.findHomography(
+                self.anchor_points[status_mask], tracked_points[status_mask], cv2.RANSAC, threshold
+            )
+            if transform is not None and int(inliers.sum()) >= self.min_tracked_points:
+                return transform, tracked_points
+        return None
 
-        src = self.reference_points[status_mask]
-        dst = tracked_points[status_mask]
-        transform, inliers = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
-        if transform is None or int(inliers.sum()) < self.min_tracked_points:
-            return None
-
-        new_homography = transform @ self.homography
-
-        # Roll the reference forward to the current frame so optical flow
-        # always tracks a short hop from the previous frame, not an
-        # ever-growing distance from the original keyframe.
-        inlier_mask = inliers.reshape(-1).astype(bool)
-        self.reference_gray = gray
-        self.reference_points = dst[inlier_mask]
-        self.homography = new_homography
-        return new_homography
+    def _anchor(self, gray: np.ndarray, homography: np.ndarray):
+        self.anchor_gray = gray
+        self.anchor_points = _grid_corners(gray)
+        self.anchor_homography = homography
+        self._last_tracked = None if self.anchor_points is None else self.anchor_points.copy()
+        self._frames_since_anchor = 0
 
 
 class HomographyWorker:
@@ -499,7 +585,23 @@ class HomographyWorker:
     request (single-slot, "latest wins", with reset always taking priority
     over a pending propagate so a new keyframe is never dropped in favor of
     a stale propagate request), never touch the propagator directly.
+
+    A keyframe calibration describes a frame that is already 0.3-1.8s old
+    when it arrives. It is applied as a correction on top of what propagation
+    had for that same frame (see _apply_keyframe), not by restarting from it:
+    restarting snapped the overlay back to where the camera had been and then
+    caught up again (docs/PLAN.md Plan 3.1, "double-snaps"). A keyframe that
+    lands far from propagation is held back as a likely calibration glitch;
+    if the next keyframe lands in the same place, propagation was the one
+    that had drifted and both are right.
     """
+
+    HISTORY_FRAMES = 256  # > the longest calibration latency (~1.8s = 90 frames at 50fps)
+    MAX_KEYFRAME_GAP = 2  # frames between the keyframe and the nearest propagated one
+    # A keyframe disagreeing with propagation by more than this share of the
+    # frame width is held back once. match_5: glitched calibrations landed
+    # 205-287px (1080p) from their neighbours; propagation drift peaked at 26px.
+    GLITCH_FRACTION_OF_WIDTH = 0.03
 
     def __init__(self, propagator: HomographyPropagator):
         self.propagator = propagator
@@ -507,6 +609,11 @@ class HomographyWorker:
         self.pending: tuple | None = None
         self.latest_homography: np.ndarray | None = None
         self.latest_frame_id: int | None = None
+        self.history: deque[tuple[int, np.ndarray]] = deque(maxlen=self.HISTORY_FRAMES)
+        self.held_correction: np.ndarray | None = None  # the last held-back keyframe's
+        self.keyframes_rebased = 0
+        self.keyframes_reset = 0
+        self.keyframes_rejected = 0
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
 
@@ -547,15 +654,63 @@ class HomographyWorker:
                 continue
             if pending[0] == "reset":
                 _, frame, homography, frame_id = pending
-                self.propagator.reset(frame, homography)
-                with self.lock:
-                    self.latest_homography = homography
-                    self.latest_frame_id = frame_id
+                self._apply_keyframe(frame, homography, frame_id)
             else:
                 _, frame, frame_id = pending
                 homography = self.propagator.propagate(frame)
                 if homography is not None:
+                    self.history.append((frame_id, homography))
                     with self.lock:
                         self.latest_homography = homography
                         self.latest_frame_id = frame_id
                 # else: hold whatever is already in self.latest_homography
+
+    def summary(self) -> str:
+        return (
+            f"Keyframes applied on top of propagation: {self.keyframes_rebased}; "
+            f"restarted from (no propagation for their frame): {self.keyframes_reset}; "
+            f"held back as calibration glitches: {self.keyframes_rejected}"
+        )
+
+    def _apply_keyframe(self, frame: np.ndarray, homography: np.ndarray, frame_id: int):
+        propagated = self._propagated_at(frame_id)
+        if propagated is None or self.propagator.homography is None:
+            self.keyframes_reset += 1
+            self.history.clear()
+            self.propagator.reset(frame, homography)
+            with self.lock:
+                self.latest_homography = homography
+                self.latest_frame_id = frame_id
+            return
+
+        # propagated(now) = motion(k -> now) @ propagated(k), so the keyframe's
+        # pitch-side correction carries forward unchanged:
+        # calibrated(k) = propagated(k) @ correction.
+        correction = np.linalg.inv(propagated) @ homography
+        max_px = self.GLITCH_FRACTION_OF_WIDTH * frame.shape[1]
+        now = self.propagator.homography
+        if landmark_distance(now, now @ correction, frame.shape) > max_px:
+            agrees_with_held = self.held_correction is not None and (
+                landmark_distance(now @ self.held_correction, now @ correction, frame.shape)
+                <= max_px
+            )
+            if not agrees_with_held:
+                self.keyframes_rejected += 1
+                self.held_correction = correction
+                return
+        self.held_correction = None
+        self.keyframes_rebased += 1
+        self.propagator.rebase(correction)
+        self.history = deque(
+            ((fid, h @ correction) for fid, h in self.history), maxlen=self.HISTORY_FRAMES
+        )
+        with self.lock:
+            self.latest_homography = self.propagator.homography
+
+    def _propagated_at(self, frame_id: int) -> np.ndarray | None:
+        for history_frame_id, homography in reversed(self.history):
+            if history_frame_id <= frame_id:
+                if frame_id - history_frame_id <= self.MAX_KEYFRAME_GAP:
+                    return homography
+                return None
+        return None

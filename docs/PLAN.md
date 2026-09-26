@@ -438,11 +438,61 @@ Take a fixed-camera football video and show a marker on each player that moves w
         change). 12.0 vs 12.3-12.7ms predict (~0.5ms), boxes IoU 0.977, no
         box of conf >= 0.5 unmatched -- too small a gain to re-verify the
         identity probes and the ball's low-confidence detections for.
-  - [ ] **Seen, not fixed: propagated pitch overlay drifts between keyframes**
-        (a halfway line drawn straight where the true one slants ~50px on
-        frame 520 of the 4K run). Both the 1080p and the rescaled 4K
+  - [X] **Seen here, fixed in Plan 2.11: propagated pitch overlay drifts between
+        keyframes** (a halfway line drawn straight where the true one slants
+        ~50px on frame 520 of the 4K run). Both the 1080p and the rescaled 4K
         calibration of that frame get it right, so it is propagation, not the
         rescale.
+
+- [X] **Plan 2.11: Pitch Overlay Drift Between Keyframes**
+
+  Measured against a full PnLCalib calibration of every 10th frame (match_5:
+  175 of 176; match_4: 376 of 376), frames whose calibration jumps >40px from
+  a neighbour's excluded as reference glitches. Replay (`HomographyWorker`
+  driven synchronously): propagate every frame, a keyframe every 90 frames
+  arriving 25 frames late, raw calibrations as keyframes (glitches included),
+  over 9 keyframe phases (match_5) / 3 (match_4). Calibrations 10 frames
+  apart differ ~9.5px median, which is the floor this can resolve.
+  - [X] **Cause 1: frame-to-frame chaining at a 3px RANSAC threshold.** A pan
+        moves the picture 1-3px per frame, inside the threshold, so points that
+        don't move with the pitch (scoreboard, players) counted as inliers and
+        biased every step toward no motion. Over 90 frames: 20px median, 73px
+        p90, 106px max. Fix: measure each frame's motion from an anchor up to
+        10 frames back, 1px threshold, re-anchor every 10 frames: 6.7 / 14 /
+        26px. (Tried and worse: corners on grass only -- 45px median; grass
+        has too little texture.)
+  - [X] **Cause 2: corners came from the broadcast graphics.** The strongest
+        200 corners of the frame were, on match_4, nearly all on the ticker,
+        scoreboard and logo: frames 1400->1410 the calibrations have the
+        camera moving 30px, propagation 3px, with 103 of 111 points agreeing on
+        it. Fix: 5 corners per cell of an 8x5 grid (found at half size: 10.7 ->
+        3.2ms per anchor, same drift). match_4 >50px frames 203 -> 4 of 849.
+  - [X] **Cause 3: a blurred fast pan left too few 1px inliers**, and propagation
+        froze until the next keyframe (match_4 1449-1555, up to 828px). Fix:
+        retry at 3px. Re-measuring from the last good frame instead was tried:
+        160px max alone, no gain on top of the retry.
+  - [X] **Cause 4 (Plan 3.1's "double-snap"): keyframes restarted propagation
+        from their 0.3-1.8s-old frame.** `HomographyWorker` now keeps the
+        homographies it propagated and applies a keyframe as a pitch-side
+        correction on top of what it had for that frame (`rebase`); only a
+        keyframe with no propagation near its frame restarts from it.
+  - [X] **Cause 5: PnLCalib glitches were accepted as keyframes** (frames
+        1110/1130 of match_5 land 205-287px off). A keyframe more than 3% of
+        the frame width from propagation is held back; the next one confirms it
+        if it lands in the same place (propagation had drifted) -- two
+        disagreeing ones are both held.
+  - [X] **Result (replay, old -> new).** match_5: median 6.6 -> 5.7px, p90 18.5
+        -> 14.5, max 256 -> 36, frames >50px 40 -> 0 of 1512 (2 glitch
+        keyframes held back of 172). match_4: median 28.0 -> 8.8px, p90 247 ->
+        22, max 1290 -> 49, >50px 328 -> 0 of 849. Cost: 1.9 -> ~2ms per
+        propagated frame avg on the homography thread (anchors 3.2ms, every
+        10th frame). Realtime match_5: 49.2 fps either way; analytics
+        "calibration shifts cancelled" 75 -> 39. Frame strips 520/1130/1440/
+        1600: halfway line and boxes on the painted lines.
+  - [ ] **Left:** isolated reference frames on match_4 (770, 820, 1030) sit
+        400px+ from the overlay; they look like calibration glitches in the
+        reference, not checked by eye. Distances/top speeds re-measured: see
+        Plan 3.1's last item (no top speed over 10 m/s left on either clip).
 
 - [ ] **Plan 3: Player & Match Analytics**
 
@@ -604,4 +654,13 @@ Take a fixed-camera football video and show a marker on each player that moves w
         four clusters, merges any pair closer than 40 BGR (one kit under two
         lights), and calls the two most populated groups the teams; keepers,
         officials and staff are `OTHER_TEAM`. `tests/test_team_classifier.py`.
-  - [ ] **Next:** fix the keyframe hand-over, then measure top speeds again.
+  - [X] **Re-measured after the keyframe hand-over fix (Plan 2.11).** Realtime,
+        old (pre-2.11) vs new code back to back, same machine. Common shifts
+        cancelled: match_5 66 -> 25, match_4 374 -> 154. Top speed, players
+        tracked >= 20s (match_5) / >= 100s (match_4): match_5 median 7.0 ->
+        6.3 m/s, max 10.3 -> 8.6, over 10 m/s 1 -> 0 of 21; match_4 median
+        9.8 -> 8.4, max 11.5 -> 9.9, over 10 m/s 4 -> 0 of 11 -- the
+        "slightly inflated by pan lag" above was the snaps. Distance: match_5
+        median 61 -> 70m (tracked time 26.6 -> 28.3s median as fewer samples
+        lack a homography, 2.40 -> 2.58 m/s over it), match_4 296 -> 310m at
+        2.41 -> 2.35 m/s -- about the same per second tracked.
