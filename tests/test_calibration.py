@@ -94,6 +94,17 @@ def _make_fake_calibrator(call_counter):
     return _FakeCalibrator(call_counter)
 
 
+def _wait_until_ready(worker, timeout_s=10.0):
+    """Frames are only accepted once the child has warmed up its model (and
+    while no other frame is in flight), so wait for that before submitting."""
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while not worker.child_ready and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert worker.child_ready
+
+
 def test_calibration_worker_updates_result_after_submit():
     import functools
     import multiprocessing as mp
@@ -106,12 +117,13 @@ def test_calibration_worker_updates_result_after_submit():
         functools.partial(_make_fake_calibrator, call_counter), keyframe_interval=1
     ).start()
     try:
+        _wait_until_ready(worker)
         worker.submit(frame=np.zeros((4, 4, 3), dtype="uint8"), frame_id=1)
         for _ in range(200):
-            if call_counter.value > 0:
+            if worker.get_result() is not None:
                 break
             time.sleep(0.05)
-        assert call_counter.value > 0
+        assert call_counter.value == 2  # the child's warm-up call, then frame 1
         result = worker.get_result()
         assert result is not None
         assert result.frame_id == 1
@@ -134,11 +146,12 @@ def test_calibration_worker_respects_keyframe_interval():
         functools.partial(_make_fake_calibrator, call_counter), keyframe_interval=1000
     ).start()
     try:
+        _wait_until_ready(worker)
         for frame_id in range(1, 21):
             worker.submit(frame=np.zeros((4, 4, 3), dtype="uint8"), frame_id=frame_id)
             time.sleep(0.005)
         time.sleep(0.5)
-        assert call_counter.value <= 1
+        assert call_counter.value == 2  # the child's warm-up call, then frame 1 only
     finally:
         worker.stop()
 
@@ -160,6 +173,7 @@ def test_calibration_worker_get_keyframe_returns_matching_frame():
     try:
         submitted_frame = np.zeros((4, 4, 3), dtype="uint8")
         submitted_frame[:] = 7
+        _wait_until_ready(worker)
         worker.submit(frame=submitted_frame, frame_id=1)
         for _ in range(200):
             if worker.get_keyframe() is not None:

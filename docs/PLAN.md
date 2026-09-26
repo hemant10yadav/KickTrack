@@ -376,6 +376,74 @@ Take a fixed-camera football video and show a marker on each player that moves w
         out to matter for Plan 3 numbers; those frames are already flagged
         occluded and excluded from position samples.
 
+- [X] **Plan 2.10: Smooth 4K Playback, Synced Markers, Live Streaming**
+
+  Goal: play and stream 4K sources at their native frame rate with no drops, and
+  markers on the players in the frame shown rather than a cycle behind. Measured
+  on a 4K (3840x2160) upscale of match_5 (50fps, 20ms budget); the repo's clips
+  are 1080p, so 1080p numbers are the same match_5.
+  - [X] **Measured first: the window, not the AI, broke 4K.** Per-frame costs at
+        4K: decode 2.6ms, inference ~14.5ms (the model sees 1152px either way),
+        but `cv2.imshow` + `cv2.waitKey` ~30ms (1080p ~18ms) -- the repaint
+        alone was over budget. Old code, full 4K clip: 20.4 display fps, 275/1750
+        frames over budget, worker 36ms.
+  - [X] **`FrameScaler`: shrink once after decode to `--display-width` (1920).**
+        Everything -- detection, identity, drawing, window, output -- runs at
+        that size; 1080p sources pass through untouched. INTER_LINEAR (0.4ms;
+        identical to INTER_AREA on an exact 2:1, which costs 5.3ms). Detections
+        on 150 frames, 4K straight into the model vs downscaled: 4055 matched
+        boxes, IoU 0.979, no box of conf >= 0.5 lost (22 vs 3 unmatched boxes,
+        all conf 0.25-0.5). Calibration keyframes keep the source frame (see
+        the resize warning in `CalibrationWorker.submit`); their homography is
+        rescaled (`homography_to_working`), checked against calibrating the
+        1080p original of the same frame: 0.1-0.4px apart on frame 440.
+  - [X] **Calibration hand-off stalled the display thread.** `submit` pulled
+        the previous, unstarted frame back out of the multiprocessing queue to
+        replace it ("latest wins"), unpickling a whole frame on the display
+        thread -- on every frame of a 0.3-1.8s calibration: 26ms per 4K frame
+        (~6ms at 1080p), 156 of the first 300 frames. Now a frame is only
+        submitted to an idle, warmed-up child (it sends `CALIBRATOR_READY`),
+        which starts on it at once -- as fresh, no displacement. 4K full clip,
+        OpenCV window: 38.7 display fps, 6/1750 frames over budget, worker 20ms.
+  - [X] **`FfplayViewer` (`--viewer ffplay`, default when installed).** Even a
+        540p OpenCV window costs ~14ms per `waitKey` on macOS (1080p 17.7ms):
+        a fixed repaint wait that capped the loop at ~40-45fps. ffplay draws
+        on the GPU in its own process; the loop enqueues the frame and paces
+        with a sleep. Full match_5: 49.1 fps (OpenCV window 44.9).
+  - [X] **`PlaybackDelay` + `ResultTimeline` (`--display-delay-ms`, default 100).**
+        Frames are held back 100ms (5 frames at 50fps) so AI results exist on
+        both sides of each one, and its boxes are interpolated onto that exact
+        frame in video time; newer-than-every-result frames extrapolate from
+        the two newest (replaces the wall-clock `MotionExtrapolator`). Synced
+        boxes are not eased (easing would re-add a frame of lag). Pitch
+        overlay/ball ring use the homography propagated for the frame shown.
+        Full clips: 1750/1750 frames drawn from their own detections, 1080p
+        and 4K.
+  - [X] **`FfmpegOutput`: `--output` via ffmpeg's `h264_videotoolbox`, to a file or
+        a stream URL (rtmp/srt/udp/rtsp; streams are paced).** cv2's `mp4v`
+        took 10.6ms per 4K frame on the display thread. Checked: 600-frame
+        file is h264 1080p50 with all 600 frames; a udp:// stream decoded 400
+        frames on the receiving end in its 8s window.
+  - [X] **GMC at downscale 4 (`GMC_DOWNSCALE`).** Once display ran at a true 50fps
+        the worker (20.8ms) fell just behind (82/1750 skipped). BoT-SORT's
+        sparse-flow GMC cost 4.5ms at ultralytics' hardcoded downscale 2, 2.5ms
+        at 4, shift estimate within 0.13px mean / 0.7px max. Worker 18.6ms,
+        skipped 18/1750 (1080p) and 34/1750 (4K); 41 ids minted and 9 swap
+        corrections vs 43 and 12 on the old code's realtime run. All 14 slow
+        regression tests pass (churn, drop-rate ceilings, fps). Not yet
+        re-checked with frame strips around each logged correction.
+  - [X] **Int8 weights: not adopted.** `quantize=8` for CoreML is k-means weight
+        palettization only (activations stay fp16), exported with
+        `uv run --with scikit-learn --with numpy==2.3.5` (no project dependency
+        change). 12.0 vs 12.3-12.7ms predict (~0.5ms), boxes IoU 0.977, no
+        box of conf >= 0.5 unmatched -- too small a gain to re-verify the
+        identity probes and the ball's low-confidence detections for.
+  - [ ] **Seen, not fixed: propagated pitch overlay drifts between keyframes**
+        (a halfway line drawn straight where the true one slants ~50px on
+        frame 520 of the 4K run). Both the 1080p and the rescaled 4K
+        calibration of that frame get it right, so it is propagation, not the
+        rescale.
+
 - [ ] **Plan 3: Player & Match Analytics**
 
   - [X] Per-player pitch-relative position, distance covered, speed (Plan 3.1)

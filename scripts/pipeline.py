@@ -2,6 +2,7 @@ import re
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,12 +23,15 @@ from scripts.display import (
     DisplaySmoother,
     DisplayStats,
     FadeController,
+    FfmpegOutput,
+    FfplayViewer,
     FpsOverlay,
     FramePacer,
     MarkerRenderer,
-    MotionExtrapolator,
     PitchMinimap,
     PitchOverlayRenderer,
+    PlaybackDelay,
+    ResultTimeline,
     StalenessTracker,
 )
 from scripts.player import (
@@ -80,6 +84,16 @@ MODEL_NAME = "yolo26s.mlpackage"
 # The exported .mlpackage has this shape baked into its input tensor, so this must
 # stay in sync with the `imgsz` used at export time (see CLAUDE.md export command).
 INFERENCE_IMGSZ = (640, 1152)
+# Frames wider than this are shrunk once, right after decode, and everything --
+# detection, identity, drawing, the window, the output -- runs at that size
+# (see FrameScaler). 1920 leaves every current 1080p clip exactly as it was.
+DISPLAY_WIDTH = 1920
+
+# BoT-SORT's camera-motion compensation (sparse optical flow) runs on the frame
+# shrunk by this factor; ultralytics hardcodes 2, and botsort.yaml cannot set it.
+# On 1080p match_5 frames: 4.5ms -> 2.5ms per cycle, the estimated shift within
+# 0.13px mean (0.7px max) of downscale 2 -- nothing at player-box scale.
+GMC_DOWNSCALE = 4
 
 JERSEY_RESAMPLE_INTERVAL = 15  # worker cycles between re-observations of a settled track
 
@@ -102,6 +116,38 @@ def resolve_video_source(raw: str) -> str | int:
 
 def is_stream_source(source: str | int) -> bool:
     return isinstance(source, int) or bool(STREAM_SCHEME_RE.match(source))
+
+
+class FrameScaler:
+    """Shrinks each source frame once, right after decode, to the working size
+    everything else runs at: detection, identity, drawing, the window, the
+    output. Measured on a 4K copy of match_5: cv2.waitKey repaints a 3840px
+    frame in ~30ms (1080p: ~18ms), more than the whole 20ms budget before any
+    tracking runs, while the resize costs 0.4ms. Detection loses nothing --
+    the model sees 1152px wide either way. Only calibration keyframes keep
+    the source frame (see CalibrationWorker.submit), so their homography is
+    rescaled into working pixels here. A source already at or under the
+    working width passes through untouched.
+    """
+
+    def __init__(self, source_width: int, source_height: int, max_width: int):
+        self.scale = min(1.0, max_width / source_width) if source_width else 1.0
+        self.size = (round(source_width * self.scale), round(source_height * self.scale))
+
+    @property
+    def active(self) -> bool:
+        return self.scale < 1.0
+
+    def to_working(self, frame: np.ndarray) -> np.ndarray:
+        if not self.active:
+            return frame
+        # INTER_LINEAR, not INTER_AREA: identical on the exact 2:1 of 4K ->
+        # 1080p (it samples each 2x2 block's centre) at 0.4ms vs 5.3ms.
+        return cv2.resize(frame, self.size, interpolation=cv2.INTER_LINEAR)
+
+    def homography_to_working(self, homography: np.ndarray) -> np.ndarray:
+        """Pitch -> source pixels becomes pitch -> working pixels."""
+        return np.diag([self.scale, self.scale, 1.0]) @ homography
 
 
 def track(model: YOLO, frame):
@@ -270,8 +316,8 @@ class InferenceWorker:
     Each submitted frame carries a frame_id and capture timestamp, which is echoed
     back with the result — this lets the caller measure exactly how many frames (and
     how many milliseconds) old the boxes it's currently displaying are, and also
-    extrapolate player motion forward using the two most recent results (see
-    MotionExtrapolator).
+    place player boxes on the exact frame being shown, between or ahead of the
+    most recent results (see ResultTimeline).
 
     This thread does *only* inference and box extraction. Everything that turns
     raw BoT-SORT boxes into players (IdentityResolver) runs on the consumer's
@@ -487,6 +533,9 @@ class PlayerTracker:
         output_path: str | None = None,
         realtime: bool = True,
         analytics_dir: str | None = None,
+        display_width: int = DISPLAY_WIDTH,
+        display_delay_ms: float = 0,
+        viewer: str = "opencv",
     ):
         self.video_source = video_source
         self.model = model
@@ -497,6 +546,11 @@ class PlayerTracker:
         self.output_path = output_path
         self.realtime = realtime
         self.analytics_dir = analytics_dir
+        self.display_width = display_width
+        self.display_delay_ms = display_delay_ms
+        self.viewer_kind = viewer  # "opencv" (cv2.imshow) or "ffplay" (FfplayViewer)
+        self.viewer = None
+        self.scaler = None  # FrameScaler, created once the source size is known
         self.analytics = None  # MatchAnalytics, created once the video's fps is known
         self.ball = None  # BallAnalytics, likewise
         self.writer = None
@@ -506,7 +560,7 @@ class PlayerTracker:
         self.pitch_overlay = PitchOverlayRenderer()
         self.minimap = PitchMinimap()
         self.ball_renderer = BallRenderer()
-        self.extrapolator = MotionExtrapolator()
+        self.timeline = ResultTimeline()
         self.smoother = DisplaySmoother()
         self.fader = FadeController()
         self.staleness = StalenessTracker()
@@ -517,16 +571,29 @@ class PlayerTracker:
         self.achieved_fps = None
         self.latest_calibration = None
         self.current_homography = None
+        # (frame_id, homography) as propagation produces them, so a delayed
+        # frame is drawn with its own camera pose, not the newest one.
+        self.homography_history = deque(maxlen=64)
         self.homography_worker = HomographyWorker(HomographyPropagator())
         self._last_keyframe_id = None
 
     def run(self):
         cap = self._open_capture()
         pacer = FramePacer(fps=cap.get(cv2.CAP_PROP_FPS) or 25)
+        self.scaler = FrameScaler(
+            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            self.display_width,
+        )
+        playback = PlaybackDelay(round(self.display_delay_ms / pacer.frame_budget_ms))
         self.analytics = MatchAnalytics(fps=1000 / pacer.frame_budget_ms)
         self.ball = BallAnalytics(fps=1000 / pacer.frame_budget_ms)
         if self.output_path:
-            self.writer = self._open_writer(cap, pacer.frame_budget_ms)
+            self.writer = self._open_writer(pacer.frame_budget_ms)
+        if self.show_window and self.viewer_kind == "ffplay":
+            self.viewer = FfplayViewer(
+                self.WINDOW_NAME, *self.scaler.size, 1000 / pacer.frame_budget_ms
+            )
         self._warmup()
 
         worker = InferenceWorker(self.model, self.ball_capture).start()
@@ -534,7 +601,7 @@ class PlayerTracker:
         self.homography_worker.start()
         self.play_start = time.perf_counter()
         try:
-            self._play(cap, worker, calibration_worker, pacer)
+            self._play(cap, worker, calibration_worker, pacer, playback)
         finally:
             worker.stop()
             calibration_worker.stop()
@@ -542,12 +609,19 @@ class PlayerTracker:
             cap.release()
             if self.writer is not None:
                 self.writer.release()
-            if self.show_window:
+            if self.viewer is not None:
+                self.viewer.release()
+            elif self.show_window:
                 cv2.destroyAllWindows()
             elapsed = time.perf_counter() - self.play_start
             self.achieved_fps = self.frame_count / elapsed
             print(f"Read {self.frame_count} frames from {self.video_source}")
             print(f"Display FPS: {self.achieved_fps:.1f}")
+            print(
+                f"Working size: {self.scaler.size[0]}x{self.scaler.size[1]}"
+                f"{' (downscaled from the source)' if self.scaler.active else ''}; "
+                f"display delay: {playback.delay_frames} frames"
+            )
             print()
             print(worker.stats.summary())
             print()
@@ -556,6 +630,7 @@ class PlayerTracker:
             print(self.resolver.identity.summary())
             print()
             print(self.staleness.summary())
+            print(self.timeline.summary())
             print()
             print(self.display_stats.summary())
             print()
@@ -590,6 +665,9 @@ class PlayerTracker:
         """Pay the one-time GPU kernel compilation cost (MPS) before playback starts."""
         blank_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         track(self.model, blank_frame)
+        # The tracker exists from that first call on (persist=True keeps it).
+        for tracker in self.model.predictor.trackers:
+            tracker.gmc.downscale = GMC_DOWNSCALE
 
     def _update_calibration(self, calibration_worker: CalibrationWorker, frame: np.ndarray):
         """Forwards each new full recalibration from CalibrationWorker
@@ -601,6 +679,10 @@ class PlayerTracker:
         which pushed ~9-10% of frames over budget on match_5's tight 20ms
         window even though the work itself only cost ~1-3ms -- moving it
         off-thread removes it from the budget entirely.
+
+        Calibration runs on the source frame (see CalibrationWorker.submit)
+        while propagation runs on working-size frames, so a new keyframe's
+        frame and homography are brought to working size here.
         """
         keyframe = calibration_worker.get_keyframe()
         if keyframe is not None:
@@ -608,14 +690,26 @@ class PlayerTracker:
             is_new_keyframe = self.latest_calibration.frame_id != self._last_keyframe_id
             if is_new_keyframe and self.latest_calibration.homography is not None:
                 self.homography_worker.reset(
-                    keyframe_frame,
-                    self.latest_calibration.homography,
+                    self.scaler.to_working(keyframe_frame),
+                    self.scaler.homography_to_working(self.latest_calibration.homography),
                     self.latest_calibration.frame_id,
                 )
                 self._last_keyframe_id = self.latest_calibration.frame_id
 
         self.homography_worker.submit(frame, self.frame_count)
-        self.current_homography, _ = self.homography_worker.get_latest()
+        self.current_homography, homography_frame_id = self.homography_worker.get_latest()
+        if homography_frame_id is not None and (
+            not self.homography_history or homography_frame_id > self.homography_history[-1][0]
+        ):
+            self.homography_history.append((homography_frame_id, self.current_homography))
+
+    def _homography_for(self, frame_id: int) -> np.ndarray | None:
+        """The homography propagated for `frame_id` (or the nearest frame
+        before it), for drawing a delayed frame with its own camera pose."""
+        for history_frame_id, homography in reversed(self.homography_history):
+            if history_frame_id <= frame_id:
+                return homography
+        return self.current_homography
 
     def _ball_candidates_on_pitch(self, candidates) -> list:
         """(x1, y1, x2, y2, conf) pixel candidates -> (x_m, y_m, conf) on the
@@ -642,11 +736,9 @@ class PlayerTracker:
     def _team_color(self, team: int):
         return self.classifier.team_color(team) if self.classifier.centers is not None else None
 
-    def _open_writer(self, cap: cv2.VideoCapture, frame_budget_ms: float) -> cv2.VideoWriter:
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        return cv2.VideoWriter(self.output_path, fourcc, 1000 / frame_budget_ms, (width, height))
+    def _open_writer(self, frame_budget_ms: float) -> FfmpegOutput:
+        width, height = self.scaler.size
+        return FfmpegOutput(self.output_path, width, height, 1000 / frame_budget_ms)
 
     def _play(
         self,
@@ -654,28 +746,36 @@ class PlayerTracker:
         worker: InferenceWorker,
         calibration_worker: CalibrationWorker,
         pacer: FramePacer,
+        playback: PlaybackDelay,
     ):
         # The display thread has ~13ms of slack per frame at 50fps (see
         # DisplayStats), so resolving identities here costs playback nothing,
         # whereas on the worker it came straight out of the inference budget.
+        source_ended = False
         while True:
             iteration_start = time.perf_counter()
             self.fps_overlay.tick(iteration_start)
 
             t0 = time.perf_counter()
-            ret, frame = cap.read()
-            if not ret:
-                break
-            self.frame_count += 1
+            if not source_ended:
+                ret, source_frame = cap.read()
+                source_ended = not ret
             t1 = time.perf_counter()
 
-            worker.submit(frame.copy(), self.frame_count)
-            if calibration_worker.is_keyframe(self.frame_count):
-                calibration_worker.submit(frame.copy(), self.frame_count)
+            if not source_ended:
+                self.frame_count += 1
+                frame = self.scaler.to_working(source_frame)
+                # Read-only for both workers; `frame` itself gets drawn on.
+                detection_frame = frame.copy()
+                worker.submit(detection_frame, self.frame_count)
+                if calibration_worker.is_keyframe(self.frame_count):
+                    calibration_worker.submit(source_frame.copy(), self.frame_count)
+                self._update_calibration(calibration_worker, detection_frame)
+                playback.push(frame, self.frame_count)
             result = self.resolver.resolve(worker.get_result())
-            self._update_calibration(calibration_worker, frame)
+            self.timeline.add(result)
             # Once per new worker result (record() ignores repeats), in video
-            # time, from the confirmed boxes -- not the extrapolated/smoothed
+            # time, from the confirmed boxes -- not the interpolated/smoothed
             # ones drawn on screen, which are display estimates.
             self.analytics.record(
                 result.frame_id,
@@ -691,51 +791,66 @@ class PlayerTracker:
                 self.classifier.team_for,
             )
             t2 = time.perf_counter()
-            now = time.perf_counter()
-            self.staleness.record(self.frame_count, result.frame_id, result.captured_at)
 
-            boxes = self.extrapolator.extrapolate(result, now)
-            boxes = self.smoother.smooth(boxes)
-            alphas = self.fader.update(boxes, result.coasting_progress)
-            self.pitch_overlay.draw(frame, self.current_homography)
-            self.renderer.draw(frame, boxes, alphas, captions=self._distance_captions(boxes))
-            self.minimap.draw(
-                frame,
-                self.analytics.latest_positions,
-                self.classifier.team_for,
-                self._team_color,
-                ball=self.ball.ball,
-                holder=self.ball.holder,
-            )
-            self.ball_renderer.draw(
-                frame,
-                self.ball,
-                self.current_homography,
-                self.analytics.latest_positions,
-                team_name=self.classifier.team_name,
-            )
-            t3 = time.perf_counter()
-            if self.show_window:
-                self.fps_overlay.draw(frame, native_fps=1000 / pacer.frame_budget_ms)
-                cv2.imshow(self.WINDOW_NAME, frame)
-            if self.writer is not None:
-                self.writer.write(frame)
-            t4 = time.perf_counter()
+            shown = playback.pop(flush=source_ended)
+            if shown is None and source_ended:
+                break
+            t3 = t4 = t2
+            if shown is not None:
+                frame, frame_id = shown
+                self.staleness.record(frame_id, result.frame_id, result.captured_at)
+                self._draw(frame, frame_id, pacer)
+                t3 = time.perf_counter()
+                if self.viewer is not None:
+                    self.viewer.write(frame)
+                elif self.show_window:
+                    cv2.imshow(self.WINDOW_NAME, frame)
+                if self.writer is not None:
+                    self.writer.write(frame)
+                t4 = time.perf_counter()
 
             if self.realtime:
-                key = pacer.wait(iteration_start, use_gui=self.show_window)
+                key = pacer.wait(iteration_start, use_gui=self.show_window and self.viewer is None)
             else:
                 key = -1
             t5 = time.perf_counter()
 
-            self.display_stats.record(
-                read_ms=(t1 - t0) * 1000,
-                submit_ms=(t2 - t1) * 1000,
-                draw_ms=(t3 - t2) * 1000,
-                imshow_ms=(t4 - t3) * 1000,
-                wait_ms=(t5 - t4) * 1000,
-                frame_budget_ms=pacer.frame_budget_ms,
-            )
+            if shown is not None:
+                self.display_stats.record(
+                    read_ms=(t1 - t0) * 1000,
+                    submit_ms=(t2 - t1) * 1000,
+                    draw_ms=(t3 - t2) * 1000,
+                    imshow_ms=(t4 - t3) * 1000,
+                    wait_ms=(t5 - t4) * 1000,
+                    frame_budget_ms=pacer.frame_budget_ms,
+                )
 
             if self.show_window and key == self.QUIT_KEY:
                 break
+            if self.viewer is not None and self.viewer.closed:
+                break  # its window was closed
+
+    def _draw(self, frame: np.ndarray, frame_id: int, pacer: FramePacer) -> None:
+        boxes, coasting_progress, synced = self.timeline.boxes_at(frame_id)
+        boxes = self.smoother.smooth(boxes, ease=not synced)
+        alphas = self.fader.update(boxes, coasting_progress)
+        homography = self._homography_for(frame_id)
+        self.pitch_overlay.draw(frame, homography)
+        self.renderer.draw(frame, boxes, alphas, captions=self._distance_captions(boxes))
+        self.minimap.draw(
+            frame,
+            self.analytics.latest_positions,
+            self.classifier.team_for,
+            self._team_color,
+            ball=self.ball.ball,
+            holder=self.ball.holder,
+        )
+        self.ball_renderer.draw(
+            frame,
+            self.ball,
+            homography,
+            self.analytics.latest_positions,
+            team_name=self.classifier.team_name,
+        )
+        if self.show_window:
+            self.fps_overlay.draw(frame, native_fps=1000 / pacer.frame_budget_ms)
