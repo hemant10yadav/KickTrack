@@ -13,7 +13,6 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
 ## Tech stack
 - **CV/Tracking**: Python, Ultralytics YOLO (`yolo26s.mlpackage`, CoreML), BoT-SORT tracker
 - **Package management**: `uv` (not pip/venv directly) — see `pyproject.toml`, lockfile is `uv.lock`
-- **Backend (scaffolded, not yet the active focus)**: FastAPI, `app/main.py`
 - **Hardware target**: Apple Silicon (M3 Pro) — inference runs on the Neural Engine via
   CoreML (`ComputeUnit.CPU_AND_NE`), not PyTorch/MPS (see below for why)
 - **Python 3.13, not 3.14**: `coremltools` has no working native extensions on 3.14
@@ -230,7 +229,6 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   like other `.pt`/model weight files — regenerate with the export command above)
 - `data/videos/` — test footage (`match_1.mp4`, `match_2.mp4`, `match_3.mp4`)
 - `docs/PLAN.md` — milestone checklist, updated as work progresses
-- `app/` — FastAPI skeleton (not yet the active focus)
 
 ## Working conventions for this project
 - Update `docs/PLAN.md` checkboxes as steps complete; add new "Plan N" sections for
