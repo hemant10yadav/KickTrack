@@ -85,6 +85,12 @@ def parse_args():
         "top speed, time tracked) to this directory at the end of the run.",
     )
     parser.add_argument(
+        "--show-markers",
+        action="store_true",
+        help="Draw the team-coloured pin and ID label above each player. Off by default: "
+        "only the distance each player has run is shown.",
+    )
+    parser.add_argument(
         "--show",
         action="store_true",
         help="Display a live window. Implied when --output is not given.",
@@ -116,6 +122,7 @@ def main():
         display_width=args.display_width,
         display_delay_ms=args.display_delay_ms,
         viewer=args.viewer,
+        show_markers=args.show_markers,
     ).run()
 
 

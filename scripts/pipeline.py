@@ -536,6 +536,7 @@ class PlayerTracker:
         display_width: int = DISPLAY_WIDTH,
         display_delay_ms: float = 0,
         viewer: str = "opencv",
+        show_markers: bool = False,
     ):
         self.video_source = video_source
         self.model = model
@@ -556,7 +557,7 @@ class PlayerTracker:
         self.writer = None
         self.classifier = TeamClassifier()
         self.resolver = IdentityResolver(self.classifier)
-        self.renderer = MarkerRenderer(self.classifier)
+        self.renderer = MarkerRenderer(self.classifier, show_markers=show_markers)
         self.pitch_overlay = PitchOverlayRenderer()
         self.minimap = PitchMinimap()
         self.ball_renderer = BallRenderer()

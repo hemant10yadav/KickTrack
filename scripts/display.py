@@ -45,8 +45,9 @@ class MarkerRenderer:
     ANCHOR_EASING = 0.2
     ANCHOR_SNAP_DISTANCE_PX = 150
 
-    def __init__(self, classifier: TeamClassifier):
+    def __init__(self, classifier: TeamClassifier, show_markers: bool = False):
         self.classifier = classifier
+        self.show_markers = show_markers  # pin + ID label; off leaves only the caption
         self.anchor_positions = {}  # track_id -> (tip_x, tip_y) floats
 
     def draw(self, frame, boxes, alphas=None, captions=None):
@@ -63,9 +64,12 @@ class MarkerRenderer:
             color = self._color_for(track_id)
             tip = self._smoothed_tip(track_id, x1, y1, x2, y2)
             bbox_height = y2 - y1
-            self._draw_marker(frame, tip, bbox_height, color, alpha)
             caption = None if captions is None else captions.get(track_id)
-            self._draw_label(frame, x1, tip, bbox_height, track_id, color, caption)
+            if self.show_markers:
+                self._draw_marker(frame, tip, bbox_height, color, alpha)
+                self._draw_label(frame, x1, tip, bbox_height, track_id, color, caption)
+            elif caption:
+                self._draw_caption(frame, x1, tip[1], caption)
         self._prune_anchors(current_ids)
 
     def _color_for(self, track_id):
@@ -154,18 +158,21 @@ class MarkerRenderer:
             lineType=cv2.LINE_AA,
         )
         if caption:
-            # Above the ID so the pin keeps its clear gap to the player's head;
-            # white so it reads on every kit colour.
-            cv2.putText(
-                frame,
-                caption,
-                (x1, max(0, baseline - 16)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                (255, 255, 255),
-                1,
-                lineType=cv2.LINE_AA,
-            )
+            # Above the ID so the pin keeps its clear gap to the player's head.
+            self._draw_caption(frame, x1, baseline - 16, caption)
+
+    def _draw_caption(self, frame, x, baseline, caption):
+        # White so it reads on every kit colour.
+        cv2.putText(
+            frame,
+            caption,
+            (x, max(0, baseline)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (255, 255, 255),
+            1,
+            lineType=cv2.LINE_AA,
+        )
 
 
 class PitchMinimap:
