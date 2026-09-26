@@ -316,3 +316,74 @@ def test_homography_worker_holds_last_good_when_propagate_fails():
         assert np.array_equal(homography, np.eye(3))
     finally:
         worker.stop()
+
+
+# Pitch -> image for the 300px textured frame: the whole pitch lands in frame.
+_PITCH_TO_FRAME = np.array([[2.5, 0.0, 150.0], [0.0, 3.0, 150.0], [0.0, 0.0, 1.0]])
+
+
+def _pitch_shift(dx_m, dy_m=0.0):
+    return np.array([[1.0, 0.0, dx_m], [0.0, 1.0, dy_m], [0.0, 0.0, 1.0]])
+
+
+def _propagated_worker():
+    """A HomographyWorker driven synchronously (no thread) through two
+    frames of a known 6px-per-frame pan, with its propagation history."""
+    from scripts.calibration import HomographyPropagator, HomographyWorker
+
+    frame0 = _make_textured_frame()
+    worker = HomographyWorker(HomographyPropagator())
+    worker.propagator.reset(frame0, _PITCH_TO_FRAME)
+    frames = [frame0]
+    for frame_id in (1, 2):
+        shift = np.array([[1, 0, 6.0 * frame_id], [0, 1, 0]], dtype="float32")
+        frame = cv2.warpAffine(frame0, shift, (frame0.shape[1], frame0.shape[0]))
+        worker.history.append((frame_id, worker.propagator.propagate(frame)))
+        frames.append(frame)
+    return worker, frames
+
+
+def test_keyframe_is_applied_from_now_not_from_its_old_frame():
+    """A calibration of frame 1 arriving at frame 2 corrects frame 2's pose;
+    restarting from frame 1 would snap the overlay back one frame of pan."""
+    worker, frames = _propagated_worker()
+    propagated_1, propagated_2 = worker.history[0][1], worker.history[1][1]
+    calibrated_1 = propagated_1 @ _pitch_shift(1.0)  # 2.5px: a small, honest correction
+
+    worker._apply_keyframe(frames[1], calibrated_1, frame_id=1)
+
+    assert worker.keyframes_rebased == 1
+    assert np.allclose(worker.propagator.homography, propagated_2 @ _pitch_shift(1.0), atol=1e-6)
+
+
+def test_keyframe_far_from_propagation_is_held_back_until_confirmed():
+    worker, frames = _propagated_worker()
+    before = worker.propagator.homography.copy()
+    propagated_1 = worker.history[0][1]
+    far_off = propagated_1 @ _pitch_shift(20.0)  # 50px away, over 3% of 300px
+
+    worker._apply_keyframe(frames[1], far_off, frame_id=1)
+    assert worker.keyframes_rejected == 1
+    assert np.allclose(worker.propagator.homography, before)
+
+    # The next keyframe lands in the same place: propagation had drifted.
+    worker._apply_keyframe(frames[2], worker.history[1][1] @ _pitch_shift(20.0), frame_id=2)
+    assert worker.keyframes_rebased == 1
+
+
+def test_two_disagreeing_glitches_are_both_held_back():
+    worker, frames = _propagated_worker()
+    before = worker.propagator.homography.copy()
+    worker._apply_keyframe(frames[1], worker.history[0][1] @ _pitch_shift(20.0), frame_id=1)
+    worker._apply_keyframe(frames[2], worker.history[1][1] @ _pitch_shift(-20.0), frame_id=2)
+    assert worker.keyframes_rejected == 2
+    assert np.allclose(worker.propagator.homography, before)
+
+
+def test_keyframe_without_propagation_for_its_frame_restarts_from_it():
+    from scripts.calibration import HomographyPropagator, HomographyWorker
+
+    worker = HomographyWorker(HomographyPropagator())
+    worker._apply_keyframe(_make_textured_frame(), _PITCH_TO_FRAME, frame_id=5)
+    assert worker.keyframes_reset == 1
+    assert np.allclose(worker.propagator.homography, _PITCH_TO_FRAME)

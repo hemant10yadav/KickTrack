@@ -653,6 +653,7 @@ class PlayerTracker:
                 )
             else:
                 print("Calibration: no result yet")
+            print(self.homography_worker.summary())
 
     def _open_capture(self) -> cv2.VideoCapture:
         cap = cv2.VideoCapture(self.video_source)
