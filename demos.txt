@@ -1,3 +1,10 @@
-# Clips published by ./demo.sh --publish, one per line: <name in data/videos/> [from-to]
-#   match_6 0:40-1:10
-match_5
+# Clips published by ./demo.sh --publish, in page order, one per line:
+#   <name in data/videos/> [start or start-end] | <title shown on the page>
+#
+# Rules (set in demo.sh): the whole video is tracked, then the finished demo
+# is cut: the first 6 s is skipped; a start alone ("0:07") shows from there;
+# no demo is longer than 1 minute; demos have no audio.
+match_5 | EPL
+match_6 | La Liga
+match_7 | Copa del Rey
+match_4 | EPL

@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KickTrack</title>
+<meta name="description" content="Tracking every player in football match footage, in real time on a MacBook.">
+<style>
+  :root {
+    --bg: #f7f7f4;
+    --surface: #ffffff;
+    --text: #1c1f1d;
+    --muted: #5d645f;
+    --line: #e1e3de;
+    --accent: #1f7a4d;
+    --accent-soft: #e3f1e9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #121513;
+      --surface: #1a1e1b;
+      --text: #e8ebe8;
+      --muted: #9aa39d;
+      --line: #2a302c;
+      --accent: #5cc48d;
+      --accent-soft: #1d2f25;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #121513;
+    --surface: #1a1e1b;
+    --text: #e8ebe8;
+    --muted: #9aa39d;
+    --line: #2a302c;
+    --accent: #5cc48d;
+    --accent-soft: #1d2f25;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 17px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 56px 16px 40px; }
+  h1 { font-size: 2.4rem; line-height: 1.1; margin: 0 0 12px; letter-spacing: -0.02em; }
+  h2 { font-size: 1.3rem; margin: 56px 0 16px; }
+  h3 { font-size: 1.05rem; margin: 0 0 6px; }
+  p { margin: 0 0 14px; }
+  a { color: var(--accent); }
+  .lede { font-size: 1.15rem; color: var(--muted); }
+  .links { display: flex; gap: 16px; margin-top: 18px; font-size: 0.95rem; }
+
+  .player { margin-top: 32px; }
+  .player[hidden] { display: none; }
+  video {
+    width: 100%;
+    display: block;
+    border-radius: 10px;
+    background: #000;
+    aspect-ratio: 16 / 9;
+  }
+  .caption { margin: 10px 0 0; font-size: 0.95rem; color: var(--muted); }
+  .caption b { color: var(--text); font-weight: 600; }
+  .thumbs {
+    display: flex;
+    gap: 10px;
+    margin-top: 14px;
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    padding-bottom: 6px;
+  }
+  .thumb {
+    flex: 0 0 150px;
+    scroll-snap-align: start;
+    padding: 0;
+    border: 2px solid transparent;
+    border-radius: 9px;
+    background: var(--surface);
+    color: var(--text);
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+    overflow: hidden;
+    opacity: 0.7;
+    transition: opacity 0.15s, border-color 0.15s;
+  }
+  .thumb:hover, .thumb:focus-visible { opacity: 1; }
+  .thumb[aria-current="true"] { border-color: var(--accent); opacity: 1; }
+  .thumb img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; }
+  .thumb span { display: block; padding: 6px 8px; font-size: 0.8rem; line-height: 1.3; }
+
+  .fc { display: flex; flex-direction: column; align-items: center; margin: 8px 0 18px; }
+  .node {
+    width: 100%;
+    max-width: 440px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 14px;
+    text-align: center;
+    font-size: 0.92rem;
+  }
+  .node b { display: block; font-size: 0.98rem; }
+  .node span { color: var(--muted); font-size: 0.85rem; }
+  .node.io { border-style: dashed; }
+  .node.core { border-color: var(--accent); }
+  .arrow { width: 2px; height: 26px; background: var(--muted); position: relative; margin-bottom: 6px; }
+  .arrow::after {
+    content: "";
+    position: absolute;
+    left: -5px;
+    bottom: -6px;
+    border: 6px solid transparent;
+    border-top: 7px solid var(--muted);
+    border-bottom: 0;
+  }
+  .lanes {
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    padding: 28px 12px 12px;
+    border: 1px dashed var(--line);
+    border-radius: 14px;
+    position: relative;
+  }
+  .lanes > .tag, .pair > .tag {
+    position: absolute;
+    top: 7px;
+    left: 14px;
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .lane { display: flex; flex-direction: column; align-items: center; }
+  .lane h4 { margin: 0 0 8px; font-size: 0.78rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--accent); }
+  .lane .node { max-width: none; flex: 1; display: flex; flex-direction: column; justify-content: center; }
+  .lane .arrow { height: 16px; }
+  .pair {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  @media (max-width: 640px) {
+    .lanes { grid-template-columns: 1fr; }
+    .pair { grid-template-columns: 1fr; }
+  }
+  .note { color: var(--muted); font-size: 0.95rem; }
+
+  .problem {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-bottom: 14px;
+  }
+  .problem p:last-child { margin-bottom: 0; }
+  .result {
+    display: inline-block;
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 0.88rem;
+    font-weight: 600;
+  }
+
+  ul.limits { padding-left: 20px; margin: 0; }
+  ul.limits li { margin-bottom: 8px; }
+  footer {
+    margin-top: 56px;
+    padding-top: 20px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 0.88rem;
+  }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1>KickTrack</h1>
+  <p class="lede">I built a tool that follows every player in football match footage and measures what they do: how far they run, where they spend their time, and when the ball goes from one teammate to another. It runs in real time on my MacBook.</p>
+  <div class="links">
+    <a href="https://github.com/hemant10yadav/KickTrack">Source on GitHub</a>
+  </div>
+  <div class="player" id="player" hidden>
+    <video id="video" autoplay muted playsinline controls preload="auto"></video>
+    <p class="caption" id="caption"></p>
+    <div class="thumbs" id="thumbs" role="list"></div>
+  </div>
+</header>
+
+<section>
+  <h2>How it works</h2>
+  <div class="fc" role="img" aria-label="Flowchart: each video frame goes to detection, calibration and playback in parallel, then identity, pitch mapping, player and ball analytics, and finally the drawn frame.">
+    <div class="node io"><b>Video frame</b><span>file or live stream, shrunk to 1920 px wide</span></div>
+    <div class="arrow"></div>
+    <div class="lanes">
+      <div class="tag">in parallel</div>
+      <div class="lane">
+        <h4>Detection</h4>
+        <div class="node"><b>YOLO26s</b><span>players and ball, on the Neural Engine</span></div>
+        <div class="arrow"></div>
+        <div class="node"><b>BoT-SORT</b><span>links boxes frame to frame, corrects for camera pans</span></div>
+      </div>
+      <div class="lane">
+        <h4>Calibration</h4>
+        <div class="node"><b>Find the pitch</b><span>PnLCalib, about every 2 s</span></div>
+        <div class="arrow"></div>
+        <div class="node"><b>Follow the camera</b><span>optical flow on every frame in between</span></div>
+      </div>
+      <div class="lane">
+        <h4>Playback</h4>
+        <div class="node"><b>Hold the frame</b><span>100 ms, so results for it arrive first</span></div>
+        <div class="arrow"></div>
+        <div class="node"><b>Keep pace</b><span>never waits on the model</span></div>
+      </div>
+    </div>
+    <div class="arrow"></div>
+    <div class="node core"><b>Identify</b><span>jersey colour keeps each player's ID and team through overlaps</span></div>
+    <div class="arrow"></div>
+    <div class="node core"><b>Map to the pitch</b><span>pixels to metres through the homography</span></div>
+    <div class="arrow"></div>
+    <div class="pair">
+      <div class="node core"><b>Players</b><span>distance, speed, heatmaps</span></div>
+      <div class="node core"><b>Ball</b><span>track, possession, passes</span></div>
+    </div>
+    <div class="arrow"></div>
+    <div class="node io"><b>Drawn frame</b><span>live window, or an MP4 with the original audio</span></div>
+  </div>
+  <p class="note">The model is slower than a 50 fps video, so it runs on its own thread and always takes the newest frame. Playback holds each frame back a little and places the markers from detections of that exact frame, so the video stays smooth.</p>
+</section>
+
+<section>
+  <h2>Problems I ran into</h2>
+
+  <div class="problem">
+    <h3>The camera wouldn't sit still</h3>
+    <p>My first tracker, ByteTrack, matched boxes by overlap alone. The footage pans and zooms a little, and that was enough to give players a new ID almost every frame. BoT-SORT corrects for camera motion, which fixed most of it. For the rest, when a new ID shows up where a player was just lost, I hand it back to that player.</p>
+  </div>
+
+  <div class="problem">
+    <h3>Too slow for 50 fps</h3>
+    <p>On the GPU with PyTorch, one frame took about 70&nbsp;ms. A 50&nbsp;fps clip gives you 20. Smaller models and lower resolutions were faster, but they missed players, and missing players is the one thing this tool can't do. So I kept full resolution and moved the model to the Neural Engine with CoreML. Then I changed the input from a square to the footage's 16:9 shape, so it stopped spending time on padding.</p>
+    <p><span class="result">Frames skipped on the 50 fps clip: 64% → about 1%</span></p>
+  </div>
+
+  <div class="problem">
+    <h3>Two players, one box</h3>
+    <p>When two players overlap, the detector sometimes draws one box around both. The tracker keeps its ID on that box, and when they split up the ID can leave with the wrong player. Nothing looks lost, so the usual recovery never kicks in. I tied each identity to a jersey colour. A track only changes hands once the original player is seen on their own again. Switching to YOLO26s helped as well, because it separates overlapping players much more often.</p>
+    <p><span class="result">Keeper and defender overlap: both kept in 19 of 19 frames (was 3)</span></p>
+  </div>
+
+  <div class="problem">
+    <h3>Pitch lines that drift</h3>
+    <p>To measure in metres I need to know where the camera is pointing. A full calibration takes up to 1.8&nbsp;s, so between calibrations I follow the camera frame by frame. Chaining those small steps drifted, partly because the scoreboard and logos stay put while the camera pans. Now every frame is measured against one anchor frame, using points spread across the whole picture.</p>
+  </div>
+
+  <div class="problem">
+    <h3>Passes credited to the wrong team</h3>
+    <p>A player's team can read wrong for a few seconds, for example while they stand next to someone in a different kit. So a pass is counted 2&nbsp;s after it happens, with the team the player showed over the ten seconds around it. On the Man City v Tottenham clip I labelled every pass by hand to check it.</p>
+    <p><span class="result">9 real passes: 8 found, none invented (earlier versions invented 2 to 4)</span></p>
+  </div>
+</section>
+
+<section>
+  <h2>What's still hard</h2>
+  <ul class="limits">
+    <li>Footage from a camera in the stands doesn't calibrate. The pitch model I use was trained on TV broadcast views.</li>
+    <li>A quick one-touch pass usually gets merged into the next one.</li>
+    <li>If the ball can't be seen at either end of a pass, I miss the pass.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>Built with</h2>
+  <p>Python, Ultralytics YOLO26s exported to CoreML, BoT-SORT, OpenCV, PnLCalib for pitch calibration, and ffmpeg. Everything runs locally on an M3 Pro MacBook.</p>
+</section>
+
+<footer>
+  The clips are short excerpts from Premier League and La Liga broadcasts, used only to show the tracking.
+</footer>
+
+</main>
+<script>
+  // demo.sh --publish writes demos/list.json: [{"name", "title"}] in demos.txt order.
+  // Browsers only autoplay muted video; the controls unmute it.
+  const video = document.getElementById("video");
+  const caption = document.getElementById("caption");
+  const thumbs = document.getElementById("thumbs");
+  let clips = [];
+  let current = 0;
+
+  function show(index) {
+    current = index;
+    const clip = clips[index];
+    video.src = `demos/${clip.name}.mp4`;
+    video.poster = `demos/${clip.name}.jpg`;
+    video.loop = clips.length === 1;
+    video.play().catch(() => {});
+    caption.replaceChildren(
+      Object.assign(document.createElement("b"), { textContent: clip.title }),
+      ` \u00b7 ${index + 1} of ${clips.length}`,
+    );
+    thumbs.querySelectorAll(".thumb").forEach((button, i) => {
+      button.setAttribute("aria-current", i === index ? "true" : "false");
+      if (i === index) button.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
+  }
+
+  video.addEventListener("ended", () => show((current + 1) % clips.length));
+
+  fetch("demos/list.json")
+    .then((response) => (response.ok ? response.json() : []))
+    .then((list) => {
+      clips = list.map((clip, i) => ({ name: clip.name, title: clip.title || `Clip ${i + 1}` }));
+      if (!clips.length) return;
+      clips.forEach((clip, i) => {
+        const button = document.createElement("button");
+        button.className = "thumb";
+        button.setAttribute("role", "listitem");
+        button.innerHTML = `<img src="demos/${clip.name}.jpg" alt="" loading="lazy"><span></span>`;
+        button.querySelector("span").textContent = clip.title;
+        button.addEventListener("click", () => show(i));
+        thumbs.appendChild(button);
+      });
+      thumbs.hidden = clips.length === 1;
+      document.getElementById("player").hidden = false;
+      show(0);
+    })
+    .catch(() => {});
+</script>
+</body>
+</html>
