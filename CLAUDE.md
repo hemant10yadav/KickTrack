@@ -13,7 +13,6 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
 ## Tech stack
 - **CV/Tracking**: Python, Ultralytics YOLO (`yolo26s.mlpackage`, CoreML), BoT-SORT tracker
 - **Package management**: `uv` (not pip/venv directly) — see `pyproject.toml`, lockfile is `uv.lock`
-- **Backend (scaffolded, not yet the active focus)**: FastAPI, `app/main.py`
 - **Hardware target**: Apple Silicon (M3 Pro) — inference runs on the Neural Engine via
   CoreML (`ComputeUnit.CPU_AND_NE`), not PyTorch/MPS (see below for why)
 - **Python 3.13, not 3.14**: `coremltools` has no working native extensions on 3.14
@@ -163,6 +162,8 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   the source frame; their homography is rescaled into working pixels. `--output`
   goes through ffmpeg's `h264_videotoolbox` (`FfmpegOutput`) to a file or a live
   stream URL (rtmp/srt/udp/rtsp); cv2's `mp4v` writer took 10.6ms per 4K frame.
+  A file source's audio is muxed back in (every source frame is written, so it
+  stays in sync); a live source's audio is not carried over.
 
 - **Pitch homography between keyframes is propagated from an anchor frame, with
   corners spread over a grid** (`HomographyPropagator`, `docs/PLAN.md` Plan 2.11):
@@ -212,9 +213,13 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
 - `scripts/ball.py` — everything "where is the ball and who has it":
   `BallTracker` (one physically plausible track from noisy candidates),
   `PossessionTracker`, `PassCounter` (team totals: completed / lost, short /
-  long), `BallAnalytics` (per-result driver, `passes.json`). See `docs/PLAN.md`
-  Plan 3.2 for why the ball is captured from the raw detections by a predictor
-  callback and why the tracker is not a Kalman filter.
+  long; passes settle 2s late so the live count only goes up), `TeamHistory`
+  (which team a player was on around a pass), `BallAnalytics` (per-result
+  driver, keeper sides, `passes.json`). See `docs/PLAN.md` Plan 3.2 for why the
+  ball is captured from the raw detections by a predictor callback and why the
+  tracker is not a Kalman filter, and Plan 3.3 for why a pass's team is never
+  the team read at that instant. Verify pass changes against the match_5 hand
+  labels (`tests/test_pass_replay.py`) *and* fresh realtime runs of both clips.
 - `scripts/display.py` — everything "what gets shown on screen": `MarkerRenderer`
   (pins, ID labels, running-distance captions), `PitchMinimap` (live top-down
   positions and the ball), `BallRenderer` (ball ring, holder ring, pass panel),
@@ -226,7 +231,11 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   like other `.pt`/model weight files — regenerate with the export command above)
 - `data/videos/` — test footage (`match_1.mp4`, `match_2.mp4`, `match_3.mp4`)
 - `docs/PLAN.md` — milestone checklist, updated as work progresses
-- `app/` — FastAPI skeleton (not yet the active focus)
+- `demo.sh` + `demos.txt` — portfolio demo videos (no markers, no pass panel, web
+  encoded, poster JPG) into gitignored `demos/`; `./demo.sh --publish` renders every
+  clip in `demos.txt` and force-pushes them as a single commit to the `gh-pages`
+  branch (GitHub Pages), so videos never enter `main`'s history. A trimmed clip
+  (`match_6@0:40-1:10`) is tracked from 10s earlier so calibration has locked on.
 
 ## Working conventions for this project
 - Update `docs/PLAN.md` checkboxes as steps complete; add new "Plan N" sections for

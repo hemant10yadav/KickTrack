@@ -537,6 +537,7 @@ class PlayerTracker:
         display_delay_ms: float = 0,
         viewer: str = "opencv",
         show_markers: bool = False,
+        show_passes: bool = True,
     ):
         self.video_source = video_source
         self.model = model
@@ -560,7 +561,7 @@ class PlayerTracker:
         self.renderer = MarkerRenderer(self.classifier, show_markers=show_markers)
         self.pitch_overlay = PitchOverlayRenderer()
         self.minimap = PitchMinimap()
-        self.ball_renderer = BallRenderer()
+        self.ball_renderer = BallRenderer(show_markers=show_markers, show_passes=show_passes)
         self.timeline = ResultTimeline()
         self.smoother = DisplaySmoother()
         self.fader = FadeController()
@@ -638,6 +639,7 @@ class PlayerTracker:
             self.analytics.finish()
             print(self.analytics.summary())
             print()
+            self.ball.finish()
             print(self.ball.summary(team_name=self.classifier.team_name))
             if self.analytics_dir:
                 self.analytics.write(self.analytics_dir, team_color=self._team_color)
@@ -740,7 +742,12 @@ class PlayerTracker:
 
     def _open_writer(self, frame_budget_ms: float) -> FfmpegOutput:
         width, height = self.scaler.size
-        return FfmpegOutput(self.output_path, width, height, 1000 / frame_budget_ms)
+        # A live source's audio can't be re-read in step with our delayed
+        # frames, so only a file source keeps its sound.
+        audio_source = None if is_stream_source(self.video_source) else self.video_source
+        return FfmpegOutput(
+            self.output_path, width, height, 1000 / frame_budget_ms, audio_source=audio_source
+        )
 
     def _play(
         self,
@@ -853,6 +860,7 @@ class PlayerTracker:
             homography,
             self.analytics.latest_positions,
             team_name=self.classifier.team_name,
+            team_color=self._team_color,
         )
         if self.show_window:
             self.fps_overlay.draw(frame, native_fps=1000 / pacer.frame_budget_ms)

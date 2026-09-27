@@ -12,7 +12,7 @@ import numpy as np
 
 from scripts.analytics import PITCH_LENGTH_M, PITCH_WIDTH_M, render_pitch
 from scripts.calibration import PITCH_LINES
-from scripts.player import OTHER_TEAM, TeamClassifier
+from scripts.player import TeamClassifier
 
 UNCLASSIFIED_COLOR = (180, 180, 180)  # gray, shown before a track has enough samples
 
@@ -290,14 +290,22 @@ class PitchOverlayRenderer:
 class BallRenderer:
     """The tracked ball on the video (a ring at its pitch position, hollow and
     dimmer while coasting through a gap), a ring around the player in
-    possession, and the team pass counts in the top-right corner."""
+    possession, and the team pass counts in the top-right corner. The two
+    rings are drawn only with show_markers, the panel unless show_passes is off."""
 
     BALL_COLOR = (0, 255, 255)
     PANEL_MARGIN = 12
 
-    def draw(self, frame, ball_analytics, homography, positions: dict, team_name=str) -> None:
-        """team_name(team) -> the label shown on the panel ("white", "yellow")."""
-        if homography is not None:
+    def __init__(self, show_markers: bool = False, show_passes: bool = True):
+        self.show_markers = show_markers
+        self.show_passes = show_passes
+
+    def draw(
+        self, frame, ball_analytics, homography, positions: dict, team_name=str, team_color=None
+    ) -> None:
+        """team_name(team) -> the label shown on the panel ("white", "yellow");
+        team_color(team) -> its BGR kit colour, None until the teams are fitted."""
+        if self.show_markers and homography is not None:
             ball = ball_analytics.ball
             if ball is not None:
                 point = self._project(homography, ball.x, ball.y, frame.shape)
@@ -315,37 +323,50 @@ class BallRenderer:
                     cv2.ellipse(
                         frame, point, (22, 9), 0, 0, 360, self.BALL_COLOR, 2, lineType=cv2.LINE_AA
                     )
-        self._draw_panel(frame, ball_analytics, team_name)
+        if self.show_passes:
+            self._draw_panel(frame, ball_analytics, team_name, team_color or (lambda _team: None))
 
     PANEL_WIDTH = 260
+    PANEL_LINE_PX = 28
 
-    def _draw_panel(self, frame, ball_analytics, team_name) -> None:
-        """Completed passes per team, by jersey colour name. The breakdown
-        (short/long/lost) stays in the terminal summary and passes.json."""
+    def _draw_panel(self, frame, ball_analytics, team_name, team_color) -> None:
+        """Completed passes for both teams, from the first frame to the last:
+        the rows are always there (0 until a pass settles) and the counts
+        only ever go up. The breakdown (short/long/lost) stays in the
+        terminal summary and passes.json."""
         totals = ball_analytics.passes.team_totals()
-        lines = [
-            f"{team_name(team)} passes: {row['completed']}"
-            for team, row in sorted(totals.items(), key=lambda kv: str(kv[0]))
-            if team is not None and team != OTHER_TEAM
-        ]
-        if not lines:
-            lines = ["no passes yet"]
+        rows = []
+        for team in (0, 1):
+            color = team_color(team)
+            label = f"{team_name(team)} team" if color is not None else f"team {team + 1}"
+            rows.append((label, totals.get(team, {}).get("completed", 0), color))
         w = frame.shape[1]
         x0, y0 = w - self.PANEL_MARGIN - self.PANEL_WIDTH, self.PANEL_MARGIN
-        height = 26 * len(lines) + 10
+        height = self.PANEL_LINE_PX * (len(rows) + 1) + 12
         overlay = frame[y0 : y0 + height, x0 : x0 + self.PANEL_WIDTH]
         cv2.addWeighted(np.zeros_like(overlay), 0.55, overlay, 0.45, 0, dst=overlay)
-        for i, text in enumerate(lines):
-            cv2.putText(
-                frame,
-                text,
-                (x0 + 8, y0 + 26 * (i + 1)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (255, 255, 255),
-                2,
-                lineType=cv2.LINE_AA,
-            )
+        self._panel_text(frame, "Passes completed", (x0 + 10, y0 + self.PANEL_LINE_PX), 0.6)
+        for i, (label, count, color) in enumerate(rows):
+            baseline = y0 + self.PANEL_LINE_PX * (i + 2)
+            if color is not None:
+                cv2.rectangle(frame, (x0 + 10, baseline - 14), (x0 + 24, baseline), color, -1)
+            self._panel_text(frame, label, (x0 + 32, baseline), 0.6)
+            count_text = str(count)
+            (tw, _), _ = cv2.getTextSize(count_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            self._panel_text(frame, count_text, (x0 + self.PANEL_WIDTH - 12 - tw, baseline), 0.7)
+
+    @staticmethod
+    def _panel_text(frame, text, origin, scale) -> None:
+        cv2.putText(
+            frame,
+            text,
+            origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            (255, 255, 255),
+            2,
+            lineType=cv2.LINE_AA,
+        )
 
     @staticmethod
     def _project(homography, x, y, shape):
@@ -813,6 +834,11 @@ class FfmpegOutput(RawVideoPipe):
     file or a live stream URL (rtmp://, srt://, udp://, rtsp://).
     cv2.VideoWriter's mp4v took 10.6ms per 4K frame on the display thread;
     here the encode runs on the media engine, in ffmpeg's process.
+
+    `audio_source` (the input video file) has its audio track, if any, muxed
+    back in: every source frame is written, at the source fps, so the two
+    line up without resampling. -shortest trims the audio when playback is
+    quit early.
     """
 
     STREAM_FORMATS = {
@@ -824,11 +850,21 @@ class FfmpegOutput(RawVideoPipe):
     }
     BITS_PER_PIXEL = 0.1  # ~10 Mbit/s at 1080p50
 
-    def __init__(self, target: str, width: int, height: int, fps: float):
+    def __init__(
+        self, target: str, width: int, height: int, fps: float, audio_source: str | None = None
+    ):
         bitrate = int(width * height * fps * self.BITS_PER_PIXEL)
         command = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             *self.raw_input_args(width, height, fps),
+        ]  # fmt: skip
+        if audio_source is not None:
+            command += [
+                "-i", audio_source,
+                "-map", "0:v", "-map", "1:a?",  # "?": a silent source is fine
+                "-c:a", "aac", "-shortest",
+            ]  # fmt: skip
+        command += [
             "-c:v", "h264_videotoolbox", "-b:v", str(bitrate), "-pix_fmt", "yuv420p",
             "-g", str(round(fps * 2)),  # a keyframe every 2s, so stream viewers can join
         ]  # fmt: skip

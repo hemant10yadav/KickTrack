@@ -11,6 +11,7 @@ from scripts.pipeline import PlayerTracker, is_stream_source, resolve_video_sour
 DEFAULT_VIDEO = "data/videos/sample.mp4"
 DEFAULT_DISPLAY_DELAY_MS = 100
 DEFAULT_VIEWER = "ffplay" if shutil.which("ffplay") else "opencv"
+OUTPUT_DIR = Path("output")
 
 
 def parse_imgsz(raw: str) -> int | tuple[int, int]:
@@ -48,12 +49,15 @@ def parse_args():
     )
     parser.add_argument(
         "--output",
+        nargs="?",
+        const="",
         default=None,
         help="Write annotated frames to this video file, or stream them live to a URL "
         "(rtmp://, srt://, udp://, rtsp://), H.264-encoded on the hardware encoder via "
-        "ffmpeg, instead of (or alongside) displaying them. A file runs headless (no "
-        "window, no real-time pacing) unless --show is also passed; a stream is always "
-        "paced at the source frame rate.",
+        "ffmpeg, instead of (or alongside) displaying them. It runs headless (no "
+        "window) unless --show is also passed, and always at the source frame rate, so "
+        "the file shows what the live window would. A bare file name is saved under "
+        "output/; with no value, output/<video name>.mp4. A file keeps the source's audio.",
     )
     parser.add_argument(
         "--viewer",
@@ -87,8 +91,15 @@ def parse_args():
     parser.add_argument(
         "--show-markers",
         action="store_true",
-        help="Draw the team-coloured pin and ID label above each player. Off by default: "
-        "only the distance each player has run is shown.",
+        help="Draw the team-coloured pin and ID label above each player, and the rings on "
+        "the ball and its holder. Off by default: only the distance each player has run "
+        "and the pass panel are shown.",
+    )
+    parser.add_argument(
+        "--hide-passes",
+        action="store_true",
+        help="Leave out the pass panel (the passes are still counted and written by "
+        "--analytics-dir).",
     )
     parser.add_argument(
         "--show",
@@ -96,6 +107,20 @@ def parse_args():
         help="Display a live window. Implied when --output is not given.",
     )
     return parser.parse_args()
+
+
+def resolve_output(output: str | None, video_source: str | int) -> str | None:
+    """A bare file name (or none) goes under OUTPUT_DIR; a path or URL is kept."""
+    if output is None or is_stream_source(output):
+        return output
+    if not output:
+        stem = Path(video_source).stem if isinstance(video_source, str) else "camera"
+        output = f"{stem}.mp4"
+    path = Path(output)
+    if path.parent == Path("."):
+        path = OUTPUT_DIR / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
 
 
 def main():
@@ -109,20 +134,24 @@ def main():
         print("Place a fixed-camera football video there, or pass a path as an argument.")
         sys.exit(1)
 
+    args.output = resolve_output(args.output, video_source)
     model = YOLO(pipeline.MODEL_NAME)
     show_window = args.show or args.output is None
-    streaming = args.output is not None and is_stream_source(args.output)
     PlayerTracker(
         video_source,
         model,
         show_window=show_window,
         output_path=args.output,
-        realtime=show_window or streaming,
+        # Always paced: the inference and calibration workers only take the
+        # newest frame, so an unpaced file run read match_6 3x faster than
+        # they could follow -- calibration came late and passes went uncounted.
+        realtime=True,
         analytics_dir=args.analytics_dir,
         display_width=args.display_width,
         display_delay_ms=args.display_delay_ms,
         viewer=args.viewer,
         show_markers=args.show_markers,
+        show_passes=not args.hide_passes,
     ).run()
 
 
