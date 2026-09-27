@@ -11,6 +11,8 @@
 #   ./demo.sh --publish               -> renders every clip in demos.txt and pushes them
 #                                        to the gh-pages branch, served at
 #                                        https://hemant10yadav.github.io/KickTrack/demos/<name>.mp4
+#   ./demo.sh --publish --no-render   -> pushes the demos already in demos/, without
+#                                        rendering them again
 #
 # Names are looked up in data/videos/. demos.txt lists one clip per line, with
 # an optional time range: "match_6 0:40-1:10".
@@ -37,8 +39,8 @@
 #   ./demo.sh match_6 --show --analytics-dir demos/match_6_stats
 #   ./demo.sh --publish --show-markers
 #
-# Web encode: DEMO_WIDTH (default 1920) and DEMO_CRF (default 26; higher is
-# smaller and blurrier) override it, e.g. DEMO_WIDTH=1280 ./demo.sh match_5
+# Web encode: DEMO_WIDTH (default 1280) and DEMO_CRF (default 28; higher is
+# smaller and blurrier) override it, e.g. DEMO_WIDTH=1920 ./demo.sh match_5
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -46,8 +48,8 @@ OUT_DIR=demos
 WORK_DIR=$OUT_DIR/.work
 CLIP_LIST=demos.txt
 PAGES_BRANCH=gh-pages
-DEMO_WIDTH=${DEMO_WIDTH:-1920}
-DEMO_CRF=${DEMO_CRF:-26}
+DEMO_WIDTH=${DEMO_WIDTH:-1280}
+DEMO_CRF=${DEMO_CRF:-28}
 # A trimmed clip is tracked from this many seconds before its start, then cut:
 # starting cold, calibration and team colours take a while to lock on.
 WARMUP_S=10
@@ -56,10 +58,15 @@ WARMUP_S=10
 seconds() { awk -F: '{ s = 0; for (i = 1; i <= NF; i++) s = s * 60 + $i; print s }' <<<"$1"; }
 
 publish=false
+render_clips=true
 clips=()
 if [ "${1:-}" = "--publish" ]; then
   publish=true
   shift
+  if [ "${1:-}" = "--no-render" ]; then
+    render_clips=false
+    shift
+  fi
   while read -r name range _; do
     case "$name" in "" | "#"*) continue ;; esac
     clips+=("$name${range:+@$range}")
@@ -120,12 +127,16 @@ render() {
 failed=()
 published=()
 for clip in "${clips[@]}"; do
-  if render "$clip" "$@"; then
-    name=${clip%@*}
-    published+=("$(basename "${name%.*}")")
-  else
+  name=${clip%@*}
+  name=$(basename "${name%.*}")
+  if $render_clips; then
+    render "$clip" "$@" || { failed+=("$clip"); continue; }
+  elif [ ! -f "$OUT_DIR/$name.mp4" ] || [ ! -f "$OUT_DIR/$name.jpg" ]; then
+    echo "not rendered yet: $OUT_DIR/$name.mp4 (run without --no-render)" >&2
     failed+=("$clip")
+    continue
   fi
+  published+=("$name")
 done
 
 if [ ${#failed[@]} -gt 0 ]; then
@@ -147,7 +158,9 @@ if $publish; then
   done
   touch "$pages/.nojekyll"
   git -C "$pages" add -f .nojekyll demos
-  git -C "$pages" commit -qm "demos from $(git rev-parse --short HEAD)"
+  # --no-verify: the repo's pre-commit hooks are for code, and this branch has
+  # no hook config (prek refuses to commit without one).
+  git -C "$pages" commit -q --no-verify -m "demos from $(git rev-parse --short HEAD)"
   git -C "$pages" push -qf origin "HEAD:$PAGES_BRANCH"
   git -C "$pages" checkout -q --detach
   git branch -D "$PAGES_BRANCH-publish" >/dev/null
