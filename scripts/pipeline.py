@@ -1,5 +1,4 @@
 import re
-import sys
 import threading
 import time
 from collections import deque
@@ -28,6 +27,7 @@ from scripts.display import (
     FpsOverlay,
     FramePacer,
     MarkerRenderer,
+    Overlays,
     PitchMinimap,
     PitchOverlayRenderer,
     PlaybackDelay,
@@ -88,6 +88,9 @@ INFERENCE_IMGSZ = (640, 1152)
 # detection, identity, drawing, the window, the output -- runs at that size
 # (see FrameScaler). 1920 leaves every current 1080p clip exactly as it was.
 DISPLAY_WIDTH = 1920
+# How far the display holds each frame back so AI results exist on both sides
+# of it and its boxes are interpolated onto it (see ResultTimeline).
+DISPLAY_DELAY_MS = 100
 
 # BoT-SORT's camera-motion compensation (sparse optical flow) runs on the frame
 # shrunk by this factor; ultralytics hardcodes 2, and botsort.yaml cannot set it.
@@ -116,6 +119,10 @@ def resolve_video_source(raw: str) -> str | int:
 
 def is_stream_source(source: str | int) -> bool:
     return isinstance(source, int) or bool(STREAM_SCHEME_RE.match(source))
+
+
+class VideoOpenError(RuntimeError):
+    """cv2 could not open the video source."""
 
 
 class FrameScaler:
@@ -520,6 +527,13 @@ class PlayerTracker:
     display always paces at the video's real frame rate, independent of how
     long a single inference call takes. Each new worker result is turned into
     identified players here, on the display thread (see IdentityResolver).
+
+    What gets drawn is read from `overlays` on every frame, so the caller can
+    change it mid-run. Each annotated frame goes to the window, the --output
+    writer and `frame_sink` (anything with write(frame), e.g. the web page's
+    FrameBroadcaster; the caller owns it, it is never released here). run()
+    blocks until the video ends, the window is closed or stop() is called
+    from another thread.
     """
 
     WINDOW_NAME = "Football Tracker"
@@ -536,8 +550,8 @@ class PlayerTracker:
         display_width: int = DISPLAY_WIDTH,
         display_delay_ms: float = 0,
         viewer: str = "opencv",
-        show_markers: bool = False,
-        show_passes: bool = True,
+        overlays: Overlays | None = None,
+        frame_sink=None,
     ):
         self.video_source = video_source
         self.model = model
@@ -552,16 +566,19 @@ class PlayerTracker:
         self.display_delay_ms = display_delay_ms
         self.viewer_kind = viewer  # "opencv" (cv2.imshow) or "ffplay" (FfplayViewer)
         self.viewer = None
+        self.overlays = Overlays() if overlays is None else overlays
+        self.frame_sink = frame_sink
+        self._stop_requested = threading.Event()
         self.scaler = None  # FrameScaler, created once the source size is known
         self.analytics = None  # MatchAnalytics, created once the video's fps is known
         self.ball = None  # BallAnalytics, likewise
         self.writer = None
         self.classifier = TeamClassifier()
         self.resolver = IdentityResolver(self.classifier)
-        self.renderer = MarkerRenderer(self.classifier, show_markers=show_markers)
+        self.renderer = MarkerRenderer(self.classifier)
         self.pitch_overlay = PitchOverlayRenderer()
         self.minimap = PitchMinimap()
-        self.ball_renderer = BallRenderer(show_markers=show_markers, show_passes=show_passes)
+        self.ball_renderer = BallRenderer()
         self.timeline = ResultTimeline()
         self.smoother = DisplaySmoother()
         self.fader = FadeController()
@@ -658,11 +675,14 @@ class PlayerTracker:
                 print("Calibration: no result yet")
             print(self.homography_worker.summary())
 
+    def stop(self) -> None:
+        """Ends run() after the frame in progress; safe from any thread."""
+        self._stop_requested.set()
+
     def _open_capture(self) -> cv2.VideoCapture:
         cap = cv2.VideoCapture(self.video_source)
         if not cap.isOpened():
-            print(f"Could not open video: {self.video_source}")
-            sys.exit(1)
+            raise VideoOpenError(f"Could not open video: {self.video_source}")
         return cap
 
     def _warmup(self):
@@ -816,6 +836,8 @@ class PlayerTracker:
                     cv2.imshow(self.WINDOW_NAME, frame)
                 if self.writer is not None:
                     self.writer.write(frame)
+                if self.frame_sink is not None:
+                    self.frame_sink.write(frame)
                 t4 = time.perf_counter()
 
             if self.realtime:
@@ -838,29 +860,44 @@ class PlayerTracker:
                 break
             if self.viewer is not None and self.viewer.closed:
                 break  # its window was closed
+            if self._stop_requested.is_set():
+                break
 
     def _draw(self, frame: np.ndarray, frame_id: int, pacer: FramePacer) -> None:
         boxes, coasting_progress, synced = self.timeline.boxes_at(frame_id)
         boxes = self.smoother.smooth(boxes, ease=not synced)
         alphas = self.fader.update(boxes, coasting_progress)
         homography = self._homography_for(frame_id)
-        self.pitch_overlay.draw(frame, homography)
-        self.renderer.draw(frame, boxes, alphas, captions=self._distance_captions(boxes))
-        self.minimap.draw(
+        overlays = self.overlays
+        if overlays.pitch_lines:
+            self.pitch_overlay.draw(frame, homography)
+        # Always called, even with nothing to draw: it eases the pin anchors.
+        self.renderer.draw(
             frame,
-            self.analytics.latest_positions,
-            self.classifier.team_for,
-            self._team_color,
-            ball=self.ball.ball,
-            holder=self.ball.holder,
+            boxes,
+            alphas,
+            captions=self._distance_captions(boxes) if overlays.distances else None,
+            pins=overlays.markers,
         )
-        self.ball_renderer.draw(
-            frame,
-            self.ball,
-            homography,
-            self.analytics.latest_positions,
-            team_name=self.classifier.team_name,
-            team_color=self._team_color,
-        )
-        if self.show_window:
+        if overlays.minimap:
+            self.minimap.draw(
+                frame,
+                self.analytics.latest_positions,
+                self.classifier.team_for,
+                self._team_color,
+                ball=self.ball.ball,
+                holder=self.ball.holder,
+            )
+        if overlays.ball:
+            self.ball_renderer.draw_rings(
+                frame, self.ball, homography, self.analytics.latest_positions
+            )
+        if overlays.passes:
+            self.ball_renderer.draw_panel(
+                frame,
+                self.ball,
+                team_name=self.classifier.team_name,
+                team_color=self._team_color,
+            )
+        if overlays.fps:
             self.fps_overlay.draw(frame, native_fps=1000 / pacer.frame_budget_ms)

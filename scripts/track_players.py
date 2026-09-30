@@ -6,10 +6,15 @@ from pathlib import Path
 from ultralytics import YOLO
 
 from scripts import pipeline
-from scripts.pipeline import PlayerTracker, is_stream_source, resolve_video_source
+from scripts.display import Overlays
+from scripts.pipeline import (
+    PlayerTracker,
+    VideoOpenError,
+    is_stream_source,
+    resolve_video_source,
+)
 
 DEFAULT_VIDEO = "data/videos/sample.mp4"
-DEFAULT_DISPLAY_DELAY_MS = 100
 DEFAULT_VIEWER = "ffplay" if shutil.which("ffplay") else "opencv"
 OUTPUT_DIR = Path("output")
 
@@ -77,10 +82,10 @@ def parse_args():
     parser.add_argument(
         "--display-delay-ms",
         type=float,
-        default=DEFAULT_DISPLAY_DELAY_MS,
+        default=pipeline.DISPLAY_DELAY_MS,
         help="Show each frame this much later than it is read, so its markers come from "
         "detections of that same frame instead of trailing the players by an inference "
-        f"cycle. 0 shows frames as read (default: {DEFAULT_DISPLAY_DELAY_MS:g})",
+        f"cycle. 0 shows frames as read (default: {pipeline.DISPLAY_DELAY_MS:g})",
     )
     parser.add_argument(
         "--analytics-dir",
@@ -137,7 +142,13 @@ def main():
     args.output = resolve_output(args.output, video_source)
     model = YOLO(pipeline.MODEL_NAME)
     show_window = args.show or args.output is None
-    PlayerTracker(
+    overlays = Overlays(
+        markers=args.show_markers,
+        ball=args.show_markers,
+        passes=not args.hide_passes,
+        fps=show_window,  # a headless --output file never had it
+    )
+    tracker = PlayerTracker(
         video_source,
         model,
         show_window=show_window,
@@ -150,9 +161,12 @@ def main():
         display_width=args.display_width,
         display_delay_ms=args.display_delay_ms,
         viewer=args.viewer,
-        show_markers=args.show_markers,
-        show_passes=not args.hide_passes,
-    ).run()
+        overlays=overlays,
+    )
+    try:
+        tracker.run()
+    except VideoOpenError as error:
+        sys.exit(str(error))
 
 
 if __name__ == "__main__":

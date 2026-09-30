@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from collections import deque
+from dataclasses import asdict, dataclass, field, fields
 
 import cv2
 import numpy as np
@@ -15,6 +16,47 @@ from scripts.calibration import PITCH_LINES
 from scripts.player import TeamClassifier
 
 UNCLASSIFIED_COLOR = (180, 180, 180)  # gray, shown before a track has enough samples
+
+
+def _overlay(label: str, default: bool = True):
+    return field(default=default, metadata={"label": label})
+
+
+@dataclass
+class Overlays:
+    """Which overlays PlayerTracker._draw puts on each frame. It reads this on
+    every frame, so one instance can be shared with whatever changes it --
+    the CLI flags before playback, the web page's checkboxes during it
+    (scripts/web.py) -- and a change shows from the next frame. Only the
+    drawing is switched: the analytics behind every overlay keep running, so
+    one switched back on shows the whole match so far (distance run, passes).
+
+    Each field's label is what the web page shows by its checkbox. A new
+    overlay is a field here and one `if` in PlayerTracker._draw.
+    """
+
+    pitch_lines: bool = _overlay("Pitch lines")
+    markers: bool = _overlay("Player pins and IDs", default=False)
+    distances: bool = _overlay("Distance run")
+    ball: bool = _overlay("Ball and holder rings", default=False)
+    passes: bool = _overlay("Pass panel")
+    minimap: bool = _overlay("Minimap")
+    fps: bool = _overlay("FPS counter")
+
+    @classmethod
+    def labels(cls) -> dict[str, str]:
+        return {f.name: f.metadata["label"] for f in fields(cls)}
+
+    def as_dict(self) -> dict[str, bool]:
+        return asdict(self)
+
+    def update(self, changes: dict[str, bool]) -> None:
+        """Applies all of `changes` or, if any name is not an overlay, none."""
+        unknown = changes.keys() - self.labels().keys()
+        if unknown:
+            raise KeyError(f"unknown overlays: {', '.join(sorted(unknown))}")
+        for name, on in changes.items():
+            setattr(self, name, bool(on))
 
 
 class MarkerRenderer:
@@ -45,14 +87,15 @@ class MarkerRenderer:
     ANCHOR_EASING = 0.2
     ANCHOR_SNAP_DISTANCE_PX = 150
 
-    def __init__(self, classifier: TeamClassifier, show_markers: bool = False):
+    def __init__(self, classifier: TeamClassifier):
         self.classifier = classifier
-        self.show_markers = show_markers  # pin + ID label; off leaves only the caption
         self.anchor_positions = {}  # track_id -> (tip_x, tip_y) floats
 
-    def draw(self, frame, boxes, alphas=None, captions=None):
+    def draw(self, frame, boxes, alphas=None, captions=None, pins: bool = True):
         """captions: optional track_id -> short text drawn under the ID label
-        (the running distance covered, in the live view)."""
+        (the running distance covered, in the live view). pins=False leaves
+        out the pin and ID label and draws only the captions; the anchors are
+        still eased, so switching pins back on doesn't make them jump."""
         current_ids = set()
         for x1, y1, x2, y2, track_id in boxes:
             if track_id < 0:
@@ -65,7 +108,7 @@ class MarkerRenderer:
             tip = self._smoothed_tip(track_id, x1, y1, x2, y2)
             bbox_height = y2 - y1
             caption = None if captions is None else captions.get(track_id)
-            if self.show_markers:
+            if pins:
                 self._draw_marker(frame, tip, bbox_height, color, alpha)
                 self._draw_label(frame, x1, tip, bbox_height, track_id, color, caption)
             elif caption:
@@ -289,51 +332,44 @@ class PitchOverlayRenderer:
 
 class BallRenderer:
     """The tracked ball on the video (a ring at its pitch position, hollow and
-    dimmer while coasting through a gap), a ring around the player in
-    possession, and the team pass counts in the top-right corner. The two
-    rings are drawn only with show_markers, the panel unless show_passes is off."""
+    dimmer while coasting through a gap) with a ring around the player in
+    possession (draw_rings), and the team pass counts in the top-right corner
+    (draw_panel). Which of the two is shown is up to the caller (Overlays)."""
 
     BALL_COLOR = (0, 255, 255)
     PANEL_MARGIN = 12
 
-    def __init__(self, show_markers: bool = False, show_passes: bool = True):
-        self.show_markers = show_markers
-        self.show_passes = show_passes
-
-    def draw(
-        self, frame, ball_analytics, homography, positions: dict, team_name=str, team_color=None
-    ) -> None:
-        """team_name(team) -> the label shown on the panel ("white", "yellow");
-        team_color(team) -> its BGR kit colour, None until the teams are fitted."""
-        if self.show_markers and homography is not None:
-            ball = ball_analytics.ball
-            if ball is not None:
-                point = self._project(homography, ball.x, ball.y, frame.shape)
-                if point is not None:
-                    seen = ball.coasting_s == 0
-                    cv2.circle(frame, point, 9, (0, 0, 0), 3, lineType=cv2.LINE_AA)
-                    cv2.circle(
-                        frame, point, 9, self.BALL_COLOR, 2 if seen else 1, lineType=cv2.LINE_AA
-                    )
-            holder = ball_analytics.holder
-            if holder is not None and holder in positions:
-                x, y = positions[holder]
-                point = self._project(homography, x, y, frame.shape)
-                if point is not None:
-                    cv2.ellipse(
-                        frame, point, (22, 9), 0, 0, 360, self.BALL_COLOR, 2, lineType=cv2.LINE_AA
-                    )
-        if self.show_passes:
-            self._draw_panel(frame, ball_analytics, team_name, team_color or (lambda _team: None))
+    def draw_rings(self, frame, ball_analytics, homography, positions: dict) -> None:
+        if homography is None:
+            return
+        ball = ball_analytics.ball
+        if ball is not None:
+            point = self._project(homography, ball.x, ball.y, frame.shape)
+            if point is not None:
+                seen = ball.coasting_s == 0
+                cv2.circle(frame, point, 9, (0, 0, 0), 3, lineType=cv2.LINE_AA)
+                cv2.circle(frame, point, 9, self.BALL_COLOR, 2 if seen else 1, lineType=cv2.LINE_AA)
+        holder = ball_analytics.holder
+        if holder is not None and holder in positions:
+            x, y = positions[holder]
+            point = self._project(homography, x, y, frame.shape)
+            if point is not None:
+                cv2.ellipse(
+                    frame, point, (22, 9), 0, 0, 360, self.BALL_COLOR, 2, lineType=cv2.LINE_AA
+                )
 
     PANEL_WIDTH = 260
     PANEL_LINE_PX = 28
 
-    def _draw_panel(self, frame, ball_analytics, team_name, team_color) -> None:
+    def draw_panel(self, frame, ball_analytics, team_name=str, team_color=None) -> None:
         """Completed passes for both teams, from the first frame to the last:
         the rows are always there (0 until a pass settles) and the counts
         only ever go up. The breakdown (short/long/lost) stays in the
-        terminal summary and passes.json."""
+        terminal summary and passes.json.
+
+        team_name(team) -> the label shown on the panel ("white", "yellow");
+        team_color(team) -> its BGR kit colour, None until the teams are fitted."""
+        team_color = team_color or (lambda _team: None)
         totals = ball_analytics.passes.team_totals()
         rows = []
         for team in (0, 1):
