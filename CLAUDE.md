@@ -175,6 +175,23 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   here with a replay against full calibrations of every 10th frame, not by eye
   alone.
 
+- **The web UI runs the CLI's pipeline, and switches overlays per frame**
+  (`web/`, `docs/PLAN.md` Plan 3.6): `uv run python -m web` runs the same
+  `PlayerTracker` on a background thread (one video at a time, a fresh model
+  per video: BoT-SORT's tracks and the ball callback live on the model) and
+  streams its annotated frames as MJPEG (`FrameBroadcaster`: the display thread
+  only hands a frame over, one thread encodes the newest; match_5 reaches the
+  page at its native 50fps). What's drawn comes from `Overlays`
+  (`scripts/display.py`), read in `PlayerTracker._draw` every frame; the CLI
+  flags only set its starting values. **A new overlay is a field in `Overlays`
+  plus one `if` in `_draw`** -- the page builds its checkboxes from the field
+  labels, and `tests/test_overlays.py` fails for an overlay drawn whatever its
+  switch says. Keep the CLI and `demo.sh` output identical when touching this.
+  Picked files are uploaded into `data/videos/` (a browser never gives the page
+  a file's path). `timeout_graceful_shutdown` in `web/__main__.py` is required:
+  the stream only ends in the app's shutdown, which uvicorn runs after open
+  responses finish, so without it an open page blocked Ctrl-C/SIGTERM.
+
 ## Known gotchas
 - **Safe-chain proxy** wraps `uv`/npm on this machine and can block package resolution
   with "minimum package age" errors, or throttle/break large downloads (e.g. model
@@ -220,12 +237,17 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   tracker is not a Kalman filter, and Plan 3.3 for why a pass's team is never
   the team read at that instant. Verify pass changes against the match_5 hand
   labels (`tests/test_pass_replay.py`) *and* fresh realtime runs of both clips.
-- `scripts/display.py` — everything "what gets shown on screen": `MarkerRenderer`
+- `scripts/display.py` — everything "what gets shown on screen": `Overlays`
+  (which overlays are drawn, switchable mid-run), `MarkerRenderer`
   (pins, ID labels, running-distance captions), `PitchMinimap` (live top-down
   positions and the ball), `BallRenderer` (ball ring, holder ring, pass panel),
   `PitchOverlayRenderer`,
   `ResultTimeline`, `PlaybackDelay`, `DisplaySmoother`, `FadeController`, `FramePacer`,
   `StalenessTracker`/`WorkerStats`/`DisplayStats`
+- `web/` — the web UI (`uv run python -m web`): `app.py` (FastAPI routes,
+  `TrackingSession`/`SessionManager`, video list and upload), `stream.py`
+  (`FrameBroadcaster`, the MJPEG stream), `static/index.html` (the page, plain
+  JS), `__main__.py` (uvicorn entrypoint)
 - `scripts/botsort_custom.yaml` — tracker tuning
 - `yolo26s.mlpackage` — the CoreML-exported model actually used at runtime (gitignored,
   like other `.pt`/model weight files — regenerate with the export command above)

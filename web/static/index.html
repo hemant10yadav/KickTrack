@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KickTrack</title>
+  <style>
+    :root {
+      --bg: #0e1116;
+      --panel: #161b22;
+      --panel-raised: #1f2630;
+      --border: #2a323d;
+      --text: #e6edf3;
+      --muted: #8b96a3;
+      --accent: #3fb950;
+      --accent-soft: rgba(63, 185, 80, 0.14);
+      --danger: #f85149;
+      --warn: #d29922;
+      --radius: 8px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 { margin: 0; font-size: 16px; letter-spacing: 0.02em; }
+    header .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+    main {
+      display: grid;
+      grid-template-columns: 240px minmax(0, 1fr) 240px;
+      gap: 16px;
+      padding: 16px 20px;
+      align-items: start;
+    }
+    @media (max-width: 1000px) {
+      main { grid-template-columns: minmax(0, 1fr); }
+      .stage-column { order: -1; }
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px;
+    }
+    .panel h2 {
+      margin: 0 0 10px;
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }
+    .panel + .panel { margin-top: 16px; }
+
+    /* Video list and path */
+    .videos { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+    .videos button {
+      width: 100%;
+      text-align: left;
+      padding: 8px 10px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+    }
+    .videos button:hover { background: var(--panel-raised); }
+    .videos button[aria-current="true"] {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+    }
+    .empty { color: var(--muted); margin: 0; }
+    .open-file { display: grid; gap: 8px; }
+    .open-file input[type="file"] { display: none; }
+    .open-file .button { width: 100%; }
+    .button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    progress {
+      width: 100%;
+      height: 6px;
+      appearance: none;
+      border: none;
+      border-radius: 3px;
+      background: var(--panel-raised);
+      overflow: hidden;
+    }
+    progress::-webkit-progress-bar { background: var(--panel-raised); }
+    progress::-webkit-progress-value { background: var(--accent); }
+    progress::-moz-progress-bar { background: var(--accent); }
+    .upload-status { margin: 0; color: var(--muted); font-size: 12px; }
+    .button {
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--panel-raised);
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+    }
+    .button:hover:not(:disabled) { border-color: var(--muted); }
+    .button:disabled { opacity: 0.45; cursor: default; }
+    .button.primary { background: var(--accent); border-color: var(--accent); color: #0b1a0f; font-weight: 600; }
+
+    /* Stage */
+    .stage {
+      position: relative;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .stage img { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .stage img:not([src]) { visibility: hidden; }  /* no broken-image icon before the stream */
+    .stage .message {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      text-align: center;
+      color: var(--muted);
+      background: rgba(0, 0, 0, 0.6);
+    }
+    .stage .message[hidden] { display: none; }
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 10px;
+    }
+    .status-bar .source {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+    }
+    .pill {
+      padding: 2px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      background: var(--panel-raised);
+      color: var(--muted);
+    }
+    .pill[data-state="playing"] { background: var(--accent-soft); color: var(--accent); }
+    .pill[data-state="loading"], .pill[data-state="stopping"] { color: var(--warn); }
+    .pill[data-state="error"] { color: var(--danger); }
+
+    /* Overlays */
+    .overlays { display: grid; gap: 2px; }
+    .overlays label {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 7px 8px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .overlays label:hover { background: var(--panel-raised); }
+    .overlays input { width: 16px; height: 16px; accent-color: var(--accent); margin: 0; }
+    .hint { margin: 10px 0 0; color: var(--muted); font-size: 12px; }
+    .error-text { color: var(--danger); margin: 0; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="dot" aria-hidden="true"></span>
+    <h1>KickTrack</h1>
+  </header>
+
+  <main>
+    <aside>
+      <section class="panel">
+        <h2>Videos</h2>
+        <ul class="videos" id="videos"></ul>
+        <p class="empty" id="videos-empty" hidden>No videos in data/videos/ yet.</p>
+      </section>
+      <section class="panel">
+        <h2>Open a file</h2>
+        <div class="open-file">
+          <input type="file" id="file" accept="video/*,.mkv">
+          <button class="button primary" id="choose" type="button">Choose a video…</button>
+          <progress id="upload-progress" max="1" value="0" hidden></progress>
+          <p class="upload-status" id="upload-status" hidden></p>
+          <p class="error-text" id="open-error" hidden></p>
+        </div>
+      </section>
+    </aside>
+
+    <section class="stage-column">
+      <div class="stage">
+        <img id="stream" alt="Tracked match video">
+        <div class="message" id="message">Pick a video to start tracking.</div>
+      </div>
+      <div class="status-bar">
+        <span class="pill" id="state" data-state="idle">idle</span>
+        <span class="source" id="source"></span>
+        <button class="button" id="stop" type="button" disabled>Stop</button>
+      </div>
+    </section>
+
+    <aside>
+      <section class="panel">
+        <h2>Overlays</h2>
+        <div class="overlays" id="overlays"></div>
+        <p class="hint">Changes show on the next frame. Analytics keep running while an overlay is off.</p>
+      </section>
+    </aside>
+  </main>
+
+  <script>
+    const MESSAGES = {
+      idle: "Pick a video to start tracking.",
+      loading: "Loading the model…",
+      finished: "Video finished. Pick another to keep going.",
+      stopping: "Stopping…",
+      stopped: "Stopped.",
+    };
+
+    const $ = (id) => document.getElementById(id);
+    let currentSource = null;
+    let videos = [];  // as the server last listed them
+    // A poll that overlapped a play/stop request may describe the session
+    // before it, so it is dropped: none may be in flight when it lands, and
+    // none may have finished since it was sent.
+    let requestsInFlight = 0;
+    let requestsFinished = 0;
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        headers: { "Content-Type": "application/json" },
+        ...options,
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail || response.statusText);
+      return body;
+    }
+
+    async function refreshVideos() {
+      videos = await api("/api/videos");
+      const list = $("videos");
+      list.replaceChildren();
+      $("videos-empty").hidden = videos.length > 0;
+      for (const video of videos) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = video.name;
+        button.dataset.path = video.path;
+        button.addEventListener("click", () => play(video.path));
+        const item = document.createElement("li");
+        item.append(button);
+        list.append(item);
+      }
+      renderStatus({ ...lastStatus });  // re-mark the playing one
+    }
+
+    function renderOverlays(overlays) {
+      const container = $("overlays");
+      container.replaceChildren();
+      for (const overlay of overlays) {
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.checked = overlay.on;
+        input.addEventListener("change", () => setOverlay(overlay.name, input));
+        const label = document.createElement("label");
+        label.append(input, overlay.label);
+        container.append(label);
+      }
+    }
+
+    let lastStatus = { state: "idle", source: null, error: null };
+
+    function renderStatus(status) {
+      lastStatus = status;
+      currentSource = status.source;
+      $("state").textContent = status.state;
+      $("state").dataset.state = status.state;
+      $("source").textContent = status.source || "";
+      $("source").title = status.source || "";
+      $("stop").disabled = !["loading", "playing"].includes(status.state);
+
+      const message = status.state === "error" ? `Error: ${status.error}` : MESSAGES[status.state];
+      $("message").textContent = message || "";
+      $("message").hidden = status.state === "playing";
+
+      for (const button of document.querySelectorAll(".videos button")) {
+        button.setAttribute("aria-current", String(button.dataset.path === status.source));
+      }
+    }
+
+    async function sessionRequest(options) {
+      requestsInFlight++;
+      try {
+        return await api("/api/session", options);
+      } finally {
+        requestsInFlight--;
+        requestsFinished++;
+      }
+    }
+
+    function showError(message) {
+      $("open-error").textContent = message || "";
+      $("open-error").hidden = !message;
+    }
+
+    async function play(source) {
+      showError(null);
+      renderStatus({ state: "loading", source, error: null });
+      try {
+        renderStatus(await sessionRequest({ method: "POST", body: JSON.stringify({ source }) }));
+      } catch (error) {
+        showError(error.message);
+        refreshStatus();
+      }
+    }
+
+    // The browser never tells the page where a picked file lives, so it is
+    // uploaded into data/videos/ and played from there -- unless the same
+    // file (name and size) is already there.
+    function upload(file, onProgress) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", `/api/videos?name=${encodeURIComponent(file.name)}`);
+        xhr.upload.addEventListener("progress", (event) => {
+          if (event.lengthComputable) onProgress(event.loaded / event.total);
+        });
+        xhr.addEventListener("load", () => {
+          let body = {};
+          try { body = JSON.parse(xhr.responseText); } catch {}
+          if (xhr.status >= 200 && xhr.status < 300) resolve(body);
+          else reject(new Error(body.detail || `Upload failed (${xhr.status})`));
+        });
+        xhr.addEventListener("error", () => reject(new Error("Upload failed: server unreachable")));
+        xhr.send(file);
+      });
+    }
+
+    async function openFile(file) {
+      showError(null);
+      const existing = videos.find((v) => v.name === file.name && v.size === file.size);
+      if (existing) return play(existing.path);
+
+      const progress = $("upload-progress");
+      const status = $("upload-status");
+      $("choose").disabled = true;
+      progress.hidden = status.hidden = false;
+      const sizeMb = (file.size / 1e6).toFixed(0);
+      const onProgress = (fraction) => {
+        progress.value = fraction;
+        status.textContent = `Copying ${file.name}: ${Math.round(fraction * 100)}% of ${sizeMb} MB`;
+      };
+      onProgress(0);
+      try {
+        const video = await upload(file, onProgress);
+        await refreshVideos();
+        await play(video.path);
+      } catch (error) {
+        showError(error.message);
+      } finally {
+        $("choose").disabled = false;
+        progress.hidden = status.hidden = true;
+      }
+    }
+
+    async function setOverlay(name, input) {
+      try {
+        renderOverlays(await api("/api/overlays", {
+          method: "PATCH",
+          body: JSON.stringify({ [name]: input.checked }),
+        }));
+      } catch (error) {
+        input.checked = !input.checked;  // the server kept the old value
+        console.error(error);
+      }
+    }
+
+    async function refreshStatus() {
+      try {
+        const finishedBefore = requestsFinished;
+        const status = await api("/api/session");
+        if (!requestsInFlight && requestsFinished === finishedBefore) renderStatus(status);
+      } catch (error) {
+        renderStatus({ state: "error", source: currentSource, error: "server unreachable" });
+      }
+    }
+
+    $("choose").addEventListener("click", () => $("file").click());
+    $("file").addEventListener("change", () => {
+      const [file] = $("file").files;
+      $("file").value = "";  // so picking the same file again still fires
+      if (file) openFile(file);
+    });
+    $("stop").addEventListener("click", async () => {
+      $("stop").disabled = true;
+      renderStatus(await sessionRequest({ method: "DELETE" }));
+    });
+
+    // Connected after load: the stream never ends, so as a src from the
+    // start it would keep the page loading.
+    window.addEventListener("load", () => { $("stream").src = "/stream"; });
+    refreshVideos();
+    api("/api/overlays").then(renderOverlays);
+    refreshStatus();
+    setInterval(refreshStatus, 1000);
+  </script>
+</body>
+</html>

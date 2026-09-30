@@ -50,13 +50,26 @@ uv run python -m scripts.track_players data/videos/match_5.mp4
 
 This opens a live window playing the video with a marker + ID on each detected player. Press `q` to quit.
 
+Or use the web UI: pick a video (from `data/videos/`, or any file through the
+browser's file chooser), watch it tracked live, and switch overlays (pitch
+lines, player pins and IDs, distance run, ball rings, pass panel, minimap, FPS)
+on and off while it plays:
+
+```bash
+uv run python -m web                 # then open http://127.0.0.1:8000
+uv run python -m web --port 9000     # another port; --host 0.0.0.0 for the LAN
+```
+
 ## Project structure
 
 ```
 scripts/track_players.py   # CLI entrypoint (parse_args, main)
 scripts/pipeline.py        # tracking pipeline (PlayerTracker, InferenceWorker, detection, video source)
 scripts/player.py          # TeamClassifier, PlayerIdentityManager, StateManager
-scripts/display.py         # MarkerRenderer, FramePacer, motion/fade/stats
+scripts/display.py         # Overlays, MarkerRenderer, FramePacer, motion/fade/stats
+web/app.py                 # FastAPI web UI: video list/upload, tracking sessions, overlay API
+web/stream.py              # annotated frames to the browser as MJPEG (FrameBroadcaster)
+web/static/index.html      # the page: videos, live video, overlay checkboxes
 scripts/botsort_custom.yaml # tracker tuning (camera motion compensation, track buffer)
 data/videos/                # test footage
 docs/PLAN.md                 # milestone checklist
