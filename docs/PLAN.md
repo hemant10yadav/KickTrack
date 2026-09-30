@@ -501,7 +501,58 @@ Take a fixed-camera football video and show a marker on each player that moves w
   - [X] Possession detection and team pass counts (Plan 3.2)
   - [X] Pass counter that holds up on real footage (Plan 3.3)
   - [X] Team shape: width, depth, area, defensive line, in and out of possession (Plan 3.4)
-  - [ ] (Longer-term, not yet scoped in detail) formations, passing networks
+  - [X] Formation lines: defence, midfield and attack of the team without the ball (Plan 3.5)
+  - [ ] (Longer-term, not yet scoped in detail) passing networks
+
+- [X] **Plan 3.5: Formation Lines**
+
+  The team without the ball gets its defence, midfield and attack drawn as
+  dots at its players' feet joined across the pitch, one colour per line,
+  and its line counts ("4-4-2") in the panel; the team with the ball keeps
+  its outline. `FormationLines` (`scripts/analytics.py`), fed by
+  `TeamShapeAnalytics`; drawn by `TeamShapeOverlay`. Prototyped offline on
+  the five recordings before any drawing, and checked on frames and on
+  half-second contact sheets of fresh realtime runs.
+
+  - [X] **Lines from where players are now, not a named formation.** A fit
+        of fixed formations (4-4-2, 4-3-3, 5-4-1, ...) to 15 s averages was
+        tried first: after fixing a bug (it kept the 10 most *advanced* ids
+        when stale ones were in the window) and adding hysteresis it was
+        stable (2-3 changes a minute), but wrong on the video -- match_5's
+        City pressed with two centre backs on halfway and three players
+        6-10 m ahead, which it could only call a back five. Now each
+        player's depth in front of his team's last man (so the team moving
+        as one moves no one between lines) is smoothed over 1 s, and the
+        sorted team is cut into three where the cut leaves least spread
+        inside the lines. match_5 City: 4-2-4, 2-3-5 and 3-2-5 while pressing
+        (12-24 s), 5-4-1 / 6-3-1 / 4-4-1 once camped in their box (24-35 s);
+        Tottenham 4-3-3 when they come into view.
+  - [X] **Stable without lagging.** A new cut replaces the lines only when
+        it fits 20% better for 1 s: a full back hovering across the cut
+        point switches lines 5 times in 6 s without it, 0 with it. Lines
+        change ~10 times a minute on the long clips -- the players moving,
+        not flicker, on the contact sheets.
+  - [X] **Possession held while the ball travels.** The ball is at a
+        player's feet in 15-30% of results; a team now keeps possession
+        until the other one has it for 1 s (or 10 s with nobody on it). The
+        1 s stops a misread touch moving the lines to the other team and
+        back: team swaps per minute match_5 3.6 -> 0, match_6 4.1 -> 1.6,
+        match_8 6.0 -> 1.3. Lines are drawn 54-68% of the time on each clip.
+  - [X] **Cost:** 2.0 ms average draw and 40 of 1750 frames skipped on
+        match_5, as before the lines.
+  - [X] Tests: `tests/test_analytics.py` (+6: cut at the gaps, a player
+        hovering between lines, a player who moves up for good, too few
+        players and the gone, the "4-4-2" label, possession held and
+        switched), `tests/test_shape_replay.py` (+2: City pressing with few
+        back then a block of four or more; Tottenham's back four),
+        `tests/test_pitch_overlay.py` (joined dots in line colours, outline
+        while possession is unknown). The hysteresis and the possession
+        switch were each checked to fail their test when switched off.
+  - [ ] **Known limits.** Always three lines, so 4-2-3-1 reads as 4-5-1.
+        A player's line needs his team's last man in view. A new id starts
+        without a depth history and is put in the nearest line. Possession
+        comes from the ball track, so a long spell with the ball unseen ends
+        in outlines only.
 
 - [ ] **Plan 3.4: Team Shape**
 

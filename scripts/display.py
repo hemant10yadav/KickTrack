@@ -255,74 +255,66 @@ class PitchMinimap:
 
 
 class TeamShapeOverlay:
-    """Each team's outline and defensive line drawn on the pitch in the video.
+    """The formation lines of the team without the ball, and the outline of
+    the team with it, drawn on the pitch in the video.
 
-    The outline goes through the feet of the shape's players in the boxes
-    shown on this very frame (ResultTimeline's), not their positions at the
-    last shape sample, so it sits on them like the markers do; a projection
-    keeps a convex outline convex, so the outline of the feet on screen is
-    the pitch outline seen by the camera. The defensive line runs
-    touchline to touchline on the grass at the team's last outfield man,
-    found on this frame too -- the same feet taken to the pitch through the
-    frame's own homography -- so it moves with him; drawn from the 0.1 s
-    shape samples, smoothed for the panel, it trailed a stepping-up defence.
-    It is drawn while the line is measurable (the team's own-goal end in
-    view, see TeamShapeAnalytics), since otherwise the deepest player seen
-    need not be the last man.
-    Thin lines only, so the players stay the thing to look at (a faint tint
-    inside was tried: blending its bounding box of a 1920-wide frame cost
-    0.65 ms per team, for a tint hardly seen); the second team's lines are
-    dashed, because two pale kits (sky blue and white on match_5) otherwise
-    read as the same outline."""
+    The team without the ball gets its defence, midfield and attack
+    (FormationLines) as dots at its players' feet joined across the pitch,
+    touchline side to touchline side, one colour per line. Everything goes
+    through the feet in the boxes shown on this very frame
+    (ResultTimeline's), not the positions of the last 0.1 s shape sample, so
+    the lines move with the players the way the markers do; the lines only
+    decide who is in which. The team with the ball -- and both teams while
+    possession is not known, or before a team's lines are -- gets a thin
+    outline through the same feet (a projection keeps a convex outline
+    convex, so it is the pitch outline seen by the camera). The second team's
+    outline is dashed, as two pale kits (sky blue and white on match_5) read
+    alike. Thin lines only: a faint tint inside the outline was tried and
+    blending its box of a 1920-wide frame cost 0.65 ms per team.
+    """
 
     OUTLINE_PX = 1
     LINE_PX = 2
+    DOT_RADIUS = 4
+    # defence, midfield, attack; not red, the colour of the pitch-calibration lines
+    LINE_COLORS = ((255, 60, 200), (0, 210, 255), (255, 190, 40))
     DASHED_TEAM = 1
     DASH_PX, GAP_PX = 8, 6
 
-    def __init__(self):
-        self._projector = PitchOverlayRenderer()
-
     def draw(self, frame, boxes, shape_analytics, homography, team_color) -> None:
         feet = {track_id: ((x1 + x2) / 2, y2) for x1, _y1, x2, y2, track_id in boxes}
-        h, w = frame.shape[:2]
         projector = PitchProjector(homography)
+        defending = shape_analytics.defending_team
         for team, shape in shape_analytics.latest.items():
-            color = team_color(team)
-            if color is None:
+            if team == defending and shape.lines is not None:
+                self._draw_lines(frame, shape.lines, feet, projector)
                 continue
+            color = team_color(team)
             points = np.array([feet[pid] for pid in shape.player_ids if pid in feet], np.float32)
-            dashed = team == self.DASHED_TEAM
-            if len(points) >= 3:
-                self._draw_outline(frame, cv2.convexHull(points).astype(np.int32), color, dashed)
-            x = self._last_man_x(team, shape, shape_analytics, feet, projector)
-            if x is not None:
-                a = self._projector._project(homography, x, -PITCH_WIDTH_M / 2, w, h)
-                b = self._projector._project(homography, x, PITCH_WIDTH_M / 2, w, h)
-                if a is not None and b is not None:
-                    self._segment(frame, a, b, color, self.LINE_PX, dashed)
+            if color is not None and len(points) >= 3:
+                hull = cv2.convexHull(points).astype(np.int32)
+                self._draw_outline(frame, hull, color, team == self.DASHED_TEAM)
 
-    @staticmethod
-    def _last_man_x(team, shape, shape_analytics, feet, projector) -> float | None:
-        """Pitch x of the team's player nearest its own goal on this frame."""
-        own_goal = shape_analytics.own_goal
-        if own_goal is None or not projector.available:
-            return None
-        if shape_analytics.display_value(team, "line_m") is None:
-            return None
-        xs = [
-            xy[0]
-            for xy in (projector.to_pitch(*feet[pid]) for pid in shape.player_ids if pid in feet)
-            if xy is not None
-        ]
-        return max(xs, key=lambda x: own_goal[team] * x) if xs else None
+    def _draw_lines(self, frame, lines, feet, projector) -> None:
+        for line, color in zip(lines, self.LINE_COLORS, strict=True):
+            shown = [feet[pid] for pid in line if pid in feet]
+            if not shown:
+                continue
+            across = [projector.to_pitch(*p) if projector.available else None for p in shown]
+            order = sorted(
+                range(len(shown)),
+                key=lambda i: across[i][1] if across[i] is not None else shown[i][0],
+            )
+            points = np.array([shown[i] for i in order])
+            if len(points) >= 2:
+                self._polyline(frame, points, color, self.LINE_PX, dashed=False)
+            for x, y in points.astype(int):
+                cv2.circle(frame, (x, y), self.DOT_RADIUS + 1, (0, 0, 0), -1, cv2.LINE_AA)
+                cv2.circle(frame, (x, y), self.DOT_RADIUS, color, -1, cv2.LINE_AA)
 
     def _draw_outline(self, frame, hull, color, dashed: bool) -> None:
         corners = hull.reshape(-1, 2)
         self._polyline(frame, np.vstack([corners, corners[:1]]), color, self.OUTLINE_PX, dashed)
-
-    def _segment(self, frame, a, b, color, thickness: int, dashed: bool) -> None:
-        self._polyline(frame, np.array([a, b]), color, thickness, dashed)
 
     def _polyline(self, frame, points: np.ndarray, color, thickness: int, dashed: bool) -> None:
         """Solid, or dashed: every dash of every edge is computed at once and
@@ -360,16 +352,16 @@ class TeamShapeOverlay:
 
 
 class TeamShapePanel:
-    """Each team's width, depth and defensive line (distance from its own
-    goal), in metres, in a panel sitting on top of the minimap. A value the
-    camera cannot measure right now (TeamShapeAnalytics) reads "-" rather
-    than a guess."""
+    """Each team's formation lines ("4-4-2", FormationLines), width, depth and
+    defensive line (distance from its own goal) in metres, in a panel sitting
+    on top of the minimap. A value the camera cannot measure right now
+    (TeamShapeAnalytics) reads "-" rather than a guess."""
 
     WIDTH = PitchMinimap.SCALE * int(PITCH_LENGTH_M)
     LINE_PX = 24
     GAP = 6
-    COLUMNS = (("width", "width_m"), ("depth", "depth_m"), ("line", "line_m"))
-    COLUMN_PX = 62
+    COLUMNS = (("lines", None), ("width", "width_m"), ("depth", "depth_m"), ("line", "line_m"))
+    COLUMN_PX = 54
 
     def draw(self, frame, shape_analytics, bottom: int, team_name=str, team_color=None) -> None:
         """bottom: the y the panel's lower edge sits at (PitchMinimap.top)."""
@@ -392,10 +384,14 @@ class TeamShapePanel:
             if color is not None:
                 cv2.rectangle(frame, (x0 + 8, baseline - 12), (x0 + 20, baseline), color, -1)
             name = team_name(team) if color is not None else f"team {team + 1}"
-            self._text(frame, name, (x0 + 26, baseline), 0.5)
+            self._text(frame, name, (x0 + 26, baseline), 0.45)
+            shape = shape_analytics.latest.get(team)
             for i, (_label, metric) in enumerate(self.COLUMNS):
-                value = shape_analytics.display_value(team, metric)
-                text = "-" if value is None else f"{value:.0f}m"
+                if metric is None:
+                    text = (shape.formation if shape is not None else None) or "-"
+                else:
+                    value = shape_analytics.display_value(team, metric)
+                    text = "-" if value is None else f"{value:.0f}m"
                 self._text_right(frame, text, self._column_right(x0, i), baseline, 0.5)
 
     def _column_right(self, x0: int, i: int) -> int:
