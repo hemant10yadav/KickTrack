@@ -160,3 +160,85 @@ def test_ball_renderer_without_calibration_still_draws_the_panel():
     frame = np.zeros((720, 1280, 3), dtype="uint8")
     BallRenderer().draw(frame, BallAnalytics(50.0), None, {})
     assert frame[:300, :, :].sum() == 0 or frame[15:60, 938:1268].sum() > 0
+
+
+def _shaped_team(x0: float):
+    from scripts.analytics import TeamShapeAnalytics
+
+    shape = TeamShapeAnalytics(50.0)
+    positions = {i: (x0 + 10 * (i % 2), -18 + 12 * (i // 2)) for i in range(8)}
+    # 10 px per metre, origin at the frame centre: the whole pitch is in view
+    homography = np.array([[10.0, 0.0, 1000.0], [0.0, 10.0, 500.0], [0.0, 0.0, 1.0]])
+    shape.record(1, positions, lambda pid: 0, homography, (2000, 1000))
+    return shape
+
+
+def test_shape_overlay_draws_a_thin_outline_through_the_shown_feet_and_the_line():
+    """Outline through the feet of the boxes on screen; the defensive line
+    touchline to touchline at the last man on this frame -- both thin."""
+    from scripts.analytics import TeamShapeAnalytics
+    from scripts.display import TeamShapeOverlay
+
+    shape = TeamShapeAnalytics(50.0)
+    shape.latest = _shaped_team(-30.0).latest  # 8 players, ids 0-7
+    shape.own_goal = {0: -1, 1: 1}
+    shape.display_value = lambda team, metric, t=None: 20.0  # the line is measurable
+    # the boxes shown on this frame; player 4 is the last man, at pixel x 350
+    feet = [(400, 200), (600, 200), (600, 300), (400, 300), (350, 250)] + [(500, 250)] * 3
+    boxes = [(fx - 5, fy - 30, fx + 5, fy, pid) for pid, (fx, fy) in enumerate(feet)]
+    frame = np.zeros((600, 600, 3), dtype="uint8")
+    red = lambda team: (0, 0, 255)  # noqa: E731
+    TeamShapeOverlay().draw(frame, boxes, shape, SCALE_TRANSLATE_HOMOGRAPHY, red)
+    assert frame[200, 500, 2] > 200  # on the outline's top edge
+    assert frame[250, 450].sum() == 0  # lines only, nothing drawn inside
+    # the line at the last man's column, well past the team (rows 200-300)
+    # towards the touchlines at y = -34 / 34 -> rows 130 / 470
+    assert frame[140, 349:352, 2].max() > 200 and frame[460, 349:352, 2].max() > 200
+    assert frame[140, 340, 2] == 0 and frame[140, 360, 2] == 0  # and thin
+
+
+def test_shape_overlay_has_no_line_while_it_is_not_measurable():
+    from scripts.analytics import TeamShapeAnalytics
+    from scripts.display import TeamShapeOverlay
+
+    shape = TeamShapeAnalytics(50.0)
+    shape.latest = _shaped_team(-30.0).latest
+    shape.own_goal = {0: -1, 1: 1}  # but no line value: the own-goal end is out of view
+    feet = [(400, 200), (600, 200), (600, 300), (400, 300), (350, 250)] + [(500, 250)] * 3
+    boxes = [(fx - 5, fy - 30, fx + 5, fy, pid) for pid, (fx, fy) in enumerate(feet)]
+    frame = np.zeros((600, 600, 3), dtype="uint8")
+    TeamShapeOverlay().draw(
+        frame, boxes, shape, SCALE_TRANSLATE_HOMOGRAPHY, lambda team: (0, 0, 255)
+    )
+    assert frame[140, 345:356].sum() == 0
+
+
+def test_shape_overlay_dashes_the_second_team():
+    from scripts.analytics import TeamShapeAnalytics
+    from scripts.display import TeamShapeOverlay
+
+    shape = TeamShapeAnalytics(50.0)
+    solid = _shaped_team(-30.0).latest[0]
+    shape.latest = {1: solid.__class__(**{**solid.__dict__, "team": 1})}
+    feet = [(100, 200), (500, 200), (500, 300), (100, 300)] + [(300, 250)] * 4
+    boxes = [(fx - 5, fy - 30, fx + 5, fy, pid) for pid, (fx, fy) in enumerate(feet)]
+    frame = np.zeros((600, 600, 3), dtype="uint8")
+    TeamShapeOverlay().draw(
+        frame, boxes, shape, SCALE_TRANSLATE_HOMOGRAPHY, lambda team: (0, 0, 255)
+    )
+    top_edge = frame[200, 100:500, 2] > 200
+    assert 0.4 < top_edge.mean() < 0.8  # dashes and gaps, not a solid line
+
+
+def test_shape_panel_sits_on_the_minimap_and_shows_dashes_until_measured():
+    from scripts.analytics import TeamShapeAnalytics
+    from scripts.display import TeamShapePanel
+
+    frame = np.zeros((720, 1280, 3), dtype="uint8")
+    top = PitchMinimap().top(frame)
+    TeamShapePanel().draw(frame, TeamShapeAnalytics(50.0), bottom=top)
+    assert frame[top:].sum() == 0  # nothing drawn over the minimap's area
+    assert frame[top - 90 : top - TeamShapePanel.GAP, 1280 - 12 - TeamShapePanel.WIDTH :].sum() > 0
+    measured = frame.copy() * 0
+    TeamShapePanel().draw(measured, _shaped_team(-30.0), bottom=top)
+    assert measured.sum() > frame.sum()  # "36m" and "10m" take more ink than "-"

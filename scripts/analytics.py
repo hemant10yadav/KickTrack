@@ -317,6 +317,342 @@ class MatchAnalytics:
             )
 
 
+@dataclass
+class TeamShape:
+    """One team's shape at one result, in pitch metres. A dimension is None
+    when the camera cuts the team off on that axis (see TeamShapeAnalytics)."""
+
+    team: int
+    players: int
+    hull: np.ndarray  # (k, 2) outline of the visible outfield players
+    player_ids: tuple  # who the shape was measured from (officials dropped)
+    width_m: float | None
+    depth_m: float | None
+    area_m2: float | None
+    line_m: float | None  # defensive line: the last outfield man's distance from his own goal line
+
+
+class TeamShapeAnalytics:
+    """Width, depth, area and defensive line of each team's outfield players
+    (teams 0 and 1; keepers and officials are the classifier's OTHER_TEAM and
+    are left out), per worker result, split by who has the ball.
+
+    The camera follows play, so a team is often only partly in frame: on
+    match_5 both teams' rearmost player sat on the halfway line for 15s
+    because that was the edge of the picture, not of the team. A dimension is
+    therefore only measured when the camera sees EDGE_M past the team on both
+    ends of that axis (checked at several points along the edge, through the
+    homography into the frame); past a goal line or touchline nobody can
+    stand, so an edge there only needs the line itself in view. Otherwise it
+    is None -- "not measurable right now" -- never a smaller number.
+
+    Which goal a team defends is not known up front. Defenders stand
+    goal-side of the opponents they mark, so over time the team defending the
+    +x goal has its centroid further toward +x than the other team's, whether
+    it is defending deep or attacking (then the opponents' defence is deeper
+    still). Measured on match_5: 6-10 m in every 3s window. The mean gap is
+    accumulated over results where both teams are visible and the direction
+    is committed once DIRECTION_MIN_S of them agree by DIRECTION_MARGIN_M;
+    the defensive line is only measured after that.
+    """
+
+    MIN_PLAYERS = 6
+    MAX_OUTFIELD = 10
+    LINE_ZONE_M = 1.0
+    ISOLATED_M = 30.0
+    EDGE_M = 5.0
+    EDGE_SAMPLES = 3
+    DIRECTION_MIN_S = 2.0
+    DIRECTION_MARGIN_M = 2.0
+    DISPLAY_HOLD_S = 1.0  # the panel keeps a value this long after it was last measured
+    DISPLAY_SMOOTH_S = 0.5
+    SERIES_BUCKET_S = 0.5
+    # A team's shape changes over seconds, and the panel smooths over
+    # DISPLAY_SMOOTH_S anyway; 10 samples a second instead of every result
+    # (up to 50) keeps this off the display thread's budget -- on match_5 the
+    # per-result version cost the worker 15-60 more skipped frames of 1750.
+    SAMPLE_S = 0.1
+    # team_of is TeamHistory's 10 s majority in the pipeline, ~1 ms for a
+    # frame's ~25 players every result at 50 fps, on the display thread; the
+    # answer cannot move in a quarter of a second, so it is asked that often.
+    TEAM_REFRESH_S = 0.25
+    METRICS = ("width_m", "depth_m", "area_m2", "line_m")
+
+    def __init__(self, fps: float):
+        self.fps = fps
+        self.latest: dict[int, TeamShape] = {}
+        self.own_goal: dict[int, int] | None = None  # team -> sign of the goal it defends
+        self._direction_sum = 0.0
+        self._direction_results = 0
+        self._last_frame_id = None
+        self._samples: list[tuple[float, int, str | None, TeamShape]] = []
+        self._display: dict[tuple[int, str], tuple[float, float]] = {}  # -> (value, last_t)
+        self.results = 0
+        self.results_measured = {team: dict.fromkeys(self.METRICS, 0) for team in (0, 1)}
+        self.results_visible = {0: 0, 1: 0}
+        self._teams: dict[int, tuple] = {}  # player_id -> (team, when it was asked)
+
+    def record(
+        self, frame_id, positions: dict, team_of, homography, frame_size, possession_team=None
+    ) -> None:
+        """positions: player_id -> (x_m, y_m) of one result (MatchAnalytics'
+        latest_positions); homography: pitch -> working-frame pixels, the one
+        those positions came through; frame_size: (w, h) of that frame;
+        possession_team: the team in possession at this result, or None.
+        Sampled every SAMPLE_S of video time; results in between are skipped."""
+        if frame_id is None or frame_id == self._last_frame_id:
+            return
+        t = frame_id / self.fps
+        since = None if self._last_frame_id is None else t - self._last_frame_id / self.fps
+        if since is not None and 0 <= since < self.SAMPLE_S - 1e-9:
+            return
+        self._last_frame_id = frame_id
+        self.results += 1
+        members = {0: [], 1: []}
+        for player_id in positions:
+            team = self._team(player_id, t, team_of)
+            if team in members:
+                members[team].append(player_id)
+        teams = {}
+        for team, ids in members.items():
+            if not ids:
+                continue
+            p = np.array([positions[pid] for pid in ids])
+            keep = self._outfield(p)
+            if len(keep) >= self.MIN_PLAYERS:
+                teams[team] = (p[keep], tuple(ids[i] for i in keep))
+        if len(teams) == 2:
+            self._direction_sum += float(teams[1][0][:, 0].mean() - teams[0][0][:, 0].mean())
+            self._direction_results += 1
+            self._update_direction()
+        self.latest = {}
+        for team, (p, ids) in teams.items():
+            shape = self._measure(team, p, ids, homography, frame_size)
+            self.latest[team] = shape
+            self.results_visible[team] += 1
+            phase = None
+            if possession_team in (0, 1):
+                phase = "in" if possession_team == team else "out"
+            self._samples.append((t, team, phase, shape))
+            for metric in self.METRICS:
+                value = getattr(shape, metric)
+                if value is None:
+                    continue
+                self.results_measured[team][metric] += 1
+                key = (team, metric)
+                prev = self._display.get(key)
+                if prev is not None and t - prev[1] <= self.DISPLAY_HOLD_S:
+                    a = min(1.0, (t - prev[1]) / self.DISPLAY_SMOOTH_S)
+                    value = prev[0] + a * (value - prev[0])
+                self._display[key] = (value, t)
+
+    def _team(self, player_id: int, t: float, team_of):
+        cached = self._teams.get(player_id)
+        if cached is None or not 0 <= t - cached[1] < self.TEAM_REFRESH_S:
+            cached = (team_of(player_id), t)
+            self._teams[player_id] = cached
+        return cached[0]
+
+    def _outfield(self, p: np.ndarray) -> np.ndarray:
+        """The team's points without the officials and staff the classifier
+        put on it. Assistant referees run the touchlines and stewards stand at
+        the corners, often in a colour near one kit: match_5's far-side
+        linesman read sky blue for 2s and stretched City's width to 68 m;
+        match_6 had one linesman on each team at once, match_4 one in
+        Watford's yellow. A point on or outside a pitch line (within
+        LINE_ZONE_M) with no teammate within ISOLATED_M is dropped. Measured
+        over all five clips, the officials caught this way stood 33-44 m from
+        the nearest player of "their" team; real players on the line came
+        closer -- the nearest call, a Tottenham throw-in taker on match_4, at
+        26-30 m -- so a few seconds of official survive at 30 m, where a lower
+        threshold would cut real wingers. Then at most MAX_OUTFIELD are
+        kept, the most isolated going first. Returns the indices kept.
+        """
+        keep = np.arange(len(p))
+        if len(p) < 2:
+            return keep
+        nearest = self._nearest_teammate(p)
+        on_line = (np.abs(p[:, 1]) >= PITCH_WIDTH_M / 2 - self.LINE_ZONE_M) | (
+            np.abs(p[:, 0]) >= PITCH_LENGTH_M / 2 - self.LINE_ZONE_M
+        )
+        keep = keep[~(on_line & (nearest > self.ISOLATED_M))]
+        while len(keep) > self.MAX_OUTFIELD:
+            keep = np.delete(keep, int(np.argmax(self._nearest_teammate(p[keep]))))
+        return keep
+
+    @staticmethod
+    def _nearest_teammate(p: np.ndarray) -> np.ndarray:
+        d = np.hypot(*(p[:, None, :] - p[None, :, :]).transpose(2, 0, 1))
+        np.fill_diagonal(d, np.inf)
+        return d.min(axis=1)
+
+    def _update_direction(self) -> None:
+        if self._direction_results < self.DIRECTION_MIN_S * self._results_per_s():
+            return
+        mean = self._direction_sum / self._direction_results
+        if abs(mean) < self.DIRECTION_MARGIN_M:
+            self.own_goal = None
+            return
+        side = 1 if mean > 0 else -1  # team 1 defends the +x goal when it stands further +x
+        self.own_goal = {1: side, 0: -side}
+
+    def _results_per_s(self) -> float:
+        if self._last_frame_id is None or self.results < 2:
+            return self.fps
+        return self.results / (self._last_frame_id / self.fps)
+
+    def _measure(self, team: int, p: np.ndarray, ids: tuple, homography, frame_size) -> TeamShape:
+        hull = cv2.convexHull(p.astype(np.float32)).reshape(-1, 2)
+        xs, ys = p[:, 0], p[:, 1]
+        seen = lambda x, y: self._in_view(homography, frame_size, x, y)  # noqa: E731
+        x_along = np.linspace(xs.min(), xs.max(), self.EDGE_SAMPLES)
+        y_along = np.linspace(ys.min(), ys.max(), self.EDGE_SAMPLES)
+        back_x, front_x = (
+            self._beyond(xs.min(), -1, PITCH_LENGTH_M),
+            self._beyond(xs.max(), 1, PITCH_LENGTH_M),
+        )
+        low_y, high_y = (
+            self._beyond(ys.min(), -1, PITCH_WIDTH_M),
+            self._beyond(ys.max(), 1, PITCH_WIDTH_M),
+        )
+        closed = {
+            -1: all(seen(back_x, y) for y in y_along),  # the -x end
+            1: all(seen(front_x, y) for y in y_along),  # the +x end
+        }
+        width_closed = all(seen(x, low_y) for x in x_along) and all(
+            seen(x, high_y) for x in x_along
+        )
+        depth_closed = closed[-1] and closed[1]
+        width = float(np.ptp(ys)) if width_closed else None
+        depth = float(np.ptp(xs)) if depth_closed else None
+        area = float(cv2.contourArea(hull)) if width_closed and depth_closed else None
+        line = None
+        if self.own_goal is not None and closed[self.own_goal[team]]:
+            goal = self.own_goal[team]
+            depth_from_goal = PITCH_LENGTH_M / 2 - goal * xs  # 0 on the own goal line
+            line = float(depth_from_goal.min())  # the last man, as the offside line is drawn
+        return TeamShape(team, len(p), hull, ids, width, depth, area, line)
+
+    def _beyond(self, edge: float, direction: int, length: float) -> float:
+        """The point EDGE_M past a team's edge, stopped at the pitch line."""
+        return float(np.clip(edge + direction * self.EDGE_M, -length / 2, length / 2))
+
+    @staticmethod
+    def _in_view(homography, frame_size, x: float, y: float) -> bool:
+        if homography is None or frame_size is None:
+            return False
+        point = homography @ np.array([x, y, 1.0])
+        if point[2] <= 1e-9:
+            return False
+        px, py = point[0] / point[2], point[1] / point[2]
+        w, h = frame_size
+        return 0 <= px < w and 0 <= py < h
+
+    def display_value(self, team: int, metric: str, t: float | None = None) -> float | None:
+        """The smoothed value for the live panel: None when it has not been
+        measured in the last DISPLAY_HOLD_S."""
+        entry = self._display.get((team, metric))
+        if entry is None:
+            return None
+        now = t if t is not None else (self._last_frame_id or 0) / self.fps
+        return entry[0] if now - entry[1] <= self.DISPLAY_HOLD_S else None
+
+    def team_stats(self, team: int) -> dict:
+        """Median of each metric over the results where it was measured,
+        overall and split by possession, and how often it was measurable."""
+        out = {"results_visible": self.results_visible[team]}
+        for metric in self.METRICS:
+            entry = {}
+            for label, phase in (
+                ("all", ...),
+                ("in_possession", "in"),
+                ("out_of_possession", "out"),
+            ):
+                values = [
+                    getattr(s, metric)
+                    for _t, tm, ph, s in self._samples
+                    if tm == team
+                    and getattr(s, metric) is not None
+                    and (phase is ... or ph == phase)
+                ]
+                entry[label] = round(float(np.median(values)), 1) if values else None
+                entry[f"{label}_results"] = len(values)
+            out[metric] = entry
+        return out
+
+    def series(self) -> list[dict]:
+        """Per SERIES_BUCKET_S of video, each team's median of every metric
+        measured in that bucket (None when none was)."""
+        buckets: dict[int, list] = {}
+        for t, team, phase, shape in self._samples:
+            buckets.setdefault(int(t / self.SERIES_BUCKET_S), []).append((team, phase, shape))
+        rows = []
+        for b in sorted(buckets):
+            row = {"t": round(b * self.SERIES_BUCKET_S, 2)}
+            for team in (0, 1):
+                entries = [(ph, s) for tm, ph, s in buckets[b] if tm == team]
+                if not entries:
+                    continue
+                team_row = {}
+                for metric in self.METRICS:
+                    values = [
+                        getattr(s, metric) for _ph, s in entries if getattr(s, metric) is not None
+                    ]
+                    team_row[metric] = round(float(np.median(values)), 1) if values else None
+                phases = [ph for ph, _s in entries if ph is not None]
+                team_row["phase"] = max(set(phases), key=phases.count) if phases else None
+                row[str(team)] = team_row
+            rows.append(row)
+        return rows
+
+    def summary(self, team_name=str) -> str:
+        lines = [
+            f"Team shape: {self.results} results; defending "
+            + (
+                ", ".join(
+                    f"{team_name(team)} {'+x' if side > 0 else '-x'}"
+                    for team, side in sorted(self.own_goal.items())
+                )
+                if self.own_goal
+                else "direction not known"
+            ),
+            f"{'team':>12} {'metric':>8} {'measured':>9} {'all':>7} {'in poss':>8} {'out poss':>9}",
+        ]
+        for team in (0, 1):
+            stats = self.team_stats(team)
+            for metric in self.METRICS:
+                m = stats[metric]
+                share = (
+                    f"{100 * self.results_measured[team][metric] / self.results_visible[team]:.0f}%"
+                    if self.results_visible[team]
+                    else "-"
+                )
+                fmt = lambda v: "-" if v is None else f"{v:.1f}"  # noqa: E731
+                lines.append(
+                    f"{team_name(team):>12} {metric.removesuffix('_m').removesuffix('_m2'):>8} "
+                    f"{share:>9} {fmt(m['all']):>7} {fmt(m['in_possession']):>8} "
+                    f"{fmt(m['out_of_possession']):>9}"
+                )
+        return "\n".join(lines)
+
+    def write(self, out_dir: str | Path, team_name=str) -> None:
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "shape.json").write_text(
+            json.dumps(
+                {
+                    "fps": self.fps,
+                    "own_goal": None
+                    if self.own_goal is None
+                    else {team_name(t): side for t, side in self.own_goal.items()},
+                    "teams": {team_name(team): self.team_stats(team) for team in (0, 1)},
+                    "series": self.series(),
+                },
+                indent=2,
+            )
+        )
+
+
 def render_pitch(scale: int = 8) -> np.ndarray:
     """Green pitch with white markings, `scale` px per metre."""
     w, h = int(PITCH_LENGTH_M * scale), int(PITCH_WIDTH_M * scale)

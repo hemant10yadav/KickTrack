@@ -1,11 +1,13 @@
 """Synthetic tests for scripts/analytics.py (Plan 3): projection, distance
-that ignores jitter and out-of-frame gaps, sample gating, and heatmap mass."""
+that ignores jitter and out-of-frame gaps, sample gating, heatmap mass, and
+team shape (what the camera can measure, officials, direction, possession)."""
 
 import json
 
 import numpy as np
+import pytest
 
-from scripts.analytics import MatchAnalytics, PitchProjector, PlayerTrace
+from scripts.analytics import MatchAnalytics, PitchProjector, PlayerTrace, TeamShapeAnalytics
 
 # pitch -> image: 10px per metre, origin at image (1000, 500); a pure affine
 # homography so every expected value can be computed by hand.
@@ -175,3 +177,132 @@ def test_write_produces_stats_and_heatmaps(tmp_path):
 
 def test_trace_window_constants_are_sane():
     assert PlayerTrace.WINDOW_S < PlayerTrace.MAX_GAP_S
+
+
+# --- TeamShapeAnalytics -----------------------------------------------------
+
+WHOLE_PITCH = (2000, 1000)  # H shows x in [-100, 100), y in [-50, 50): all of it
+LEFT_HALF = (1000, 1000)  # x < 0 only: the camera ends at the halfway line
+
+
+def _shape_record(shape, frame_id, teams, frame_size=WHOLE_PITCH, possession=None):
+    """teams: team -> list of (x, y); records them as one result."""
+    positions, team_of = {}, {}
+    for team, points in teams.items():
+        for i, xy in enumerate(points):
+            pid = 100 * (team + 1) + i
+            positions[pid] = xy
+            team_of[pid] = team
+    shape.record(frame_id, positions, team_of.get, H, frame_size, possession)
+
+
+def _block(x0, y0, rows=2, cols=4, dx=10.0, dy=12.0):
+    return [(x0 + r * dx, y0 + c * dy) for r in range(rows) for c in range(cols)]
+
+
+def test_shape_measures_width_depth_area_of_a_visible_team():
+    shape = TeamShapeAnalytics(FPS)
+    _shape_record(shape, 1, {0: _block(-30, -18), 1: _block(10, -18)})
+    s = shape.latest[0]
+    assert s.players == 8
+    assert s.width_m == pytest.approx(36.0) and s.depth_m == pytest.approx(10.0)
+    assert s.area_m2 == pytest.approx(360.0)
+
+
+def test_shape_edge_cut_by_the_camera_is_not_measured():
+    """The team reaches the halfway line and the picture ends there: its depth
+    is unknown (players may stand beyond), its width is still seen."""
+    shape = TeamShapeAnalytics(FPS)
+    _shape_record(shape, 1, {0: _block(-10, -18, rows=2, dx=9.0)}, frame_size=LEFT_HALF)
+    s = shape.latest[0]
+    assert s.depth_m is None and s.area_m2 is None
+    assert s.width_m == pytest.approx(36.0)
+
+
+def test_shape_edge_on_a_pitch_line_only_needs_the_line_in_view():
+    """Nobody stands past the goal line, so a back line on it is closed as
+    long as the line itself is in the picture."""
+    shape = TeamShapeAnalytics(FPS)
+    _shape_record(shape, 1, {0: _block(-52.0, -18, dx=12.0)}, frame_size=LEFT_HALF)
+    assert shape.latest[0].depth_m == pytest.approx(12.0)
+
+
+def test_shape_too_few_players_is_no_shape():
+    shape = TeamShapeAnalytics(FPS)
+    _shape_record(shape, 1, {0: _block(-30, -18, rows=1, cols=5)})
+    assert 0 not in shape.latest
+
+
+def test_shape_drops_an_official_on_the_touchline_but_keeps_a_wide_player():
+    """A linesman read as this team, on the touchline 40 m from everyone, is
+    dropped; a winger on the same line near his full-back is kept."""
+    shape = TeamShapeAnalytics(FPS)
+    team = _block(0, -18) + [(-40.0, -34.3)]  # linesman
+    _shape_record(shape, 1, {0: team})
+    assert shape.latest[0].players == 8 and shape.latest[0].width_m == pytest.approx(36.0)
+    shape = TeamShapeAnalytics(FPS)
+    team = _block(0, -18) + [(5.0, 33.8)]  # winger, 16 m from the nearest teammate
+    _shape_record(shape, 1, {0: team})
+    assert shape.latest[0].players == 9 and shape.latest[0].width_m == pytest.approx(51.8)
+
+
+def test_shape_keeps_at_most_ten_outfield_players():
+    shape = TeamShapeAnalytics(FPS)
+    team = _block(0, -18, rows=3, cols=4)[:10] + [(-35.0, 0.0)]  # 11: the stray goes
+    _shape_record(shape, 1, {0: team})
+    assert shape.latest[0].players == 10
+    assert shape.latest[0].depth_m == pytest.approx(20.0)
+
+
+def test_shape_learns_which_goal_each_team_defends_and_its_line():
+    """Team 1 stands goal-side (further +x) of team 0 throughout, so it
+    defends +x; its line is where its last outfield man stands, from that goal."""
+    shape = TeamShapeAnalytics(FPS)
+    attackers = _block(0, -18)
+    defenders = [(30.0, -18.0), (30.0, -6.0), (32.0, 6.0), (32.0, 18.0)] + _block(10, -18, rows=1)
+    for frame in range(1, int(3 * FPS)):
+        _shape_record(shape, frame, {0: attackers, 1: defenders})
+    assert shape.own_goal == {1: 1, 0: -1}
+    assert shape.latest[1].line_m == pytest.approx(52.5 - 32.0)
+
+
+def test_shape_line_waits_for_the_direction():
+    shape = TeamShapeAnalytics(FPS)
+    _shape_record(shape, 1, {0: _block(-30, -18), 1: _block(10, -18)})
+    assert shape.own_goal is None and shape.latest[1].line_m is None
+
+
+def test_shape_stats_split_by_possession():
+    shape = TeamShapeAnalytics(FPS)
+    frame = 0
+    for team_on_ball, width in ((0, 12.0), (1, 8.0)):  # wide with the ball, narrow without
+        for _ in range(10):
+            frame += int(FPS * TeamShapeAnalytics.SAMPLE_S)
+            _shape_record(
+                shape,
+                frame,
+                {0: _block(-30, -18, dy=width), 1: _block(10, -18)},
+                possession=team_on_ball,
+            )
+    stats = shape.team_stats(0)["width_m"]
+    assert stats["in_possession"] == pytest.approx(36.0)
+    assert stats["out_of_possession"] == pytest.approx(24.0)
+    assert stats["all_results"] == 20
+
+
+def test_shape_display_value_holds_briefly_then_clears():
+    shape = TeamShapeAnalytics(FPS)
+    _shape_record(shape, 1, {0: _block(-30, -18)})
+    assert shape.display_value(0, "width_m") == pytest.approx(36.0)
+    later = 1 / FPS + TeamShapeAnalytics.DISPLAY_HOLD_S + 0.1
+    assert shape.display_value(0, "width_m", t=later) is None
+
+
+def test_shape_write(tmp_path):
+    shape = TeamShapeAnalytics(FPS)
+    for frame in range(1, 30):
+        _shape_record(shape, frame, {0: _block(-30, -18), 1: _block(10, -18)}, possession=0)
+    shape.write(tmp_path, team_name=lambda team: f"team {team}")
+    data = json.loads((tmp_path / "shape.json").read_text())
+    assert data["teams"]["team 0"]["width_m"]["all"] == 36.0
+    assert data["series"][0]["0"]["phase"] == "in"

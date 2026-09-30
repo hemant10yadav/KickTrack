@@ -85,8 +85,9 @@ def parse_args():
     parser.add_argument(
         "--analytics-dir",
         default=None,
-        help="Write per-player/team heatmap PNGs and stats.json (distance covered, "
-        "top speed, time tracked) to this directory at the end of the run.",
+        help="Write per-player/team heatmap PNGs, stats.json (distance covered, "
+        "top speed, time tracked), passes.json and shape.json (team width, depth, "
+        "area, defensive line) to this directory at the end of the run.",
     )
     parser.add_argument(
         "--show-markers",
@@ -100,6 +101,13 @@ def parse_args():
         action="store_true",
         help="Leave out the pass panel (the passes are still counted and written by "
         "--analytics-dir).",
+    )
+    parser.add_argument(
+        "--hide-shape",
+        action="store_true",
+        help="Leave out the team outlines and defensive lines on the video and the "
+        "team-shape panel (the "
+        "shape is still measured and written by --analytics-dir).",
     )
     parser.add_argument(
         "--show",
@@ -152,6 +160,7 @@ def main():
         viewer=args.viewer,
         show_markers=args.show_markers,
         show_passes=not args.hide_passes,
+        show_shape=not args.hide_shape,
     ).run()
 
 

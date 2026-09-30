@@ -210,6 +210,12 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   cancelling, `stats.json` + heatmap PNGs via `--analytics-dir`). See
   `docs/PLAN.md` Plan 3.1 for why per-frame steps are never summed and why
   everyone-moves-together is a calibration event, not motion.
+  `TeamShapeAnalytics` (width / depth / area / defensive line per team,
+  sampled every 0.1s, split by possession, `shape.json`) only measures what
+  the camera can see past a team's edges, learns which goal each team defends,
+  drops officials on the lines, and takes teams from the ball's `TeamHistory`
+  -- see Plan 3.4. `tests/test_shape_replay.py` replays match_5 through it
+  (`tests/fixtures/match_5_shape.jsonl.gz`, with homographies).
 - `scripts/ball.py` — everything "where is the ball and who has it":
   `BallTracker` (one physically plausible track from noisy candidates),
   `PossessionTracker`, `PassCounter` (team totals: completed / lost, short /
@@ -223,6 +229,8 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
 - `scripts/display.py` — everything "what gets shown on screen": `MarkerRenderer`
   (pins, ID labels, running-distance captions), `PitchMinimap` (live top-down
   positions and the ball), `BallRenderer` (ball ring, holder ring, pass panel),
+  `TeamShapeOverlay` (team outlines and last-man lines on the video, from the
+  boxes shown on that frame), `TeamShapePanel`,
   `PitchOverlayRenderer`,
   `ResultTimeline`, `PlaybackDelay`, `DisplaySmoother`, `FadeController`, `FramePacer`,
   `StalenessTracker`/`WorkerStats`/`DisplayStats`

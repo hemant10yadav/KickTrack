@@ -500,7 +500,87 @@ Take a fixed-camera football video and show a marker on each player that moves w
   - [X] Heatmaps per player (and per team) (Plan 3.1)
   - [X] Possession detection and team pass counts (Plan 3.2)
   - [X] Pass counter that holds up on real footage (Plan 3.3)
-  - [ ] (Longer-term, not yet scoped in detail) formations/team shape, passing networks
+  - [X] Team shape: width, depth, area, defensive line, in and out of possession (Plan 3.4)
+  - [ ] (Longer-term, not yet scoped in detail) formations, passing networks
+
+- [ ] **Plan 3.4: Team Shape**
+
+  Each team's width, depth, area and defensive line (its last outfield man's
+  distance from its own goal), measured from the gated pitch positions every
+  0.1 s, split by who has the ball, drawn on the video and written to
+  `shape.json`. All in `TeamShapeAnalytics` (`scripts/analytics.py`);
+  drawn by `TeamShapeOverlay` and `TeamShapePanel` (`scripts/display.py`).
+  Recorded on all five clips (positions, teams, homography, possession per
+  result) and checked on frames with each team's outline and line drawn on,
+  at the moments the numbers moved.
+
+  - [X] **Only what the camera can see.** The camera follows play, so a team
+        is often cut off: on match_5 both teams' rearmost player sat on the
+        halfway line for 15 s because that was the edge of the picture. A
+        dimension is only measured when a point 5 m past the team on both ends
+        of that axis (three points along each edge) projects into the frame;
+        past a goal line or touchline only the line itself has to be seen.
+        Otherwise it is "-", never a smaller number. Measurable share per
+        team: match_5 91% / 22% depth, match_4 61 / 64%, match_6 84 / 96%,
+        match_8 80 / 94%.
+  - [X] **Which goal each team defends**, learned: defenders stand
+        goal-side, so the team defending +x has its centroid further +x
+        whether it defends or attacks (match_5: 6-10 m in every 3 s window).
+        Committed after 2 s of both teams in view; right on every clip,
+        checked against the keepers.
+  - [X] **Teams from `TeamHistory`, not the latest read.** A Tottenham
+        defender read as "other" for 3 s on match_4 dropped out of the shape
+        and moved the line 20 m; `BallAnalytics.team_now` (the 10 s majority
+        the pass counter already uses) keeps him.
+  - [X] **Officials dropped.** Linesmen run the touchlines in colours near a
+        kit: match_5's read sky blue and stretched City to 68 m wide; match_6
+        had one on each team at once, match_4 one in Watford's yellow. A point
+        within 1 m of a pitch line with no teammate within 30 m is dropped:
+        the officials caught stood 33-44 m from "their" team, the nearest real
+        player on a line (a Tottenham throw-in taker) 26-30 m. Then at most 10
+        per team. Some seconds of official survive at 30 m; a lower threshold
+        cut real wingers.
+  - [X] **Numbers, matched to the video.** match_5 City: last man ~52 m from
+        goal while pressing (11-24 s, on halfway), ~11 m camped in their box
+        (31-34 s); 28 m wide without the ball vs 36 m with it. match_4
+        Tottenham: 58 m wide in possession (a player on each touchline) vs
+        40 m out. match_8 Tottenham: a 31 x 13 m low block at 30 s.
+  - [X] **On the video**: a thin outline through the feet of the shape's
+        players in the boxes shown on that frame (so it sits on them like
+        the markers), and the defensive line touchline to touchline on the
+        grass at the last man -- also found on that frame, from the same feet
+        through the frame's own homography, as the line drawn from the 0.1 s
+        samples (smoothed for the panel) trailed a defence stepping up. The
+        second team is dashed, as two pale kits read alike.
+        A "Team shape" panel (width / depth / line) sits on the minimap.
+        `--hide-shape` turns both off. A faint tint inside the outline was
+        dropped: blending its box of a 1920-wide frame cost 0.65 ms per team.
+  - [X] **Cost on the display thread**, measured in isolation: recording
+        0.19 ms per sample (10 per second -- every result, with a team vote
+        per player, was 1.18 ms), outline + line 0.04 ms, panel 0.04 ms per
+        frame. Drawn dashes are one `cv2.polylines` call (a `cv2.line` per
+        dash took the draw from 2.5 to 6 ms).
+  - [ ] **Not yet: a clean frame-drop comparison.** Realtime runs of match_5
+        were too noisy to show an effect this small: baseline `main` alone
+        skipped 28-193 of 1750 frames across seven runs as the machine heated
+        up (and a VS Code language server took a core during some). The last
+        run before the tint was dropped skipped 34.
+  - [X] Tests: `tests/test_analytics.py` (+11: visible team, cut-off edge,
+        edge on a pitch line, too few players, official vs winger on the
+        touchline, 10-player cap, direction and last man, line waits for the
+        direction, possession split, display hold, shape.json);
+        `tests/test_shape_replay.py` (match_5 recorded with homographies,
+        `tests/fixtures/match_5_shape.jsonl.gz`: direction, press then deep
+        block, the linesman, narrower without the ball, Tottenham's depth
+        unmeasured while cut off); overlay and panel in
+        `tests/test_pitch_overlay.py`. Each synthetic guard was checked to
+        fail with its rule switched off.
+  - [ ] **Known limits.** Formations are not read yet. A team split between
+        a kit and "other" by the classifier (match_7's striped Barcelona
+        kit) gives a shape of the part that was read -- 7 m deep -- which the
+        visibility check cannot catch; match_7 is mostly "-". The defensive
+        line is one player, so a defender dropping onto the goal line moves
+        it; it is the offside line only when the keeper is not the last man.
 
 - [X] **Plan 3.3: A Pass Counter That Holds Up on Real Footage**
 
