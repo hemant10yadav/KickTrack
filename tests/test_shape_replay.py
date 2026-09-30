@@ -87,10 +87,35 @@ def test_linesman_does_not_stretch_city(replayed):
     assert widths and max(widths) < 45  # 68 m with him in
 
 
-def test_city_narrower_without_the_ball(replayed):
+def test_city_defend_narrower_than_spurs_attack(replayed):
+    """Tottenham keep the ball from 1.5 s: City's block without it is
+    narrower than Tottenham spread with it."""
     shape, _ = replayed
-    width = shape.team_stats(CITY)["width_m"]
-    assert width["out_of_possession"] < width["in_possession"]
+    city = shape.team_stats(CITY)["width_m"]["out_of_possession"]
+    spurs = shape.team_stats(SPURS)["width_m"]["in_possession"]
+    assert city is not None and spurs is not None and city < spurs - 10
+
+
+def _defence_sizes(samples, team, t0, t1):
+    return [len(s.lines[0]) for t, tm, s in samples if tm == team and t0 <= t <= t1 and s.lines]
+
+
+def test_city_lines_press_with_few_back_then_drop_into_a_block(replayed):
+    """Pressing (16-22 s) City keep two or three back; camped in their box
+    (26-34 s) four or more make the defence line."""
+    _, samples = replayed
+    pressing = _defence_sizes(samples, CITY, 16.0, 22.0)
+    block = _defence_sizes(samples, CITY, 26.0, 34.0)
+    assert len(pressing) > 40 and np.median(pressing) <= 3
+    assert len(block) > 40 and min(block) >= 4
+
+
+def test_spurs_back_four_when_they_come_into_view(replayed):
+    _, samples = replayed
+    labels = [
+        s.formation for t, tm, s in samples if tm == SPURS and 30.5 <= t <= 34.5 and s.formation
+    ]
+    assert labels and all(label.startswith("4-") for label in labels)
 
 
 def test_spurs_depth_only_when_both_ends_are_in_view(replayed):

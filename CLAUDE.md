@@ -214,7 +214,9 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
   sampled every 0.1s, split by possession, `shape.json`) only measures what
   the camera can see past a team's edges, learns which goal each team defends,
   drops officials on the lines, and takes teams from the ball's `TeamHistory`
-  -- see Plan 3.4. `tests/test_shape_replay.py` replays match_5 through it
+  -- see Plan 3.4. `FormationLines` cuts each team into defence / midfield /
+  attack from where its players are now (depth in front of the last man),
+  with hysteresis -- see Plan 3.5 for why not a fitted named formation. `tests/test_shape_replay.py` replays match_5 through it
   (`tests/fixtures/match_5_shape.jsonl.gz`, with homographies).
 - `scripts/ball.py` — everything "where is the ball and who has it":
   `BallTracker` (one physically plausible track from noisy candidates),
@@ -229,8 +231,9 @@ on top of the tracking pipeline. See `docs/PLAN.md` for the full milestone check
 - `scripts/display.py` — everything "what gets shown on screen": `MarkerRenderer`
   (pins, ID labels, running-distance captions), `PitchMinimap` (live top-down
   positions and the ball), `BallRenderer` (ball ring, holder ring, pass panel),
-  `TeamShapeOverlay` (team outlines and last-man lines on the video, from the
-  boxes shown on that frame), `TeamShapePanel`,
+  `TeamShapeOverlay` (the formation lines of the team without the ball as
+  joined dots, and the other team's outline, on the video, through the feet
+  of the boxes shown on that frame), `TeamShapePanel`,
   `PitchOverlayRenderer`,
   `ResultTimeline`, `PlaybackDelay`, `DisplaySmoother`, `FadeController`, `FramePacer`,
   `StalenessTracker`/`WorkerStats`/`DisplayStats`

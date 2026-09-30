@@ -2,12 +2,19 @@
 that ignores jitter and out-of-frame gaps, sample gating, heatmap mass, and
 team shape (what the camera can measure, officials, direction, possession)."""
 
+import itertools
 import json
 
 import numpy as np
 import pytest
 
-from scripts.analytics import MatchAnalytics, PitchProjector, PlayerTrace, TeamShapeAnalytics
+from scripts.analytics import (
+    FormationLines,
+    MatchAnalytics,
+    PitchProjector,
+    PlayerTrace,
+    TeamShapeAnalytics,
+)
 
 # pitch -> image: 10px per metre, origin at image (1000, 500); a pure affine
 # homography so every expected value can be computed by hand.
@@ -276,7 +283,7 @@ def test_shape_stats_split_by_possession():
     shape = TeamShapeAnalytics(FPS)
     frame = 0
     for team_on_ball, width in ((0, 12.0), (1, 8.0)):  # wide with the ball, narrow without
-        for _ in range(10):
+        for _ in range(30):
             frame += int(FPS * TeamShapeAnalytics.SAMPLE_S)
             _shape_record(
                 shape,
@@ -287,7 +294,7 @@ def test_shape_stats_split_by_possession():
     stats = shape.team_stats(0)["width_m"]
     assert stats["in_possession"] == pytest.approx(36.0)
     assert stats["out_of_possession"] == pytest.approx(24.0)
-    assert stats["all_results"] == 20
+    assert stats["all_results"] == 60
 
 
 def test_shape_display_value_holds_briefly_then_clears():
@@ -306,3 +313,96 @@ def test_shape_write(tmp_path):
     data = json.loads((tmp_path / "shape.json").read_text())
     assert data["teams"]["team 0"]["width_m"]["all"] == 36.0
     assert data["series"][0]["0"]["phase"] == "in"
+
+
+# --- FormationLines ----------------------------------------------------------
+
+FOUR_FOUR_TWO = {
+    1: 0.0,
+    2: 0.5,
+    3: 1.0,
+    4: 0.2,
+    5: 12.0,
+    6: 12.5,
+    7: 13.0,
+    8: 11.5,
+    9: 24.0,
+    10: 25.0,
+}
+
+
+def _lines_over(lines, depths_at, seconds, team=0, t0=0.0):
+    """Feeds depths_at(t) every 0.1 s for `seconds`; returns the last lines."""
+    out = None
+    for i in range(int(seconds * 10)):
+        t = t0 + i / 10
+        out = lines.update(t, team, depths_at(t))
+    return out
+
+
+def test_formation_lines_cut_where_the_gaps_are():
+    lines = FormationLines()
+    defence, midfield, attack = _lines_over(lines, lambda t: FOUR_FOUR_TWO, 1.0)
+    assert set(defence) == {1, 2, 3, 4} and set(midfield) == {5, 6, 7, 8}
+    assert set(attack) == {9, 10}
+
+
+def test_formation_lines_do_not_flip_for_a_player_between_two_lines():
+    """A full back hovering across the point where the best cut changes
+    (6.45 m here), a metre either side of it every half second, stays in one
+    line instead of switching back and forth (5 switches without hysteresis)."""
+    lines = FormationLines()
+    _lines_over(lines, lambda t: FOUR_FOUR_TWO, 2.0)
+    seen_in = []
+    for i in range(60):
+        t = 2.0 + i / 10
+        hover = {**FOUR_FOUR_TWO, 4: 7.5 if (i // 5) % 2 else 5.5}
+        defence, _, _ = lines.update(t, 0, hover)
+        seen_in.append(4 in defence)
+    switches = sum(a != b for a, b in itertools.pairwise(seen_in))
+    assert switches <= 1
+
+
+def test_formation_lines_follow_a_player_who_really_moves_up():
+    lines = FormationLines()
+    _lines_over(lines, lambda t: FOUR_FOUR_TWO, 2.0)
+    pushed = {**FOUR_FOUR_TWO, 4: 12.3}  # the full back stays up: 3-5-2
+    defence, midfield, _ = _lines_over(lines, lambda t: pushed, 4.0, t0=2.0)
+    assert 4 in midfield and len(defence) == 3
+
+
+def test_formation_lines_need_enough_players_and_forget_the_gone():
+    lines = FormationLines()
+    few = {pid: d for pid, d in FOUR_FOUR_TWO.items() if pid <= 5}
+    assert _lines_over(lines, lambda t: few, 1.0) is None
+    _lines_over(lines, lambda t: FOUR_FOUR_TWO, 1.0, t0=1.0)
+    without_ten = {pid: d for pid, d in FOUR_FOUR_TWO.items() if pid != 10}
+    defence, midfield, attack = _lines_over(lines, lambda t: without_ten, 3.0, t0=2.0)
+    assert 10 not in defence + midfield + attack
+
+
+def test_shape_formation_label_and_lines_of_a_whole_team():
+    shape = TeamShapeAnalytics(FPS)
+    back, mid, front = -40.0, -28.0, -16.0  # team 0 defends -x: a 4-4-2
+    team0 = [(back, y) for y in (-20, -7, 7, 20)] + [(mid, y) for y in (-20, -7, 7, 20)]
+    team0 += [(front, -5.0), (front, 5.0)]
+    team1 = [(x + 30.0, y) for x, y in team0]
+    for frame in range(1, int(4 * FPS), 5):
+        _shape_record(shape, frame, {0: team0, 1: team1})
+    assert shape.latest[0].formation == "4-4-2"
+
+
+def test_shape_possession_is_held_while_the_ball_travels():
+    shape = TeamShapeAnalytics(FPS)
+    _shape_record(shape, 1, {0: _block(-30, -18)}, possession=0)
+    _shape_record(shape, 100, {0: _block(-30, -18)})  # 2 s later, ball in flight
+    assert shape.in_possession == 0 and shape.defending_team == 1
+    for frame in (150, 155, 160):  # a touch read on the other side for 0.2 s
+        _shape_record(shape, frame, {0: _block(-30, -18)}, possession=1)
+    assert shape.defending_team == 1  # is not a change of possession yet
+    for frame in range(165, 215, 5):
+        _shape_record(shape, frame, {0: _block(-30, -18)}, possession=1)
+    assert shape.defending_team == 0  # it lasted POSSESSION_SWITCH_S
+    late = frame + int((TeamShapeAnalytics.POSSESSION_HOLD_S + 1) * FPS)
+    _shape_record(shape, late, {0: _block(-30, -18)})
+    assert shape.defending_team is None

@@ -9,6 +9,7 @@ then be silently wrong. The camera follows play, so a player is only measured
 while in frame: `tracked_s` is reported next to `distance_m` for that reason.
 """
 
+import itertools
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -330,6 +331,188 @@ class TeamShape:
     depth_m: float | None
     area_m2: float | None
     line_m: float | None  # defensive line: the last outfield man's distance from his own goal line
+    lines: tuple | None = None  # (defence, midfield, attack) player ids, see FormationLines
+
+    @property
+    def formation(self) -> str | None:
+        """ "4-4-2" from the three lines, once the whole outfield team is in them."""
+        if self.lines is None or sum(map(len, self.lines)) < FormationLines.LABEL_MIN_PLAYERS:
+            return None
+        return "-".join(str(len(line)) for line in self.lines)
+
+
+class FormationLines:
+    """Each team's defence, midfield and attack, by role.
+
+    Broadcast formation lines keep a player in his line while he moves: the
+    back four stays one line when a full back steps up, and the line bends
+    to him. So a player's line comes from his *role* -- his average position
+    over the last ROLE_TAU_S, as depth in front of his team's last man (the
+    team moving as one moves no one) and across the pitch -- and the lines
+    are drawn through where the players stand on each frame.
+
+    A line is players across the pitch at about one depth, allowed to bend
+    evenly towards both flanks: its spread is how far its players sit from
+    the best depth = a + c * across^2 through them. On depth alone, match_5's
+    City pressing read as a back five -- two centre backs on halfway, the full
+    backs 5-8 m up the flanks and the holding midfielder 9 m up the middle --
+    and joined across the pitch it zigzagged; with the bend the full backs fit
+    the back line and the midfielder in front of the centre backs does not.
+    The team is cut into a defence of 3-5 (from its deepest players, a couple
+    of places of slack for someone like him), a midfield of 2-5 and an attack
+    of 1-3 where the lines' spread is least. That search runs every
+    RECUT_EVERY_S -- roles move over seconds -- and a new cut replaces the held
+    one only when it fits MARGIN better for HOLD_S. In between a player keeps
+    his line unless he fits another STICKY_M better; a new one joins the line
+    he fits; one unseen for ROLE_MEMORY_S drops out.
+
+    Lines from where players stand *now* were tried before roles (Plan 3.5):
+    the same pressing moment read 2-3-5 in one run and 5-4-1 in the next.
+    """
+
+    ROLE_TAU_S = 20.0
+    ROLE_MEMORY_S = 10.0
+    WARMUP_S = 3.0  # on match_5 City read 5-2-3 after 1 s of history, 4-3-3 from 3 s
+    RECUT_EVERY_S = 1.0
+    MARGIN = 0.25
+    HOLD_S = 3.0
+    STICKY_M = 3.0
+    MIN_PLAYERS = 8
+    LABEL_MIN_PLAYERS = 10
+    MAX_PLAYERS = 10
+    SIZES = {"defence": (3, 5), "midfield": (2, 5), "attack": (1, 3)}
+    DEFENCE_SLACK = 2  # a defender may be up to this many places from the deepest
+
+    def __init__(self):
+        self.lines: dict[int, tuple | None] = {0: None, 1: None}
+        self._role: dict[
+            int, list
+        ] = {}  # player_id -> [depth, across, last seen, team, first seen]
+        self._challenger: dict[int, float | None] = {0: None, 1: None}  # a better cut, since
+        self._best: dict[int, tuple | None] = {0: None, 1: None}  # (cut, when searched)
+
+    def update(self, t: float, team: int, positions: dict) -> tuple | None:
+        """positions: player_id -> (metres in front of the team's last man,
+        metres across the pitch) for the players of `team` seen at time t.
+        Returns (defence, midfield, attack) player ids, or None with too few
+        players known."""
+        for pid, (depth, across) in positions.items():
+            r = self._role.get(pid)
+            if r is None or r[3] != team or t - r[2] > self.ROLE_MEMORY_S:
+                self._role[pid] = [depth, across, t, team, t]
+            else:
+                # a running mean until ROLE_TAU_S of history, then exponential
+                weight = min(
+                    1.0, max((t - r[2]) / max(t - r[4], 1e-6), (t - r[2]) / self.ROLE_TAU_S)
+                )
+                r[0] += weight * (depth - r[0])
+                r[1] += weight * (across - r[1])
+                r[2] = t
+        known = {
+            pid: (r[0], r[1])
+            for pid, r in self._role.items()
+            if r[3] == team and t - r[2] <= self.ROLE_MEMORY_S
+        }
+        if len(known) > self.MAX_PLAYERS:
+            # A re-used id left a stale one: keep who is in the lines, then the
+            # freshest. By freshness alone two ids took turns being the
+            # eleventh on match_5, moving a player between lines each time.
+            held = {pid for line in self.lines[team] or () for pid in line}
+            ranked = sorted(known, key=lambda pid: (pid not in held, -self._role[pid][2]))
+            known = {pid: known[pid] for pid in ranked[: self.MAX_PLAYERS]}
+        if len(known) < self.MIN_PLAYERS:
+            self.lines[team], self._challenger[team], self._best[team] = None, None, None
+            return None
+        history = np.median([t - self._role[pid][4] for pid in known])
+        if self.lines[team] is None and history < self.WARMUP_S:
+            return None  # roles from a second or two are just where players stand now
+        held = self._keep(self.lines[team], known)
+        searched = self._best[team]
+        if held is None or searched is None or t - searched[1] >= self.RECUT_EVERY_S:
+            searched = (self._best_cut(known), t)
+            self._best[team] = searched
+        best = self._on(searched[0], known)
+        if held is None:
+            held, self._challenger[team] = best, None
+        elif best is not None and self._spread(best, known) < (1 - self.MARGIN) * self._spread(
+            held, known
+        ):
+            if self._challenger[team] is None:
+                self._challenger[team] = t
+            elif t - self._challenger[team] >= self.HOLD_S:
+                held, self._challenger[team] = best, None
+        else:
+            self._challenger[team] = None
+        self.lines[team] = held
+        return held
+
+    def _keep(self, lines, known: dict) -> tuple | None:
+        """The held lines on the players known now: a player keeps his line
+        unless he fits another STICKY_M better, a new one joins the line he
+        fits best, the gone drop out -- so a player walking into or out of
+        the picture moves no one else."""
+        lines = self._on(lines, known)
+        if lines is None:
+            return None
+        curves = [self._curve(line, known) for line in lines]
+        role = {pid: i for i, line in enumerate(lines) for pid in line}
+        for pid, (depth, across) in known.items():
+            misfit = [abs(depth - (a + c * across**2)) for a, c in curves]
+            nearest = int(np.argmin(misfit))
+            if pid not in role or misfit[nearest] + self.STICKY_M < misfit[role[pid]]:
+                role[pid] = nearest
+        kept = tuple(tuple(pid for pid in role if role[pid] == i) for i in range(3))
+        return self._on(kept, known)
+
+    def _on(self, lines, known: dict) -> tuple | None:
+        """`lines` on the players known now, None if a line breaks its size."""
+        if lines is None:
+            return None
+        lines = tuple(tuple(pid for pid in line if pid in known) for line in lines)
+        sizes = self.SIZES.values()
+        if not all(lo <= len(line) <= hi for line, (lo, hi) in zip(lines, sizes, strict=True)):
+            return None
+        return lines
+
+    @classmethod
+    def _best_cut(cls, known: dict) -> tuple:
+        order = sorted(known, key=lambda pid: known[pid][0])
+        n = len(order)
+        (d0, d1), (m0, m1), (a0, a1) = cls.SIZES.values()
+        best, best_spread = None, np.inf
+        for d in range(d0, d1 + 1):
+            for defence in itertools.combinations(order[: d + cls.DEFENCE_SLACK], d):
+                rest = [pid for pid in order if pid not in defence]
+                defence_spread = cls._line_spread(defence, known)
+                if defence_spread >= best_spread:
+                    continue
+                for m in range(m0, m1 + 1):
+                    if not a0 <= n - d - m <= a1:
+                        continue
+                    lines = (defence, tuple(rest[:m]), tuple(rest[m:]))
+                    spread = defence_spread + sum(cls._line_spread(x, known) for x in lines[1:])
+                    if spread < best_spread:
+                        best, best_spread = lines, spread
+        return best
+
+    @classmethod
+    def _spread(cls, lines: tuple, known: dict) -> float:
+        return sum(cls._line_spread(line, known) for line in lines)
+
+    @staticmethod
+    def _curve(line: tuple, known: dict) -> tuple[float, float]:
+        """(a, c) of depth = a + c * across^2 through the line's players."""
+        depth = np.array([known[pid][0] for pid in line])
+        across2 = np.array([known[pid][1] for pid in line]) ** 2
+        if len(line) < 2 or np.ptp(across2) < 1e-6:
+            return float(depth.mean()), 0.0
+        c, a = np.polyfit(across2, depth, 1)
+        return float(a), float(c)
+
+    @classmethod
+    def _line_spread(cls, line: tuple, known: dict) -> float:
+        a, c = cls._curve(line, known)
+        return float(sum((known[pid][0] - (a + c * known[pid][1] ** 2)) ** 2 for pid in line))
 
 
 class TeamShapeAnalytics:
@@ -372,6 +555,8 @@ class TeamShapeAnalytics:
     # (up to 50) keeps this off the display thread's budget -- on match_5 the
     # per-result version cost the worker 15-60 more skipped frames of 1750.
     SAMPLE_S = 0.1
+    POSSESSION_HOLD_S = 10.0
+    POSSESSION_SWITCH_S = 1.0
     # team_of is TeamHistory's 10 s majority in the pipeline, ~1 ms for a
     # frame's ~25 players every result at 50 fps, on the display thread; the
     # answer cannot move in a quarter of a second, so it is asked that often.
@@ -391,6 +576,10 @@ class TeamShapeAnalytics:
         self.results_measured = {team: dict.fromkeys(self.METRICS, 0) for team in (0, 1)}
         self.results_visible = {0: 0, 1: 0}
         self._teams: dict[int, tuple] = {}  # player_id -> (team, when it was asked)
+        self.formation_lines = FormationLines()
+        self.in_possession: int | None = None
+        self._possession_seen: float | None = None
+        self._switch: tuple | None = None  # (other team, since) while a change of side is pending
 
     def record(
         self, frame_id, positions: dict, team_of, homography, frame_size, possession_team=None
@@ -408,6 +597,7 @@ class TeamShapeAnalytics:
             return
         self._last_frame_id = frame_id
         self.results += 1
+        self._update_possession(t, possession_team)
         members = {0: [], 1: []}
         for player_id in positions:
             team = self._team(player_id, t, team_of)
@@ -428,11 +618,21 @@ class TeamShapeAnalytics:
         self.latest = {}
         for team, (p, ids) in teams.items():
             shape = self._measure(team, p, ids, homography, frame_size)
+            if shape.line_m is not None:  # depths from the last man need him in view
+                goal = self.own_goal[team]
+                relative = {
+                    pid: (
+                        PITCH_LENGTH_M / 2 - goal * positions[pid][0] - shape.line_m,
+                        positions[pid][1],
+                    )
+                    for pid in ids
+                }
+                shape.lines = self.formation_lines.update(t, team, relative)
             self.latest[team] = shape
             self.results_visible[team] += 1
             phase = None
-            if possession_team in (0, 1):
-                phase = "in" if possession_team == team else "out"
+            if self.in_possession is not None:
+                phase = "in" if self.in_possession == team else "out"
             self._samples.append((t, team, phase, shape))
             for metric in self.METRICS:
                 value = getattr(shape, metric)
@@ -445,6 +645,34 @@ class TeamShapeAnalytics:
                     a = min(1.0, (t - prev[1]) / self.DISPLAY_SMOOTH_S)
                     value = prev[0] + a * (value - prev[0])
                 self._display[key] = (value, t)
+
+    def _update_possession(self, t: float, possession_team) -> None:
+        """The team in possession, held while the ball travels: the ball is
+        at someone's feet in only 15-30% of results (in flight or unseen the
+        rest), so, as possession is counted in football, a team keeps it
+        until the other one has the ball -- or for POSSESSION_HOLD_S with
+        nobody on it (out of play, or lost from view). A change of side has
+        to last POSSESSION_SWITCH_S: a touch read on the wrong side for a
+        few results would otherwise move the drawn lines to the other team
+        and straight back (seen on match_5 at 1:11 on the clock)."""
+        if possession_team in (0, 1):
+            if self.in_possession is None or possession_team == self.in_possession:
+                self.in_possession, self._possession_seen = possession_team, t
+                self._switch = None
+            elif self._switch is None or self._switch[0] != possession_team:
+                self._switch = (possession_team, t)
+            elif t - self._switch[1] >= self.POSSESSION_SWITCH_S:
+                self.in_possession, self._possession_seen = possession_team, t
+                self._switch = None
+        elif (
+            self._possession_seen is not None and t - self._possession_seen > self.POSSESSION_HOLD_S
+        ):
+            self.in_possession, self._switch = None, None
+
+    @property
+    def defending_team(self) -> int | None:
+        """The team without the ball, or None while possession is not known."""
+        return None if self.in_possession is None else 1 - self.in_possession
 
     def _team(self, player_id: int, t: float, team_of):
         cached = self._teams.get(player_id)
@@ -601,6 +829,8 @@ class TeamShapeAnalytics:
                     team_row[metric] = round(float(np.median(values)), 1) if values else None
                 phases = [ph for ph, _s in entries if ph is not None]
                 team_row["phase"] = max(set(phases), key=phases.count) if phases else None
+                formations = [s.formation for _ph, s in entries if s.formation is not None]
+                team_row["formation"] = formations[-1] if formations else None
                 row[str(team)] = team_row
             rows.append(row)
         return rows

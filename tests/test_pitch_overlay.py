@@ -173,44 +173,43 @@ def _shaped_team(x0: float):
     return shape
 
 
-def test_shape_overlay_draws_a_thin_outline_through_the_shown_feet_and_the_line():
-    """Outline through the feet of the boxes on screen; the defensive line
-    touchline to touchline at the last man on this frame -- both thin."""
+FEET = [(400, 200), (600, 200), (600, 300), (400, 300), (350, 250)] + [(500, 250)] * 3
+BOXES = [(fx - 5, fy - 30, fx + 5, fy, pid) for pid, (fx, fy) in enumerate(FEET)]
+
+
+def test_shape_overlay_outlines_a_team_through_the_shown_feet():
+    """While possession is not known: a thin outline through the feet of
+    the boxes on screen, nothing inside it."""
     from scripts.analytics import TeamShapeAnalytics
     from scripts.display import TeamShapeOverlay
 
     shape = TeamShapeAnalytics(50.0)
     shape.latest = _shaped_team(-30.0).latest  # 8 players, ids 0-7
-    shape.own_goal = {0: -1, 1: 1}
-    shape.display_value = lambda team, metric, t=None: 20.0  # the line is measurable
-    # the boxes shown on this frame; player 4 is the last man, at pixel x 350
-    feet = [(400, 200), (600, 200), (600, 300), (400, 300), (350, 250)] + [(500, 250)] * 3
-    boxes = [(fx - 5, fy - 30, fx + 5, fy, pid) for pid, (fx, fy) in enumerate(feet)]
     frame = np.zeros((600, 600, 3), dtype="uint8")
     red = lambda team: (0, 0, 255)  # noqa: E731
-    TeamShapeOverlay().draw(frame, boxes, shape, SCALE_TRANSLATE_HOMOGRAPHY, red)
+    TeamShapeOverlay().draw(frame, BOXES, shape, SCALE_TRANSLATE_HOMOGRAPHY, red)
     assert frame[200, 500, 2] > 200  # on the outline's top edge
     assert frame[250, 450].sum() == 0  # lines only, nothing drawn inside
-    # the line at the last man's column, well past the team (rows 200-300)
-    # towards the touchlines at y = -34 / 34 -> rows 130 / 470
-    assert frame[140, 349:352, 2].max() > 200 and frame[460, 349:352, 2].max() > 200
-    assert frame[140, 340, 2] == 0 and frame[140, 360, 2] == 0  # and thin
 
 
-def test_shape_overlay_has_no_line_while_it_is_not_measurable():
+def test_shape_overlay_draws_the_defending_teams_lines_as_joined_dots():
+    """The team without the ball: a dot at each player's feet, the players of
+    a line joined across the pitch, one colour per line, and no outline."""
     from scripts.analytics import TeamShapeAnalytics
     from scripts.display import TeamShapeOverlay
 
     shape = TeamShapeAnalytics(50.0)
-    shape.latest = _shaped_team(-30.0).latest
-    shape.own_goal = {0: -1, 1: 1}  # but no line value: the own-goal end is out of view
-    feet = [(400, 200), (600, 200), (600, 300), (400, 300), (350, 250)] + [(500, 250)] * 3
-    boxes = [(fx - 5, fy - 30, fx + 5, fy, pid) for pid, (fx, fy) in enumerate(feet)]
-    frame = np.zeros((600, 600, 3), dtype="uint8")
-    TeamShapeOverlay().draw(
-        frame, boxes, shape, SCALE_TRANSLATE_HOMOGRAPHY, lambda team: (0, 0, 255)
-    )
-    assert frame[140, 345:356].sum() == 0
+    team = _shaped_team(-30.0).latest[0]
+    team.lines = ((0, 3), (4,), (1, 2))  # defence: feet (400,200)-(400,300); attack: x 600
+    shape.latest = {0: team}
+    shape.in_possession = 1
+    frame = np.zeros((600, 700, 3), dtype="uint8")
+    TeamShapeOverlay().draw(frame, BOXES, shape, SCALE_TRANSLATE_HOMOGRAPHY, lambda t: (0, 0, 255))
+    defence, midfield, attack = TeamShapeOverlay.LINE_COLORS
+    assert tuple(frame[250, 400]) == defence  # halfway along the defence line
+    assert tuple(frame[250, 350]) == midfield  # the lone midfielder's dot
+    assert tuple(frame[250, 600]) == attack
+    assert frame[200, 500].sum() == 0  # no outline for this team
 
 
 def test_shape_overlay_dashes_the_second_team():
