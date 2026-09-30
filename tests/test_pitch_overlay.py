@@ -107,6 +107,15 @@ def test_minimap_with_no_positions_still_shows_the_pitch():
     assert frame.sum() > 0
 
 
+def test_marker_without_pins_draws_only_its_caption():
+    frame = np.zeros((400, 400, 3), dtype="uint8")
+    renderer = MarkerRenderer(TeamClassifier())
+    renderer.draw(frame, [(150, 200, 180, 260, 3)], pins=False)
+    assert frame.sum() == 0
+    renderer.draw(frame, [(150, 200, 180, 260, 3)], captions={3: "42m"}, pins=False)
+    assert frame.sum() > 0
+
+
 def test_marker_caption_is_drawn_above_the_id_label():
     frame = np.zeros((400, 400, 3), dtype="uint8")
     renderer = MarkerRenderer(TeamClassifier())
@@ -131,7 +140,9 @@ def test_ball_renderer_draws_ball_holder_and_pass_panel():
     for f in range(1, 21):
         analytics.record(f, [(0.4, 0.0, 0.5)], positions, lambda pid: 0)
     assert analytics.holder == 1
-    BallRenderer(show_markers=True).draw(frame, analytics, SCALE_TRANSLATE_HOMOGRAPHY, positions)
+    renderer = BallRenderer()
+    renderer.draw_rings(frame, analytics, SCALE_TRANSLATE_HOMOGRAPHY, positions)
+    renderer.draw_panel(frame, analytics)
     # ball ring at the centre spot (world 0,0 -> pixel 300,300), yellow
     b, g, r = frame[300, 309]
     assert g > 150 and r > 150 and b < 100
@@ -139,7 +150,7 @@ def test_ball_renderer_draws_ball_holder_and_pass_panel():
     assert frame[15:60, 1280 - 12 - 330 : 1280 - 12].sum() > 0
 
 
-def test_ball_renderer_hides_the_rings_by_default():
+def test_ball_renderer_panel_draws_no_rings():
     from scripts.ball import BallAnalytics
     from scripts.display import BallRenderer
 
@@ -148,9 +159,9 @@ def test_ball_renderer_hides_the_rings_by_default():
     positions = {1: (0.0, 0.0), 2: (20.0, 0.0)}
     for f in range(1, 21):
         analytics.record(f, [(0.4, 0.0, 0.5)], positions, lambda pid: 0)
-    BallRenderer().draw(frame, analytics, SCALE_TRANSLATE_HOMOGRAPHY, positions)
+    BallRenderer().draw_panel(frame, analytics)
     assert frame[250:350, 250:350].sum() == 0  # no ring or holder ellipse
-    assert frame[15:60, 1280 - 12 - 330 : 1280 - 12].sum() > 0  # the panel still is
+    assert frame[15:60, 1280 - 12 - 330 : 1280 - 12].sum() > 0  # the panel is there
 
 
 def test_ball_renderer_without_calibration_still_draws_the_panel():
@@ -158,5 +169,8 @@ def test_ball_renderer_without_calibration_still_draws_the_panel():
     from scripts.display import BallRenderer
 
     frame = np.zeros((720, 1280, 3), dtype="uint8")
-    BallRenderer().draw(frame, BallAnalytics(50.0), None, {})
-    assert frame[:300, :, :].sum() == 0 or frame[15:60, 938:1268].sum() > 0
+    renderer = BallRenderer()
+    renderer.draw_rings(frame, BallAnalytics(50.0), None, {})
+    assert frame.sum() == 0
+    renderer.draw_panel(frame, BallAnalytics(50.0))
+    assert frame[15:60, 938:1268].sum() > 0

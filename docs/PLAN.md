@@ -500,7 +500,71 @@ Take a fixed-camera football video and show a marker on each player that moves w
   - [X] Heatmaps per player (and per team) (Plan 3.1)
   - [X] Possession detection and team pass counts (Plan 3.2)
   - [X] Pass counter that holds up on real footage (Plan 3.3)
+  - [X] Web UI: pick a video, switch overlays live while it plays (Plan 3.6)
   - [ ] (Longer-term, not yet scoped in detail) formations/team shape, passing networks
+
+- [X] **Plan 3.6: Web UI with Overlays Switched Live**
+
+  A page that lists the videos in `data/videos/` (or takes one picked with
+  the browser's file chooser), plays the chosen one tracked live, and has a
+  checkbox per overlay that applies from the next frame. `uv run python -m
+  web`, then http://127.0.0.1:8000. The CLI (`scripts.track_players`) and
+  `demo.sh` are unchanged: same flags, same output.
+
+  - [X] **One pipeline, two front ends.** The web app runs the same
+        `PlayerTracker` as the CLI on a background thread, one video at a
+        time (the Neural Engine runs one model). A fresh model per video:
+        BoT-SORT's tracks live on the model (`persist=True`) and every
+        tracker installs its ball callback on it.
+  - [X] **`Overlays`** (`scripts/display.py`): one switch per overlay (pitch
+        lines, pins + IDs, distance run, ball + holder rings, pass panel,
+        minimap, FPS counter), read by `PlayerTracker._draw` on every frame.
+        The CLI flags only set its starting values (`--show-markers` turns on
+        pins and rings, `--hide-passes` turns off the panel, the FPS counter
+        is on only with a window, as before). Only the drawing is switched:
+        analytics keep running, so an overlay switched back on shows the
+        match so far. A new overlay is a field there (its label is the
+        checkbox's) and one `if` in `_draw`; `tests/test_overlays.py` fails
+        for an overlay drawn whatever its switch says.
+  - [X] **Frames to the browser as MJPEG** (`web/stream.py`). The display
+        thread only hands its frame over; one encoder thread compresses the
+        newest (~3.2 ms per 1080p frame, ~190 KB at quality 80, measured on
+        match_5), and a slow viewer skips to the newest frame instead of
+        queueing. Measured: match_5 reaches the page at 50.2 frames/s (its
+        native 50) with the live FPS readout at 49.9. Each part is followed
+        by the next boundary at once: a browser shows a part only when that
+        boundary arrives, so the last frame of a finished video never
+        showed and kept the page loading.
+  - [X] **Switching videos doesn't wait for the old one.** A replaced
+        session winds down in the background while the next loads (its
+        display loop ends within a frame, and the new video has no frames for
+        the seconds its model takes). Measured: switch 5.8 s -> 3.5 s to the
+        new video's first frame; stop returns in 0.1 s. The old wait was
+        `CalibrationWorker.stop()`: its process takes ~7 s to load the
+        calibration model and can't take the stop sentinel until then, so a
+        video stopped earlier waits out the 2 s join and is killed (0.5 s
+        once loaded). The CLI pays the same at exit; left as it is.
+  - [X] **Picking a file uploads it.** A browser never tells the page where a
+        picked file lives, so it is sent as the raw request body (written
+        once, no multipart temp copy) into `data/videos/`: never over a video
+        already there (`name (1).mp4`), via a hidden `.part` file so a cut-off
+        upload leaves nothing, and not at all when that name and size are
+        already listed.
+  - [X] **Shutdown.** uvicorn waits for open responses before the app's own
+        shutdown, and the stream only ends in that shutdown: an open page kept
+        Ctrl-C and SIGTERM from ever exiting. `timeout_graceful_shutdown=1`:
+        exits 1.3 s after SIGTERM with a page connected.
+  - [X] **CLI and demo unchanged.** match_5 `--output --show-markers`: main
+        49.0 fps / 65 frames skipped by the worker, this branch 48.7 / 63.
+        `demo.sh` renders the same overlays as before (minimap, pitch lines,
+        distances; no pins, panel or FPS counter).
+  - [X] Tests: `tests/test_overlays.py` (switches, and `_draw` through a stub
+        model: all off draws nothing, each on draws, a change shows on the
+        next frame); `tests/test_web.py` (JPEG hand-off, the API, uploads).
+  - [ ] **Known limits.** No sound, pause or seek: it is a live view of the
+        tracking, not a player. Team-shape overlays (Plans 3.4-3.5) get their
+        checkboxes when that branch merges: a field in `Overlays` and an
+        `if` in `_draw` each.
 
 - [X] **Plan 3.3: A Pass Counter That Holds Up on Real Footage**
 
