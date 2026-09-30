@@ -625,6 +625,20 @@ class BallAnalytics:
     def holder(self) -> int | None:
         return None if self.possession.current is None else self.possession.current.player_id
 
+    @property
+    def possession_team(self):
+        """The side in possession at the latest result (a keeper's by where he
+        stands), or None."""
+        return None if self.possession.current is None else self.possession.current.team
+
+    def team_now(self, player_id: int):
+        """The team a player has read as over the recent past, at the latest
+        result (TeamHistory's majority, so a few seconds of a wrong read do
+        not move him)."""
+        if self._last_frame_id is None:
+            return None
+        return self.teams.team_at(player_id, self._last_frame_id / self.fps)
+
     def summary(self, team_name=str) -> str:
         """team_name(team) -> label, e.g. TeamClassifier.team_name."""
         lines = [

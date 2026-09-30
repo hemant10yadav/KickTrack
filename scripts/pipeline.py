@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from scripts.analytics import MatchAnalytics, PitchProjector
+from scripts.analytics import MatchAnalytics, PitchProjector, TeamShapeAnalytics
 from scripts.ball import BallAnalytics
 from scripts.calibration import (
     CalibrationWorker,
@@ -33,6 +33,8 @@ from scripts.display import (
     PlaybackDelay,
     ResultTimeline,
     StalenessTracker,
+    TeamShapeOverlay,
+    TeamShapePanel,
 )
 from scripts.player import (
     JerseySampler,
@@ -538,6 +540,7 @@ class PlayerTracker:
         viewer: str = "opencv",
         show_markers: bool = False,
         show_passes: bool = True,
+        show_shape: bool = True,
     ):
         self.video_source = video_source
         self.model = model
@@ -555,6 +558,7 @@ class PlayerTracker:
         self.scaler = None  # FrameScaler, created once the source size is known
         self.analytics = None  # MatchAnalytics, created once the video's fps is known
         self.ball = None  # BallAnalytics, likewise
+        self.shape = None  # TeamShapeAnalytics, likewise
         self.writer = None
         self.classifier = TeamClassifier()
         self.resolver = IdentityResolver(self.classifier)
@@ -562,6 +566,8 @@ class PlayerTracker:
         self.pitch_overlay = PitchOverlayRenderer()
         self.minimap = PitchMinimap()
         self.ball_renderer = BallRenderer(show_markers=show_markers, show_passes=show_passes)
+        self.shape_panel = TeamShapePanel() if show_shape else None
+        self.shape_overlay = TeamShapeOverlay() if show_shape else None
         self.timeline = ResultTimeline()
         self.smoother = DisplaySmoother()
         self.fader = FadeController()
@@ -590,6 +596,7 @@ class PlayerTracker:
         playback = PlaybackDelay(round(self.display_delay_ms / pacer.frame_budget_ms))
         self.analytics = MatchAnalytics(fps=1000 / pacer.frame_budget_ms)
         self.ball = BallAnalytics(fps=1000 / pacer.frame_budget_ms)
+        self.shape = TeamShapeAnalytics(fps=1000 / pacer.frame_budget_ms)
         if self.output_path:
             self.writer = self._open_writer(pacer.frame_budget_ms)
         if self.show_window and self.viewer_kind == "ffplay":
@@ -641,9 +648,12 @@ class PlayerTracker:
             print()
             self.ball.finish()
             print(self.ball.summary(team_name=self.classifier.team_name))
+            print()
+            print(self.shape.summary(team_name=self.classifier.team_name))
             if self.analytics_dir:
                 self.analytics.write(self.analytics_dir, team_color=self._team_color)
                 self.ball.write(self.analytics_dir, team_name=self.classifier.team_name)
+                self.shape.write(self.analytics_dir, team_name=self.classifier.team_name)
                 print(f"Analytics written to {self.analytics_dir}/")
             print()
             if self.latest_calibration is not None:
@@ -799,6 +809,17 @@ class PlayerTracker:
                 self.analytics.latest_positions,
                 self.classifier.team_for,
             )
+            # Teams from the ball's TeamHistory, not the latest read: a
+            # defender read as "other" for 3 s (match_4) would drop out of
+            # his team's shape and move its defensive line 20 m.
+            self.shape.record(
+                result.frame_id,
+                self.analytics.latest_positions,
+                self.ball.team_now,
+                self.current_homography,
+                self.scaler.size,
+                self.ball.possession_team,
+            )
             t2 = time.perf_counter()
 
             shown = playback.pop(flush=source_ended)
@@ -845,6 +866,8 @@ class PlayerTracker:
         alphas = self.fader.update(boxes, coasting_progress)
         homography = self._homography_for(frame_id)
         self.pitch_overlay.draw(frame, homography)
+        if self.shape_overlay is not None:
+            self.shape_overlay.draw(frame, boxes, self.shape, homography, self._team_color)
         self.renderer.draw(frame, boxes, alphas, captions=self._distance_captions(boxes))
         self.minimap.draw(
             frame,
@@ -854,6 +877,14 @@ class PlayerTracker:
             ball=self.ball.ball,
             holder=self.ball.holder,
         )
+        if self.shape_panel is not None:
+            self.shape_panel.draw(
+                frame,
+                self.shape,
+                bottom=self.minimap.top(frame),
+                team_name=self.classifier.team_name,
+                team_color=self._team_color,
+            )
         self.ball_renderer.draw(
             frame,
             self.ball,
